@@ -1,0 +1,18 @@
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Backups
+*.bak
+*.bak-pre-tune
+*.orig
+
+# Local-only configs
+local.env
+*.local
