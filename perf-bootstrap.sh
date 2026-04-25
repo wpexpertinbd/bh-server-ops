@@ -115,7 +115,14 @@ detect() {
     [ -d "$D" ] || continue
     PHP_FPM_USER_DIRS+=("$D")
     V=$(echo "$D" | grep -oE 'php-fpm[0-9]+' | grep -oE '[0-9]+')
-    PHP_FPM_SERVICES+=("php-fpm-${V}")
+    # Auto-detect actual systemd unit name — CWP CloudLinux uses 'php-fpm83'
+    # (no hyphen between 'fpm' and version), some other distros may use
+    # 'php-fpm-83'. Pick whichever exists.
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^php-fpm${V}\.service"; then
+      PHP_FPM_SERVICES+=("php-fpm${V}")
+    elif systemctl list-unit-files --type=service 2>/dev/null | grep -q "^php-fpm-${V}\.service"; then
+      PHP_FPM_SERVICES+=("php-fpm-${V}")
+    fi
     INI_DIR="/opt/alt/php-fpm${V}/usr/php/php.d"
     [ -d "$INI_DIR" ] && PHP_INI_DIRS+=("$INI_DIR")
   done
