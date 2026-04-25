@@ -285,7 +285,12 @@ if [ "$INTERACTIVE" = "1" ]; then
     ENABLE_AUTO_RECOVERY_CRON="$REPLY"
 
     if [ "$ENABLE_MONITOR_CRON" = "1" ] || [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
-      ask "Sites to monitor (space-separated, blank to auto-discover)" "$MONITOR_SITES"
+      echo ""
+      echo "  Sites to monitor — hostname only, space-separated."
+      echo "  Examples: www.artechbd.com api.artechbd.com kotipoti.com"
+      echo "  (Full URLs like https://… work too — protocol + trailing slash auto-stripped)"
+      echo "  (Blank = auto-discover from CWP user_data)"
+      ask "Sites" "$MONITOR_SITES"
       MONITOR_SITES="$REPLY"
     fi
   fi
@@ -589,12 +594,15 @@ fi
 [ -z "\$SITES" ] && exit 0
 
 for SITE in \$SITES; do
-    T=\$(curl -s -o /dev/null -w "%{time_starttransfer}" -m 30 "https://\$SITE/" 2>/dev/null)
+    # Strip protocol + trailing slash so user can paste full URL or hostname
+    HOST=\$(echo "\$SITE" | sed -E 's#^https?://##; s#/.*##')
+    [ -z "\$HOST" ] && continue
+    T=\$(curl -s -o /dev/null -w "%{time_starttransfer}" -m 30 "https://\$HOST/" 2>/dev/null)
     T_INT=\${T%.*}
     if [ "\${T_INT:-0}" -gt "\$THRESHOLD" ] 2>/dev/null; then
         CW=\$(ss -tan state close-wait 2>/dev/null | wc -l)
         TOP=\$(ps aux 2>/dev/null | grep "php-fpm: pool" | grep -v grep | awk '{print \$1}' | sort | uniq -c | sort -rn | head -3 | awk '{printf "%s:%s ",\$2,\$1}')
-        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] SLOW: \$SITE TTFB=\${T}s  CLOSE_WAIT=\$CW  top_pools=\$TOP" >> \$LOG
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] SLOW: \$HOST TTFB=\${T}s  CLOSE_WAIT=\$CW  top_pools=\$TOP" >> \$LOG
     fi
 done
 MONITOR
@@ -616,10 +624,13 @@ fi
 
 NEEDS_RECOVERY=0
 for SITE in \$SITES; do
-    T=\$(curl -s -o /dev/null -w "%{time_starttransfer}" -m 25 "https://\$SITE/" 2>/dev/null)
+    # Strip protocol + trailing slash
+    HOST=\$(echo "\$SITE" | sed -E 's#^https?://##; s#/.*##')
+    [ -z "\$HOST" ] && continue
+    T=\$(curl -s -o /dev/null -w "%{time_starttransfer}" -m 25 "https://\$HOST/" 2>/dev/null)
     T_INT=\${T%.*}
     if [ "\${T_INT:-0}" -gt "\$THRESHOLD" ] 2>/dev/null; then
-        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Saturation: \$SITE TTFB=\${T}s — triggering recovery" >> \$LOG
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Saturation: \$HOST TTFB=\${T}s — triggering recovery" >> \$LOG
         NEEDS_RECOVERY=1
         break
     fi
