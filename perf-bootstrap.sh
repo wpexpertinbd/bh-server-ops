@@ -646,11 +646,34 @@ if [ "\$NEEDS_RECOVERY" = "1" ]; then
     fi
     touch \$LOG.lastfire
 
-    systemctl reload httpd 2>/dev/null && echo "  reloaded httpd" >> \$LOG
+    # ── Apache: try graceful reload first (no downtime); if site STILL slow
+    #    after 5s, full restart (1-2s blip but always clears stuck workers).
+    if systemctl is-active --quiet httpd 2>/dev/null; then
+        systemctl reload httpd 2>/dev/null && echo "  reloaded httpd" >> \$LOG
+        sleep 5
+        # Re-check the same site that was slow — if still bad, escalate to restart
+        for SITE in \$SITES; do
+            HOST=\$(echo "\$SITE" | sed -E 's#^https?://##; s#/.*##')
+            [ -z "\$HOST" ] && continue
+            T=\$(curl -s -o /dev/null -w "%{time_starttransfer}" -m 15 "https://\$HOST/" 2>/dev/null)
+            T_INT=\${T%.*}
+            if [ "\${T_INT:-0}" -gt "\$THRESHOLD" ] 2>/dev/null; then
+                echo "  ⚠ reload didn't clear stuck workers — escalating to restart" >> \$LOG
+                systemctl restart httpd 2>/dev/null && echo "  restarted httpd" >> \$LOG
+                break
+            fi
+        done
+    fi
+
+    # ── PHP-FPM: reload re-execs master (zero downtime, fresh workers)
+    #    — always sufficient unless master itself is hung.
     for S in \$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print \$1}' | grep -E "^(php-fpm|ea-php.*-php-fpm|php[0-9.]+-fpm)"); do
         systemctl reload "\$S" 2>/dev/null && echo "  reloaded \$S" >> \$LOG
     done
+
+    # ── Varnish cache flush
     command -v varnishadm >/dev/null && varnishadm "ban req.url ~ ." 2>/dev/null && echo "  flushed varnish" >> \$LOG
+
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Recovery complete" >> \$LOG
 fi
 RECOVERY
