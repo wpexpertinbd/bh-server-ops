@@ -31,19 +31,53 @@ Idempotent — safe to re-run.
 ```bash
 # SSH to target server as root, then:
 curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh -o /root/perf-bootstrap.sh
-
-# Edit the EDIT block at the top
-nano /root/perf-bootstrap.sh
-#    HEAVY_USERS="laravel-user1 laravel-user2"
-#    TARGET_RAM_GB=64
-#    MONITOR_SITES="example.com api.example.com"   # optional, auto-discovers if empty
-
-# Run
 chmod +x /root/perf-bootstrap.sh
 bash /root/perf-bootstrap.sh
 ```
 
-The script prints what it auto-detected (panel, Apache MPM, PHP versions, services) before applying changes — sanity check before deploying.
+The script runs **interactive by default** — it auto-detects the environment (panel, Apache MPM, PHP versions, RAM), then prompts for:
+
+- **Action:** Install / Rollback / Quit
+- **TARGET_RAM_GB** (auto-filled from `free -g`)
+- **Heavy app users** (Laravel/Symfony tenants — get 20 dynamic workers)
+- **Apache MPM tuning?** (yes/no)
+- **Redis cap?** (yes/no)
+- **Install helpers?** (`tenant-cap`, `saturation-monitor`, `auto-recovery`)
+- **Saturation-monitor cron** (every 5 min — recommended yes)
+- **Auto-recovery cron** (every 3 min — default no, opt-in)
+- **Sites to monitor** (auto-discover or provide explicit list)
+
+A summary is shown before any change. Press Enter on each prompt to accept the default in `[brackets]`.
+
+### Non-interactive run (curl pipe, automation, etc.)
+
+When stdin isn't a TTY (e.g. `curl ... | bash`) or you pass `-y`, the script uses built-in defaults silently:
+
+```bash
+# Pass defaults via flag
+bash perf-bootstrap.sh -y
+
+# Or set them as env vars
+HEAVY_USERS="user1 user2" \
+TARGET_RAM_GB=32 \
+ENABLE_AUTO_RECOVERY_CRON=1 \
+bash perf-bootstrap.sh -y
+
+# Pipe-from-curl (treated as non-interactive)
+curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh | bash
+```
+
+### Rollback
+
+```bash
+# Interactive — choose 'R' at the action prompt
+bash /root/perf-bootstrap.sh
+
+# Non-interactive — pass --rollback
+bash /root/perf-bootstrap.sh --rollback
+```
+
+Restores all `.bak-pre-tune` backups, removes drop-in OPcache/sysctl, removes helpers + cron, reloads services.
 
 ### ⚠️ If you uploaded the script from Windows (SCP / FileZilla / WinSCP)
 

@@ -1,38 +1,83 @@
 #!/bin/bash
 # ================================================================
-#  Universal Web Server Performance Bootstrap (v3.1)
+#  Universal Web Server Performance Bootstrap (v3.2)
 #  Works on: CWP, cPanel/EA4, RHEL/AlmaLinux/Rocky, Debian/Ubuntu
 #  Idempotent. Safe to re-run.
 #
+#  Run modes:
+#    bash perf-bootstrap.sh        → interactive (asks for HEAVY_USERS, crons, etc.)
+#    bash perf-bootstrap.sh -y     → non-interactive (use built-in defaults)
+#    curl ... | bash               → non-interactive (no TTY)
+#
 #  Installs:
 #    1. Server-wide perf tuning (kernel, OPcache, FPM, MPM, Redis)
-#    2. /usr/local/sbin/tenant-cap        — quick noisy-neighbor cap
+#    2. /usr/local/sbin/tenant-cap         — quick noisy-neighbor cap
 #    3. /usr/local/sbin/saturation-monitor — TTFB watcher (cron 5min)
-#    4. /usr/local/sbin/auto-recovery     — auto-reload on saturation (cron 3min)
+#    4. /usr/local/sbin/auto-recovery      — auto-reload on saturation (cron 3min)
 # ================================================================
 
 set -e
 
-#################### EDIT THESE IF APPLICABLE ####################
-HEAVY_USERS=""              # Laravel/Symfony users get 20 workers dynamic
-                            # Example: HEAVY_USERS="artechbd kotipoti"
-SKIP_USERS="nobody"         # System users to skip
-APPLY_APACHE_MPM=1          # 0 to skip MPM bump
-APPLY_REDIS=1               # 0 to skip Redis cap
-TARGET_RAM_GB=64            # Used to size MPM workers — adjust if smaller box
+#################### DEFAULTS (used in non-interactive mode) ####################
+HEAVY_USERS="${HEAVY_USERS:-}"               # Laravel/Symfony users — 20 workers dynamic
+SKIP_USERS="${SKIP_USERS:-nobody}"           # System users to skip
+APPLY_APACHE_MPM="${APPLY_APACHE_MPM:-1}"
+APPLY_REDIS="${APPLY_REDIS:-1}"
+TARGET_RAM_GB="${TARGET_RAM_GB:-auto}"       # 'auto' = detect from /proc/meminfo
 
-# Helper scripts + cron
-INSTALL_HELPERS=1           # 0 to skip /usr/local/sbin/ helpers
-ENABLE_MONITOR_CRON=1       # 0 to skip TTFB monitor cron (5min)
-ENABLE_AUTO_RECOVERY_CRON=0 # 1 to enable self-healing reload cron (3min)
-                            # Off by default — enable after observing patterns
+INSTALL_HELPERS="${INSTALL_HELPERS:-1}"
+ENABLE_MONITOR_CRON="${ENABLE_MONITOR_CRON:-1}"
+ENABLE_AUTO_RECOVERY_CRON="${ENABLE_AUTO_RECOVERY_CRON:-0}"
+MONITOR_SITES="${MONITOR_SITES:-}"           # auto-discover if empty
+TTFB_WARN_THRESHOLD="${TTFB_WARN_THRESHOLD:-10}"
+TTFB_RECOVER_THRESHOLD="${TTFB_RECOVER_THRESHOLD:-20}"
+#################################################################################
 
-# Sites to monitor for saturation. Space-separated.
-# If empty, monitor will auto-discover from CWP user_data or skip.
-MONITOR_SITES=""            # Example: MONITOR_SITES="www.artechbd.com api.artechbd.com kotipoti.com"
-TTFB_WARN_THRESHOLD=10      # seconds; log to /var/log/saturation.log if exceeded
-TTFB_RECOVER_THRESHOLD=20   # seconds; auto-recovery triggers if exceeded
-#################################################################
+# CLI flag: -y / --yes → skip interactive prompts
+NON_INTERACTIVE=0
+case "${1:-}" in
+  -y|--yes|--non-interactive) NON_INTERACTIVE=1 ;;
+esac
+
+# Auto-detect TARGET_RAM_GB if not explicitly set
+if [ "$TARGET_RAM_GB" = "auto" ]; then
+  TARGET_RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 8)
+fi
+
+# Detect interactive TTY
+INTERACTIVE=0
+[ "$NON_INTERACTIVE" = "0" ] && [ -t 0 ] && INTERACTIVE=1
+
+# ────────────────────────────────────────────────
+# PROMPT HELPER
+# ────────────────────────────────────────────────
+ask() {
+  # ask "prompt" "default" → returns answer in $REPLY
+  local prompt="$1" default="$2"
+  if [ "$INTERACTIVE" = "0" ]; then REPLY="$default"; return; fi
+  if [ -n "$default" ]; then
+    read -r -p "$prompt [$default]: " REPLY < /dev/tty
+    [ -z "$REPLY" ] && REPLY="$default"
+  else
+    read -r -p "$prompt: " REPLY < /dev/tty
+  fi
+}
+
+ask_yn() {
+  # ask_yn "prompt" "y" → returns 1/0 in $REPLY based on default y/n
+  local prompt="$1" default="$2"
+  local yn_disp
+  case "$default" in y|Y|1) yn_disp="Y/n" ;; *) yn_disp="y/N" ;; esac
+
+  if [ "$INTERACTIVE" = "0" ]; then
+    case "$default" in y|Y|1) REPLY=1 ;; *) REPLY=0 ;; esac
+    return
+  fi
+
+  read -r -p "$prompt [$yn_disp]: " ANS < /dev/tty
+  [ -z "$ANS" ] && ANS="$default"
+  case "$ANS" in y|Y|yes|YES|1) REPLY=1 ;; *) REPLY=0 ;; esac
+}
 
 # ────────────────────────────────────────────────
 # ENVIRONMENT DETECTION
@@ -103,7 +148,7 @@ detect() {
 detect
 
 echo "=============================================="
-echo "  Universal Perf Bootstrap v3"
+echo "  Universal Perf Bootstrap v3.2"
 echo "  $(date)"
 echo "=============================================="
 echo "Detected:"
@@ -116,6 +161,7 @@ echo "  PHP-FPM user pool dirs (${#PHP_FPM_USER_DIRS[@]}):"
 for D in "${PHP_FPM_USER_DIRS[@]}"; do echo "    $D"; done
 echo "  PHP-FPM services: ${PHP_FPM_SERVICES[*]}"
 echo "  PHP ini.d dirs: ${PHP_INI_DIRS[*]}"
+echo "  RAM (TARGET_RAM_GB): ${TARGET_RAM_GB} GB"
 echo ""
 
 if [ -z "$APACHE_BIN" ] && [ ${#PHP_FPM_USER_DIRS[@]} -eq 0 ]; then
@@ -124,9 +170,146 @@ if [ -z "$APACHE_BIN" ] && [ ${#PHP_FPM_USER_DIRS[@]} -eq 0 ]; then
 fi
 
 # ────────────────────────────────────────────────
+# CLI MODE SELECTION (Install / Rollback / Quit)
+# ────────────────────────────────────────────────
+MODE="install"
+case "${1:-}" in
+  -r|--rollback) MODE="rollback"; NON_INTERACTIVE=1 ;;
+  -y|--yes|--non-interactive) MODE="install"; NON_INTERACTIVE=1 ;;
+esac
+
+if [ "$INTERACTIVE" = "1" ]; then
+  echo "─── Choose action ───"
+  echo "  [I]nstall   Apply / re-apply tuning + helpers (default)"
+  echo "  [R]ollback  Restore all .bak-pre-tune backups, remove helpers + cron"
+  echo "  [Q]uit     Exit without changes"
+  read -r -p "Action [I/r/q]: " ACT < /dev/tty
+  case "$ACT" in
+    r|R|rollback) MODE="rollback" ;;
+    q|Q|quit|exit) echo "Aborted."; exit 0 ;;
+    *) MODE="install" ;;
+  esac
+  echo ""
+fi
+
+# ────────────────────────────────────────────────
+# ROLLBACK PATH
+# ────────────────────────────────────────────────
+if [ "$MODE" = "rollback" ]; then
+  if [ "$INTERACTIVE" = "1" ]; then
+    echo "⚠ This will restore ALL .bak-pre-tune backups under /opt /etc /usr/local"
+    echo "  remove /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}"
+    echo "  remove cron entries for monitor + auto-recovery"
+    echo "  reload Apache + PHP-FPM"
+    ask_yn "Proceed with rollback?" "n"
+    [ "$REPLY" = "0" ] && { echo "Aborted."; exit 0; }
+  fi
+
+  echo ""
+  echo "─── Rolling back ───"
+
+  # Unfreeze frozen files
+  [ -f "$APACHE_MPM_CONF" ] && chattr -i "$APACHE_MPM_CONF" 2>/dev/null || true
+  [ -n "$CWP_TPL_DIR" ] && [ -d "$CWP_TPL_DIR" ] && \
+    chattr -i "$CWP_TPL_DIR"/*.tpl 2>/dev/null || true
+
+  # Restore backups
+  RESTORED=0
+  while IFS= read -r BAK; do
+    [ -z "$BAK" ] && continue
+    ORIG="${BAK%.bak-pre-tune}"
+    mv "$BAK" "$ORIG" && RESTORED=$((RESTORED+1))
+  done < <(find /opt /etc /usr/local -name '*.bak-pre-tune' 2>/dev/null)
+  echo "✓ Restored $RESTORED backup files"
+
+  # Remove our drop-in OPcache + sysctl
+  for INI_DIR in "${PHP_INI_DIRS[@]}"; do
+    rm -f "$INI_DIR/99-opcache-tuned.ini"
+  done
+  rm -f /etc/sysctl.d/99-performance.conf
+  echo "✓ Removed drop-in configs (sysctl, OPcache 99-tuned)"
+
+  # Remove helpers
+  rm -f /usr/local/sbin/tenant-cap /usr/local/sbin/saturation-monitor /usr/local/sbin/auto-recovery
+  echo "✓ Removed /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}"
+
+  # Remove cron
+  CRON_TMP=$(mktemp)
+  crontab -l 2>/dev/null | grep -v 'saturation-monitor' | grep -v 'auto-recovery' > "$CRON_TMP" || true
+  crontab "$CRON_TMP"
+  rm -f "$CRON_TMP"
+  echo "✓ Removed monitor + auto-recovery cron entries"
+
+  # Reload services
+  for S in "${PHP_FPM_SERVICES[@]}"; do
+    systemctl is-active --quiet "$S" 2>/dev/null && systemctl reload "$S" && echo "✓ reloaded $S"
+  done
+  [ -n "$APACHE_SERVICE" ] && systemctl is-active --quiet "$APACHE_SERVICE" 2>/dev/null && \
+    systemctl reload "$APACHE_SERVICE" && echo "✓ reloaded $APACHE_SERVICE"
+
+  echo ""
+  echo "=============================================="
+  echo "  Rollback complete on $(hostname)"
+  echo "=============================================="
+  exit 0
+fi
+
+# ────────────────────────────────────────────────
+# INSTALL PATH — interactive prompts
+# ────────────────────────────────────────────────
+if [ "$INTERACTIVE" = "1" ]; then
+  echo "─── Configuration ───"
+  echo "(Press Enter to accept the default in [brackets])"
+  echo ""
+
+  ask "TARGET_RAM_GB (used to size Apache MPM workers)" "$TARGET_RAM_GB"
+  TARGET_RAM_GB="$REPLY"
+
+  ask "Heavy app users (Laravel/Symfony, space-separated, blank for none)" "$HEAVY_USERS"
+  HEAVY_USERS="$REPLY"
+
+  ask_yn "Apply Apache MPM tuning?" "y"
+  APPLY_APACHE_MPM="$REPLY"
+
+  ask_yn "Apply Redis cap (2GB + LRU)?" "y"
+  APPLY_REDIS="$REPLY"
+
+  ask_yn "Install /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}?" "y"
+  INSTALL_HELPERS="$REPLY"
+
+  if [ "$INSTALL_HELPERS" = "1" ]; then
+    ask_yn "Enable saturation-monitor cron (every 5 min, logs slow sites)?" "y"
+    ENABLE_MONITOR_CRON="$REPLY"
+
+    ask_yn "Enable auto-recovery cron (every 3 min, auto-reloads on saturation)?" "n"
+    ENABLE_AUTO_RECOVERY_CRON="$REPLY"
+
+    if [ "$ENABLE_MONITOR_CRON" = "1" ] || [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
+      ask "Sites to monitor (space-separated, blank to auto-discover)" "$MONITOR_SITES"
+      MONITOR_SITES="$REPLY"
+    fi
+  fi
+
+  echo ""
+  echo "─── Summary ───"
+  echo "  TARGET_RAM_GB:             $TARGET_RAM_GB"
+  echo "  HEAVY_USERS:               ${HEAVY_USERS:-(none)}"
+  echo "  Apache MPM tuning:         $([ "$APPLY_APACHE_MPM" = "1" ] && echo yes || echo no)"
+  echo "  Redis cap:                 $([ "$APPLY_REDIS" = "1" ] && echo yes || echo no)"
+  echo "  Install helpers:           $([ "$INSTALL_HELPERS" = "1" ] && echo yes || echo no)"
+  echo "  Saturation-monitor cron:   $([ "$ENABLE_MONITOR_CRON" = "1" ] && echo yes || echo no)"
+  echo "  Auto-recovery cron:        $([ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ] && echo yes || echo no)"
+  echo "  Sites to monitor:          ${MONITOR_SITES:-(auto-discover)}"
+  echo ""
+  ask_yn "Proceed with these settings?" "y"
+  [ "$REPLY" = "0" ] && { echo "Aborted."; exit 0; }
+  echo ""
+fi
+
+# ────────────────────────────────────────────────
 # 1. Kernel tunables
 # ────────────────────────────────────────────────
-echo "─── [1/7] Kernel tunables ───"
+echo "─── [1/8] Kernel tunables ───"
 cat > /etc/sysctl.d/99-performance.conf <<'EOF'
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
@@ -142,7 +325,7 @@ echo "✓ /etc/sysctl.d/99-performance.conf applied"
 # 2. OPcache bump for every PHP-FPM ini.d found
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [2/7] OPcache tuning ───"
+echo "─── [2/8] OPcache tuning ───"
 if [ ${#PHP_INI_DIRS[@]} -eq 0 ]; then
   echo "⊘ No PHP ini directories detected — skipping"
 else
@@ -162,7 +345,7 @@ fi
 # 3. Per-user FPM pool tuning + request_terminate_timeout
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [3/7] Per-user FPM pool tuning ───"
+echo "─── [3/8] Per-user FPM pool tuning ───"
 TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0
 
 ensure_kv() {
@@ -211,7 +394,7 @@ fi
 # 4. CWP template patch (only if CWP detected)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [4/7] CWP template patch ───"
+echo "─── [4/8] CWP template patch ───"
 if [ -n "$CWP_TPL_DIR" ] && [ -d "$CWP_TPL_DIR" ]; then
   for T in "$CWP_TPL_DIR"/default.tpl "$CWP_TPL_DIR"/processes-40.tpl "$CWP_TPL_DIR"/processes-45.tpl; do
     [ -f "$T" ] || continue
@@ -233,7 +416,7 @@ fi
 # 5. Apache MPM bump (auto-detect MPM type)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [5/7] Apache MPM tuning ───"
+echo "─── [5/8] Apache MPM tuning ───"
 if [ "$APPLY_APACHE_MPM" = "1" ] && [ -n "$APACHE_BIN" ] && [ -f "$APACHE_MPM_CONF" ]; then
   CURRENT_MPM=$($APACHE_BIN -V 2>&1 | grep "Server MPM" | awk '{print $3}' | tr 'A-Z' 'a-z')
   echo "Current MPM: $CURRENT_MPM"
@@ -320,7 +503,7 @@ fi
 # 6. Redis cap
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [6/7] Redis cap ───"
+echo "─── [6/8] Redis cap ───"
 if [ "$APPLY_REDIS" = "1" ] && command -v redis-cli >/dev/null && systemctl is-active --quiet redis 2>/dev/null; then
   redis-cli CONFIG SET maxmemory 2gb > /dev/null
   redis-cli CONFIG SET maxmemory-policy allkeys-lru > /dev/null
