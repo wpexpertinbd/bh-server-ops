@@ -27,9 +27,8 @@ Idempotent — safe to re-run.
 
 ```bash
 # 1. SSH to target server as root
-# 2. Get the script
+# 2. Get the script (curl is best — line endings are guaranteed correct)
 curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh -o /root/perf-bootstrap.sh
-# OR scp from local
 
 # 3. Edit the EDIT block at the top
 nano /root/perf-bootstrap.sh
@@ -42,6 +41,30 @@ bash /root/perf-bootstrap.sh
 ```
 
 The script prints what it auto-detected (panel, Apache MPM, PHP versions, services) before applying changes — sanity check before deploying.
+
+### ⚠️ If you uploaded the script from Windows (SCP / FileZilla / WinSCP)
+
+Windows uses CRLF line endings — bash will fail with `$'\r': command not found` errors. Fix:
+
+```bash
+# RHEL / AlmaLinux / Rocky / CentOS / CWP
+yum install -y dos2unix
+
+# Debian / Ubuntu
+apt-get install -y dos2unix
+
+# Convert + run
+dos2unix /root/perf-bootstrap.sh
+chmod +x /root/perf-bootstrap.sh
+bash /root/perf-bootstrap.sh
+```
+
+If `dos2unix` isn't available, this one-liner does the same thing:
+```bash
+sed -i 's/\r$//' /root/perf-bootstrap.sh
+```
+
+**Tip:** Always use `curl` (Method 1 above) instead of SCP — fetched files always have correct LF line endings.
 
 ## RAM-based MPM scaling
 
