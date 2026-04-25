@@ -1,7 +1,11 @@
 #!/bin/bash
 # ================================================================
-#  Universal Web Server Performance Bootstrap (v3.2)
+#  Universal Web Server Performance Bootstrap (v3.3)
 #  Works on: CWP, cPanel/EA4, RHEL/AlmaLinux/Rocky, Debian/Ubuntu
+#  Scales: 1-2 GB tiny VPS up to 64+ GB dedicated. All settings
+#          (Apache MPM, FPM children, OPcache, Redis) auto-tier
+#          based on /proc/meminfo so a 4 GB box doesn't get 64 GB
+#          defaults that OOM the kernel.
 #  Idempotent. Safe to re-run.
 #
 #  Run modes:
@@ -42,6 +46,43 @@ esac
 # Auto-detect TARGET_RAM_GB if not explicitly set
 if [ "$TARGET_RAM_GB" = "auto" ]; then
   TARGET_RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 8)
+fi
+
+# ────────────────────────────────────────────────
+# RAM TIER → SIZING (all memory-hungry settings scale together)
+# ────────────────────────────────────────────────
+# Compute proportional values so a 4 GB VPS doesn't get 64 GB defaults.
+# Format: <comment shows expected peak Apache+OPcache+Redis baseline>
+if   [ "$TARGET_RAM_GB" -ge 64 ]; then  # baseline ~10 GB
+  MAX_WORKERS=1600;  THREADS_PER_CHILD=50;  SERVER_LIMIT=32
+  LIGHT_CHILDREN=10; HEAVY_CHILDREN=20
+  OPCACHE_MB=256;    OPCACHE_FILES=20000;   INTERNED_MB=16
+  REDIS_MAX=2gb
+elif [ "$TARGET_RAM_GB" -ge 32 ]; then  # baseline ~6 GB
+  MAX_WORKERS=800;   THREADS_PER_CHILD=50;  SERVER_LIMIT=16
+  LIGHT_CHILDREN=10; HEAVY_CHILDREN=20
+  OPCACHE_MB=256;    OPCACHE_FILES=20000;   INTERNED_MB=16
+  REDIS_MAX=1gb
+elif [ "$TARGET_RAM_GB" -ge 16 ]; then  # baseline ~3 GB
+  MAX_WORKERS=400;   THREADS_PER_CHILD=50;  SERVER_LIMIT=8
+  LIGHT_CHILDREN=8;  HEAVY_CHILDREN=15
+  OPCACHE_MB=192;    OPCACHE_FILES=15000;   INTERNED_MB=12
+  REDIS_MAX=512mb
+elif [ "$TARGET_RAM_GB" -ge 8 ];  then  # baseline ~1.5 GB
+  MAX_WORKERS=200;   THREADS_PER_CHILD=40;  SERVER_LIMIT=5
+  LIGHT_CHILDREN=6;  HEAVY_CHILDREN=12
+  OPCACHE_MB=128;    OPCACHE_FILES=10000;   INTERNED_MB=8
+  REDIS_MAX=384mb
+elif [ "$TARGET_RAM_GB" -ge 4 ];  then  # baseline ~700 MB (small VPS)
+  MAX_WORKERS=100;   THREADS_PER_CHILD=25;  SERVER_LIMIT=4
+  LIGHT_CHILDREN=4;  HEAVY_CHILDREN=8
+  OPCACHE_MB=96;     OPCACHE_FILES=8000;    INTERNED_MB=8
+  REDIS_MAX=256mb
+else                                       # tiny VPS (1-3 GB)
+  MAX_WORKERS=50;    THREADS_PER_CHILD=25;  SERVER_LIMIT=2
+  LIGHT_CHILDREN=3;  HEAVY_CHILDREN=5
+  OPCACHE_MB=64;     OPCACHE_FILES=5000;    INTERNED_MB=4
+  REDIS_MAX=128mb
 fi
 
 # Detect interactive TTY
@@ -155,7 +196,7 @@ detect() {
 detect
 
 echo "=============================================="
-echo "  Universal Perf Bootstrap v3.2"
+echo "  Universal Perf Bootstrap v3.3"
 echo "  $(date)"
 echo "=============================================="
 echo "Detected:"
@@ -321,7 +362,7 @@ fi
 # ────────────────────────────────────────────────
 # 1. Kernel tunables
 # ────────────────────────────────────────────────
-echo "─── [1/8] Kernel tunables ───"
+echo "─── [1/9] Kernel tunables ───"
 cat > /etc/sysctl.d/99-performance.conf <<'EOF'
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
@@ -334,22 +375,55 @@ sysctl -p /etc/sysctl.d/99-performance.conf > /dev/null
 echo "✓ /etc/sysctl.d/99-performance.conf applied"
 
 # ────────────────────────────────────────────────
-# 2. OPcache bump for every PHP-FPM ini.d found
+# 2. Create swap if none exists (small VPS often ship without)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [2/8] OPcache tuning ───"
+echo "─── [2/9] Swap setup ───"
+EXISTING_SWAP_KB=$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+if [ "${EXISTING_SWAP_KB:-0}" -gt 0 ]; then
+  echo "⊘ Swap already present ($((EXISTING_SWAP_KB / 1024)) MB) — skipping"
+else
+  # Decide swap size: 2× RAM up to 4 GB, then RAM up to 8 GB, then 8 GB ceiling
+  if   [ "$TARGET_RAM_GB" -le 2 ];  then SWAP_GB=$(( TARGET_RAM_GB * 2 ))
+  elif [ "$TARGET_RAM_GB" -le 8 ];  then SWAP_GB=$TARGET_RAM_GB
+  elif [ "$TARGET_RAM_GB" -le 32 ]; then SWAP_GB=8
+  else                                   SWAP_GB=4; fi
+
+  # Check disk free on /
+  DISK_FREE_GB=$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G",""); print $4}')
+  if [ -z "$DISK_FREE_GB" ] || [ "$DISK_FREE_GB" -lt $((SWAP_GB + 5)) ]; then
+    echo "⊘ Not enough free disk on / to create ${SWAP_GB}GB swap (free: ${DISK_FREE_GB:-?}GB) — skipping"
+  else
+    echo "Creating /swapfile (${SWAP_GB} GB)..."
+    fallocate -l "${SWAP_GB}G" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_GB * 1024)) status=none
+    chmod 600 /swapfile
+    mkswap /swapfile > /dev/null
+    swapon /swapfile
+    # Persist via fstab
+    if ! grep -q '^/swapfile' /etc/fstab; then
+      echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+    echo "✓ Created + activated ${SWAP_GB} GB swap (persistent in /etc/fstab)"
+  fi
+fi
+
+# ────────────────────────────────────────────────
+# 3. OPcache bump for every PHP-FPM ini.d found
+# ────────────────────────────────────────────────
+echo ""
+echo "─── [3/9] OPcache tuning ───"
 if [ ${#PHP_INI_DIRS[@]} -eq 0 ]; then
   echo "⊘ No PHP ini directories detected — skipping"
 else
   for INI_DIR in "${PHP_INI_DIRS[@]}"; do
-    cat > "$INI_DIR/99-opcache-tuned.ini" <<'EOF'
-; Bootstrap OPcache tune — Laravel/WordPress safe
-opcache.memory_consumption=256
-opcache.max_accelerated_files=20000
-opcache.interned_strings_buffer=16
+    cat > "$INI_DIR/99-opcache-tuned.ini" <<EOF
+; Bootstrap OPcache tune (auto-scaled to ${TARGET_RAM_GB}GB RAM)
+opcache.memory_consumption=${OPCACHE_MB}
+opcache.max_accelerated_files=${OPCACHE_FILES}
+opcache.interned_strings_buffer=${INTERNED_MB}
 opcache.revalidate_freq=60
 EOF
-    echo "✓ $INI_DIR/99-opcache-tuned.ini"
+    echo "✓ $INI_DIR/99-opcache-tuned.ini  (${OPCACHE_MB}MB / ${OPCACHE_FILES} files)"
   done
 fi
 
@@ -357,7 +431,7 @@ fi
 # 3. Per-user FPM pool tuning + request_terminate_timeout
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [3/8] Per-user FPM pool tuning ───"
+echo "─── [4/9] Per-user FPM pool tuning ───"
 TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0
 
 ensure_kv() {
@@ -381,17 +455,22 @@ else
       [ -f "${CONF}.bak-pre-tune" ] || cp "$CONF" "${CONF}.bak-pre-tune"
 
       if echo " $HEAVY_USERS " | grep -q " $USER "; then
+        # Heavy app users — dynamic pool, scaled HEAVY_CHILDREN per RAM tier
+        START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
+        MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
+        MAX_SPARE=$(( HEAVY_CHILDREN / 2 )); [ $MAX_SPARE -lt 4 ] && MAX_SPARE=4
         ensure_kv "$CONF" "pm" "dynamic"
-        ensure_kv "$CONF" "pm.max_children" "20"
+        ensure_kv "$CONF" "pm.max_children" "$HEAVY_CHILDREN"
         ensure_kv "$CONF" "pm.max_requests" "500"
-        ensure_kv "$CONF" "pm.start_servers" "4"
-        ensure_kv "$CONF" "pm.min_spare_servers" "2"
-        ensure_kv "$CONF" "pm.max_spare_servers" "8"
+        ensure_kv "$CONF" "pm.start_servers" "$START_SVR"
+        ensure_kv "$CONF" "pm.min_spare_servers" "$MIN_SPARE"
+        ensure_kv "$CONF" "pm.max_spare_servers" "$MAX_SPARE"
         ensure_kv "$CONF" "request_terminate_timeout" "30s"
         HEAVY_TOUCHED=$((HEAVY_TOUCHED+1))
       else
+        # Light tenants (WordPress etc.) — ondemand pool, LIGHT_CHILDREN per RAM tier
         ensure_kv "$CONF" "pm" "ondemand"
-        ensure_kv "$CONF" "pm.max_children" "10"
+        ensure_kv "$CONF" "pm.max_children" "$LIGHT_CHILDREN"
         ensure_kv "$CONF" "pm.max_requests" "500"
         ensure_kv "$CONF" "pm.process_idle_timeout" "30s"
         ensure_kv "$CONF" "request_terminate_timeout" "30s"
@@ -406,15 +485,15 @@ fi
 # 4. CWP template patch (only if CWP detected)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [4/8] CWP template patch ───"
+echo "─── [5/9] CWP template patch ───"
 if [ -n "$CWP_TPL_DIR" ] && [ -d "$CWP_TPL_DIR" ]; then
   for T in "$CWP_TPL_DIR"/default.tpl "$CWP_TPL_DIR"/processes-40.tpl "$CWP_TPL_DIR"/processes-45.tpl; do
     [ -f "$T" ] || continue
     chattr -i "$T" 2>/dev/null || true
     [ -f "${T}.bak-pre-tune" ] || cp "$T" "${T}.bak-pre-tune"
-    sed -i 's/^pm.max_children = 4$/pm.max_children = 10/' "$T"
-    sed -i 's/^pm.max_requests = 4000$/pm.max_requests = 500/' "$T"
-    sed -i 's/^pm.process_idle_timeout = 15s$/pm.process_idle_timeout = 30s/' "$T"
+    sed -i "s/^pm.max_children = .*/pm.max_children = ${LIGHT_CHILDREN}/" "$T"
+    sed -i 's/^pm.max_requests = .*/pm.max_requests = 500/' "$T"
+    sed -i 's/^pm.process_idle_timeout = .*/pm.process_idle_timeout = 30s/' "$T"
     grep -q "^request_terminate_timeout" "$T" || \
       echo "request_terminate_timeout = 30s" >> "$T"
     chattr +i "$T" 2>/dev/null || true
@@ -428,23 +507,21 @@ fi
 # 5. Apache MPM bump (auto-detect MPM type)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [5/8] Apache MPM tuning ───"
+echo "─── [6/9] Apache MPM tuning ───"
 if [ "$APPLY_APACHE_MPM" = "1" ] && [ -n "$APACHE_BIN" ] && [ -f "$APACHE_MPM_CONF" ]; then
   CURRENT_MPM=$($APACHE_BIN -V 2>&1 | grep "Server MPM" | awk '{print $3}' | tr 'A-Z' 'a-z')
   echo "Current MPM: $CURRENT_MPM"
   echo "Config file: $APACHE_MPM_CONF"
 
-  case "$TARGET_RAM_GB" in
-    "" | *[!0-9]*) MAX_WORKERS=1600 ;;
-    *)
-      if [ "$TARGET_RAM_GB" -ge 64 ];   then MAX_WORKERS=1600
-      elif [ "$TARGET_RAM_GB" -ge 32 ]; then MAX_WORKERS=800
-      elif [ "$TARGET_RAM_GB" -ge 16 ]; then MAX_WORKERS=400
-      else                                   MAX_WORKERS=200; fi ;;
-  esac
-  THREADS=50
-  SERVER_LIMIT=$(( MAX_WORKERS / THREADS ))
-  echo "Sizing: TARGET_RAM=${TARGET_RAM_GB}G → MaxRequestWorkers=$MAX_WORKERS, ServerLimit=$SERVER_LIMIT"
+  # MAX_WORKERS, THREADS_PER_CHILD, SERVER_LIMIT already computed in the
+  # RAM TIER block at the top of the script — use those values.
+  THREADS=$THREADS_PER_CHILD
+  # Scale spare-thread bands proportionally to the worker pool.
+  SS=$(( MAX_WORKERS / 8 )); [ $SS -lt 4 ] && SS=4   # StartServers
+  MIN_S=$(( MAX_WORKERS / 16 )); [ $MIN_S -lt 25 ] && MIN_S=25
+  MAX_S=$(( MAX_WORKERS / 4 )); [ $MAX_S -lt 100 ] && MAX_S=100
+  TL=$(( THREADS_PER_CHILD * 2 )); [ $TL -lt 64 ] && TL=64   # ThreadLimit
+  echo "Sizing: TARGET_RAM=${TARGET_RAM_GB}G → MaxRequestWorkers=$MAX_WORKERS, ServerLimit=$SERVER_LIMIT, ThreadsPerChild=$THREADS"
 
   chattr -i "$APACHE_MPM_CONF" 2>/dev/null || true
   [ -f "${APACHE_MPM_CONF}.bak-pre-tune" ] || cp "$APACHE_MPM_CONF" "${APACHE_MPM_CONF}.bak-pre-tune"
@@ -456,10 +533,10 @@ import re
 path = '$APACHE_MPM_CONF'
 with open(path) as f: content = f.read()
 new_block = """<IfModule $MOD>
-    StartServers             8
-    MinSpareThreads        100
-    MaxSpareThreads        400
-    ThreadLimit            128
+    StartServers             $SS
+    MinSpareThreads        $MIN_S
+    MaxSpareThreads        $MAX_S
+    ThreadLimit            $TL
     ThreadsPerChild         $THREADS
     ServerLimit             $SERVER_LIMIT
     MaxRequestWorkers     $MAX_WORKERS
@@ -515,12 +592,12 @@ fi
 # 6. Redis cap
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [6/8] Redis cap ───"
+echo "─── [7/9] Redis cap ───"
 if [ "$APPLY_REDIS" = "1" ] && command -v redis-cli >/dev/null && systemctl is-active --quiet redis 2>/dev/null; then
-  redis-cli CONFIG SET maxmemory 2gb > /dev/null
+  redis-cli CONFIG SET maxmemory "$REDIS_MAX" > /dev/null
   redis-cli CONFIG SET maxmemory-policy allkeys-lru > /dev/null
   redis-cli CONFIG REWRITE > /dev/null 2>&1 || true
-  echo "✓ Redis: maxmemory 2GB, allkeys-lru"
+  echo "✓ Redis: maxmemory $REDIS_MAX, allkeys-lru"
 else
   echo "⊘ Redis not running or skipped"
 fi
@@ -529,7 +606,7 @@ fi
 # 7. Reload services (graceful)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [7/8] Reload services ───"
+echo "─── [8/9] Reload services ───"
 for S in "${PHP_FPM_SERVICES[@]}"; do
   systemctl is-active --quiet "$S" 2>/dev/null && systemctl reload "$S" && echo "✓ reloaded $S"
 done
@@ -540,7 +617,7 @@ done
 # 8. Install helper scripts (tenant-cap, monitor, auto-recovery)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [8/8] Install helper scripts ───"
+echo "─── [9/9] Install helper scripts ───"
 if [ "$INSTALL_HELPERS" = "1" ]; then
   mkdir -p /usr/local/sbin
 

@@ -151,18 +151,39 @@ Optional cron that runs every 3 minutes. If TTFB exceeds recovery threshold (def
 
 To enable, set `ENABLE_AUTO_RECOVERY_CRON=1` in the bootstrap script before running. **Recommendation:** observe `saturation-monitor` logs for a week first to see actual patterns, then enable auto-recovery only if needed.
 
-## RAM-based MPM scaling
+## RAM-tier scaling
 
-The script auto-sizes Apache MaxRequestWorkers based on `TARGET_RAM_GB`:
+Every memory-hungry setting (Apache MPM, FPM children, OPcache, Redis) auto-scales together based on detected RAM. Same script works from a tiny 1 vCPU/2 GB VPS to a 64 GB dedicated box.
 
-| `TARGET_RAM_GB` | MaxRequestWorkers | ServerLimit | Peak Apache RAM |
-|---|---|---|---|
-| ≥ 64 | 1600 | 32 | ~8 GB |
-| ≥ 32 | 800 | 16 | ~4 GB |
-| ≥ 16 | 400 | 8 | ~2 GB |
-| < 16 | 200 | 4 | ~1 GB |
+| RAM tier | Apache MaxWorkers | FPM children (light/heavy) | OPcache | Redis cap |
+|---|---|---|---|---|
+| ≥ 64 GB | 1600 (32×50) | 10 / 20 | 256 MB | 2 GB |
+| ≥ 32 GB | 800 (16×50) | 10 / 20 | 256 MB | 1 GB |
+| ≥ 16 GB | 400 (8×50) | 8 / 15 | 192 MB | 512 MB |
+| ≥ 8 GB | 200 (5×40) | 6 / 12 | 128 MB | 384 MB |
+| **≥ 4 GB** | **100 (4×25)** | **4 / 8** | **96 MB** | **256 MB** |
+| **< 4 GB** | **50 (2×25)** | **3 / 5** | **64 MB** | **128 MB** |
 
-Adjust `THREADS=50` (top of MPM section) if you need finer control.
+Total baseline (Apache + OPcache + Redis):
+- 64 GB box: ~10 GB used (15% of RAM)
+- 8 GB box: ~1.5 GB used (19%)
+- 4 GB box: ~700 MB used (17%)
+- 2 GB box: ~400 MB used (20%)
+
+Tenant FPM workers get the rest of available RAM.
+
+## Swap setup
+
+Many small VPS providers ship without swap. Step [2/9] auto-creates `/swapfile` if no swap exists:
+
+| RAM | Swap created |
+|---|---|
+| ≤ 2 GB | 2× RAM |
+| 3-8 GB | 1× RAM |
+| 9-32 GB | 8 GB |
+| > 32 GB | 4 GB |
+
+Skipped if any swap already exists OR if disk free < `swap + 5 GB`. Persisted via `/etc/fstab`.
 
 ## Verification
 
