@@ -1,8 +1,14 @@
 #!/bin/bash
 # ================================================================
-#  Universal Web Server Performance Bootstrap (v3)
+#  Universal Web Server Performance Bootstrap (v3.1)
 #  Works on: CWP, cPanel/EA4, RHEL/AlmaLinux/Rocky, Debian/Ubuntu
 #  Idempotent. Safe to re-run.
+#
+#  Installs:
+#    1. Server-wide perf tuning (kernel, OPcache, FPM, MPM, Redis)
+#    2. /usr/local/sbin/tenant-cap        — quick noisy-neighbor cap
+#    3. /usr/local/sbin/saturation-monitor — TTFB watcher (cron 5min)
+#    4. /usr/local/sbin/auto-recovery     — auto-reload on saturation (cron 3min)
 # ================================================================
 
 set -e
@@ -14,6 +20,18 @@ SKIP_USERS="nobody"         # System users to skip
 APPLY_APACHE_MPM=1          # 0 to skip MPM bump
 APPLY_REDIS=1               # 0 to skip Redis cap
 TARGET_RAM_GB=64            # Used to size MPM workers — adjust if smaller box
+
+# Helper scripts + cron
+INSTALL_HELPERS=1           # 0 to skip /usr/local/sbin/ helpers
+ENABLE_MONITOR_CRON=1       # 0 to skip TTFB monitor cron (5min)
+ENABLE_AUTO_RECOVERY_CRON=0 # 1 to enable self-healing reload cron (3min)
+                            # Off by default — enable after observing patterns
+
+# Sites to monitor for saturation. Space-separated.
+# If empty, monitor will auto-discover from CWP user_data or skip.
+MONITOR_SITES=""            # Example: MONITOR_SITES="www.artechbd.com api.artechbd.com kotipoti.com"
+TTFB_WARN_THRESHOLD=10      # seconds; log to /var/log/saturation.log if exceeded
+TTFB_RECOVER_THRESHOLD=20   # seconds; auto-recovery triggers if exceeded
 #################################################################
 
 # ────────────────────────────────────────────────
@@ -316,12 +334,160 @@ fi
 # 7. Reload services (graceful)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [7/7] Reload services ───"
+echo "─── [7/8] Reload services ───"
 for S in "${PHP_FPM_SERVICES[@]}"; do
   systemctl is-active --quiet "$S" 2>/dev/null && systemctl reload "$S" && echo "✓ reloaded $S"
 done
 [ -n "$APACHE_SERVICE" ] && systemctl is-active --quiet "$APACHE_SERVICE" 2>/dev/null && \
   systemctl reload "$APACHE_SERVICE" && echo "✓ reloaded $APACHE_SERVICE"
+
+# ────────────────────────────────────────────────
+# 8. Install helper scripts (tenant-cap, monitor, auto-recovery)
+# ────────────────────────────────────────────────
+echo ""
+echo "─── [8/8] Install helper scripts ───"
+if [ "$INSTALL_HELPERS" = "1" ]; then
+  mkdir -p /usr/local/sbin
+
+  # ── tenant-cap: instantly cap a noisy tenant's PHP workers ────
+  cat > /usr/local/sbin/tenant-cap <<'TENANTCAP'
+#!/bin/bash
+# tenant-cap — cap (or check) a tenant's PHP-FPM max_children across all PHP versions
+# Usage:
+#   tenant-cap medicalp 4    # cap medicalp at 4 max workers
+#   tenant-cap medicalp      # show current settings
+#   tenant-cap medicalp 10   # restore to default 10
+USER="$1"
+LIMIT="$2"
+[ -z "$USER" ] && { echo "Usage: tenant-cap <user> [max_children]"; exit 1; }
+
+found_any=0
+for D in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users \
+         /opt/cpanel/ea-php*/root/etc/php-fpm.d/users \
+         /etc/php/*/fpm/pool.d \
+         /etc/php-fpm.d; do
+  [ -d "$D" ] || continue
+  CONF="$D/$USER.conf"
+  [ -f "$CONF" ] || continue
+  found_any=1
+  if [ -z "$LIMIT" ]; then
+    CUR=$(grep -E "^pm.max_children" "$CONF" | awk -F= '{print $2}' | tr -d ' ')
+    echo "  $D : pm.max_children = ${CUR:-?}"
+  else
+    sed -i "s/^pm.max_children = .*/pm.max_children = $LIMIT/" "$CONF"
+    echo "  $D : pm.max_children = $LIMIT (set)"
+  fi
+done
+
+[ "$found_any" = "0" ] && { echo "✗ No pool configs found for user '$USER'"; exit 1; }
+
+# Reload all running php-fpm services
+if [ -n "$LIMIT" ]; then
+  for S in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E "^(php-fpm|ea-php.*-php-fpm|php[0-9.]+-fpm)"); do
+    systemctl reload "$S" 2>/dev/null && echo "✓ reloaded $S"
+  done
+fi
+TENANTCAP
+  chmod +x /usr/local/sbin/tenant-cap
+  echo "✓ /usr/local/sbin/tenant-cap installed"
+
+  # ── saturation-monitor: log if any site TTFB > threshold ──────
+  cat > /usr/local/sbin/saturation-monitor <<MONITOR
+#!/bin/bash
+# saturation-monitor — log to /var/log/saturation.log if any monitored site is slow
+THRESHOLD=$TTFB_WARN_THRESHOLD
+SITES="$MONITOR_SITES"
+LOG=/var/log/saturation.log
+
+# Auto-discover CWP user domains if SITES is empty
+if [ -z "\$SITES" ] && [ -d /etc/cwpsrv ]; then
+    SITES=\$(find /etc/cwpsrv -maxdepth 3 -name '*.conf' 2>/dev/null | xargs -I{} grep -hE '^\s*server_name' {} 2>/dev/null | awk '{print \$2}' | tr -d ';' | grep -vE '^(www\\.|webmail\\.|mail\\.|cpanel\\.|ftp\\.)' | sort -u | head -10)
+fi
+[ -z "\$SITES" ] && exit 0
+
+for SITE in \$SITES; do
+    T=\$(curl -s -o /dev/null -w "%{time_starttransfer}" -m 30 "https://\$SITE/" 2>/dev/null)
+    T_INT=\${T%.*}
+    if [ "\${T_INT:-0}" -gt "\$THRESHOLD" ] 2>/dev/null; then
+        CW=\$(ss -tan state close-wait 2>/dev/null | wc -l)
+        TOP=\$(ps aux 2>/dev/null | grep "php-fpm: pool" | grep -v grep | awk '{print \$1}' | sort | uniq -c | sort -rn | head -3 | awk '{printf "%s:%s ",\$2,\$1}')
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] SLOW: \$SITE TTFB=\${T}s  CLOSE_WAIT=\$CW  top_pools=\$TOP" >> \$LOG
+    fi
+done
+MONITOR
+  chmod +x /usr/local/sbin/saturation-monitor
+  echo "✓ /usr/local/sbin/saturation-monitor installed"
+
+  # ── auto-recovery: graceful reload if catastrophic TTFB ───────
+  cat > /usr/local/sbin/auto-recovery <<RECOVERY
+#!/bin/bash
+# auto-recovery — graceful reload Apache + FPM + Varnish if any site is past recovery threshold
+THRESHOLD=$TTFB_RECOVER_THRESHOLD
+SITES="$MONITOR_SITES"
+LOG=/var/log/auto-recovery.log
+
+if [ -z "\$SITES" ] && [ -d /etc/cwpsrv ]; then
+    SITES=\$(find /etc/cwpsrv -maxdepth 3 -name '*.conf' 2>/dev/null | xargs -I{} grep -hE '^\s*server_name' {} 2>/dev/null | awk '{print \$2}' | tr -d ';' | grep -vE '^(www\\.|webmail\\.|mail\\.|cpanel\\.|ftp\\.)' | sort -u | head -5)
+fi
+[ -z "\$SITES" ] && exit 0
+
+NEEDS_RECOVERY=0
+for SITE in \$SITES; do
+    T=\$(curl -s -o /dev/null -w "%{time_starttransfer}" -m 25 "https://\$SITE/" 2>/dev/null)
+    T_INT=\${T%.*}
+    if [ "\${T_INT:-0}" -gt "\$THRESHOLD" ] 2>/dev/null; then
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Saturation: \$SITE TTFB=\${T}s — triggering recovery" >> \$LOG
+        NEEDS_RECOVERY=1
+        break
+    fi
+done
+
+if [ "\$NEEDS_RECOVERY" = "1" ]; then
+    # Throttle: don't recover more than once per 10 min
+    LAST=\$(stat -c %Y \$LOG.lastfire 2>/dev/null || echo 0)
+    NOW=\$(date +%s)
+    if [ \$((NOW - LAST)) -lt 600 ]; then
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Skipped — last recovery <10 min ago" >> \$LOG
+        exit 0
+    fi
+    touch \$LOG.lastfire
+
+    systemctl reload httpd 2>/dev/null && echo "  reloaded httpd" >> \$LOG
+    for S in \$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print \$1}' | grep -E "^(php-fpm|ea-php.*-php-fpm|php[0-9.]+-fpm)"); do
+        systemctl reload "\$S" 2>/dev/null && echo "  reloaded \$S" >> \$LOG
+    done
+    command -v varnishadm >/dev/null && varnishadm "ban req.url ~ ." 2>/dev/null && echo "  flushed varnish" >> \$LOG
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Recovery complete" >> \$LOG
+fi
+RECOVERY
+  chmod +x /usr/local/sbin/auto-recovery
+  echo "✓ /usr/local/sbin/auto-recovery installed"
+
+  # ── Setup cron jobs ─────────────────────────────────────────
+  CRON_TMP=$(mktemp)
+  crontab -l 2>/dev/null | grep -v 'saturation-monitor' | grep -v 'auto-recovery' > "$CRON_TMP" || true
+
+  if [ "$ENABLE_MONITOR_CRON" = "1" ]; then
+    echo "*/5 * * * * /usr/local/sbin/saturation-monitor >/dev/null 2>&1" >> "$CRON_TMP"
+    echo "✓ cron added: saturation-monitor every 5 min"
+  fi
+
+  if [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
+    echo "*/3 * * * * /usr/local/sbin/auto-recovery >/dev/null 2>&1" >> "$CRON_TMP"
+    echo "✓ cron added: auto-recovery every 3 min"
+  else
+    echo "⊘ auto-recovery cron disabled (set ENABLE_AUTO_RECOVERY_CRON=1 to enable)"
+  fi
+
+  crontab "$CRON_TMP"
+  rm -f "$CRON_TMP"
+
+  # Touch log files so they exist with right perms
+  touch /var/log/saturation.log /var/log/auto-recovery.log
+  chmod 644 /var/log/saturation.log /var/log/auto-recovery.log
+else
+  echo "⊘ Helper installation skipped"
+fi
 
 echo ""
 echo "=============================================="
@@ -330,6 +496,11 @@ echo "=============================================="
 echo "  Panel: $PANEL"
 echo "  Light tenants tuned: $TOUCHED"
 echo "  Heavy tenants tuned: $HEAVY_TOUCHED"
+[ "$INSTALL_HELPERS" = "1" ] && {
+  echo "  Helpers: /usr/local/sbin/{tenant-cap, saturation-monitor, auto-recovery}"
+  echo "  Monitor cron: $([ "$ENABLE_MONITOR_CRON" = "1" ] && echo enabled || echo disabled)"
+  echo "  Auto-recovery cron: $([ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ] && echo enabled || echo disabled)"
+}
 echo ""
 echo "  Verify (run on this server):"
 echo "    [ -n \"$APACHE_BIN\" ] && $APACHE_BIN -V | grep MPM"
