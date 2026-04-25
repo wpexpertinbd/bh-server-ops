@@ -335,7 +335,7 @@ if [ "$INTERACTIVE" = "1" ]; then
     if [ "$ENABLE_MONITOR_CRON" = "1" ] || [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
       echo ""
       echo "  Sites to monitor — hostname only, space-separated."
-      echo "  Examples: www.artechbd.com api.artechbd.com kotipoti.com"
+      echo "  Examples: www.example.com api.example.com shop.example.com"
       echo "  (Full URLs like https://… work too — protocol + trailing slash auto-stripped)"
       echo "  (Blank = auto-discover from CWP user_data)"
       ask "Sites" "$MONITOR_SITES"
