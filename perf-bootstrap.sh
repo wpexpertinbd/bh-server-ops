@@ -608,10 +608,14 @@ if [ "$APPLY_APACHE_MPM" = "1" ] && [ -n "$APACHE_BIN" ] && [ -f "$APACHE_MPM_CO
   # MAX_WORKERS, THREADS_PER_CHILD, SERVER_LIMIT already computed in the
   # RAM TIER block at the top of the script — use those values.
   THREADS=$THREADS_PER_CHILD
-  # Scale spare-thread bands proportionally to the worker pool.
-  SS=$(( MAX_WORKERS / 8 )); [ $SS -lt 4 ] && SS=4   # StartServers
-  MIN_S=$(( MAX_WORKERS / 16 )); [ $MIN_S -lt 25 ] && MIN_S=25
-  MAX_S=$(( MAX_WORKERS / 4 )); [ $MAX_S -lt 100 ] && MAX_S=100
+  # Spare-thread band MUST cover several full children, otherwise Apache
+  # constantly kills/spawns children to stay in band → graceful-shutdown
+  # thrash (lots of "G" in scoreboard, multi-second DurationPerReq, server
+  # appears slow with 0% CPU). Anchor to ThreadsPerChild × ServerLimit, not
+  # MaxRequestWorkers / N.
+  SS=4   # StartServers — Apache will scale up to MinSpareThreads anyway
+  MIN_S=$(( THREADS_PER_CHILD * 2 ));                       [ $MIN_S -lt 50 ]  && MIN_S=50
+  MAX_S=$(( THREADS_PER_CHILD * (SERVER_LIMIT / 2) ));      [ $MAX_S -lt 200 ] && MAX_S=200
   TL=$(( THREADS_PER_CHILD * 2 )); [ $TL -lt 64 ] && TL=64   # ThreadLimit
   echo "Sizing: TARGET_RAM=${TARGET_RAM_GB}G → MaxRequestWorkers=$MAX_WORKERS, ServerLimit=$SERVER_LIMIT, ThreadsPerChild=$THREADS"
 
@@ -632,7 +636,7 @@ new_block = """<IfModule $MOD>
     ThreadsPerChild         $THREADS
     ServerLimit             $SERVER_LIMIT
     MaxRequestWorkers     $MAX_WORKERS
-    MaxConnectionsPerChild 10000
+    MaxConnectionsPerChild 0
 </IfModule>"""
 if re.search(r'<IfModule\s+$MOD>.*?</IfModule>', content, re.DOTALL):
     content = re.sub(r'<IfModule\s+$MOD>.*?</IfModule>',
@@ -655,7 +659,7 @@ new_block = """<IfModule mpm_prefork_module>
     MaxSpareServers       20
     ServerLimit          $PRE_LIMIT
     MaxRequestWorkers    $PRE_LIMIT
-    MaxConnectionsPerChild 10000
+    MaxConnectionsPerChild 0
 </IfModule>"""
 if re.search(r'<IfModule\s+mpm_prefork_module>.*?</IfModule>', content, re.DOTALL):
     content = re.sub(r'<IfModule\s+mpm_prefork_module>.*?</IfModule>',
@@ -678,6 +682,44 @@ PYEOF
   fi
 else
   echo "⊘ Apache MPM tuning skipped"
+fi
+
+# ────────────────────────────────────────────────
+# 5b. Apache mod_status visibility + bad-watchdog detector
+# ────────────────────────────────────────────────
+# Without /server-status reachable on the Apache backend port, future
+# slowdown diagnosis is blind (you can't see scoreboard, BusyWorkers,
+# DurationPerReq, Stopping count). Install a localhost-only Location.
+# Also detect external "auto-restart on high load" cron scripts — these
+# fight the tuning and cause the exact graceful-shutdown thrash we just
+# fixed (lots of "G" in scoreboard, multi-second response times, 0% CPU).
+echo ""
+echo "─── [6b/10] Apache visibility + bad-watchdog check ───"
+if [ -d /usr/local/apache/conf.d ] && [ -n "$APACHE_BIN" ]; then
+  STATUS_CONF=/usr/local/apache/conf.d/server-status.conf
+  PUB_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  cat > "$STATUS_CONF" <<EOF
+ExtendedStatus On
+<Location /server-status>
+    SetHandler server-status
+    Require ip 127.0.0.1
+    Require ip ::1
+${PUB_IP:+    Require ip $PUB_IP}
+</Location>
+EOF
+  echo "✓ /server-status enabled (127.0.0.1${PUB_IP:+, $PUB_IP})"
+fi
+# Detect known-bad watchdog patterns in cron — anything that restarts httpd
+# unconditionally based on load alone (no real TTFB check, no throttle).
+BAD_WD=$(crontab -l 2>/dev/null | grep -E 'apache-watchdog|highload|systemctl restart httpd' | grep -v auto-recovery || true)
+if [ -n "$BAD_WD" ]; then
+  echo ""
+  echo "⚠ WARNING: aggressive Apache restart cron detected:"
+  echo "$BAD_WD" | sed 's/^/    /'
+  echo "  These fight MPM tuning and cause graceful-shutdown thrash."
+  echo "  Recommended: remove with → crontab -l | grep -v apache-watchdog | crontab -"
+  echo "  This script's own /usr/local/sbin/auto-recovery is safer (real TTFB"
+  echo "  check, 10-min throttle, reload before restart)."
 fi
 
 # ────────────────────────────────────────────────
