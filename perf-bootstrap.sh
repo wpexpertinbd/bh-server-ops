@@ -54,7 +54,7 @@ fi
 # ────────────────────────────────────────────────
 # Compute proportional values so a 4 GB VPS doesn't get 64 GB defaults.
 # Format: <comment shows expected peak Apache+OPcache+Redis baseline>
-if   [ "$TARGET_RAM_GB" -ge 64 ]; then  # baseline ~10 GB
+if   [ "$TARGET_RAM_GB" -ge 60 ]; then  # baseline ~10 GB (60GB+ box reports 62)
   MAX_WORKERS=1600;  THREADS_PER_CHILD=50;  SERVER_LIMIT=32
   LIGHT_CHILDREN=10; HEAVY_CHILDREN=20
   OPCACHE_MB=256;    OPCACHE_FILES=20000;   INTERNED_MB=16
@@ -859,7 +859,9 @@ PYEOF
 
   # ─ patch CWP nginx template (so newly-created vhosts also get it) ─
   CWP_NGX_TPL=""
-  for T in /usr/local/cwpsrv/htdocs/resources/admin/cwp_files/nginx_*.conf \
+  for T in /usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx/default.tpl \
+           /usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx/php-fpm/default.tpl \
+           /usr/local/cwpsrv/htdocs/resources/admin/cwp_files/nginx_*.conf \
            /usr/local/cwpsrv/htdocs/resources/admin/templates/nginx_*.conf \
            /etc/cwpnginx/conf.d/*.tpl; do
     [ -f "$T" ] && CWP_NGX_TPL="$T" && break
@@ -947,11 +949,25 @@ failregex = ^<HOST>\s+"POST\s+(?:[^"]*/)?wp-login\.php[^"]*"
 ignoreregex =
 F2BF
 
-  # Jail config — only active if nginx access log exists
+  # Jail config — only active if nginx access log exists.
+  # If CSF is detected & active, route bans through CSF so it doesn't
+  # fight fail2ban's iptables rules.
   NGX_LOG=/var/log/nginx/access.log
+  if systemctl is-active --quiet csf 2>/dev/null || command -v csf >/dev/null 2>&1; then
+    F2B_BAN="csf-cmd"
+    # filter.d action for CSF
+    cat > /etc/fail2ban/action.d/csf-cmd.conf <<'CSFA'
+[Definition]
+actionban   = csf -d <ip> "fail2ban: <name>"
+actionunban = csf -dr <ip>
+CSFA
+    echo "  CSF detected — fail2ban bans will route through CSF"
+  else
+    F2B_BAN="iptables-multiport"
+  fi
   cat > /etc/fail2ban/jail.d/bh-nginx.conf <<F2BJ
 [DEFAULT]
-banaction = iptables-multiport
+banaction = $F2B_BAN
 backend   = auto
 
 [nginx-badbot]
@@ -987,91 +1003,73 @@ else
 fi
 
 # ────────────────────────────────────────────────
-# 6f. Static-file edge serving (let nginx handle JS/CSS/images,
-#     never bother Apache for them — biggest single speed win)
+# 6f. Nginx http-level perf tuning (open_file_cache + gzip + keepalive)
 # ────────────────────────────────────────────────
-# Most "5-10 second page loads" client complaints aren't really PHP
-# being slow — they're 50+ static asset requests each going through
-# nginx → Apache → mod_proxy_fcgi → file read. Letting nginx serve
-# them direct-from-disk drops that to ~1ms per asset.
+# Note: we deliberately do NOT inject a static-file edge location into
+# vhosts here. CWP's default vhost template already has a nested
+# `location ~ .*\.(jpg|css|js|...)` block inside `location /` that does
+# this correctly with the right `root` directive. Adding our own at
+# server-level shadowed it (nginx prefers top-level regex over nested
+# regex) and caused 404s/config errors on every CWP install.
+#
+# The actual speed wins are at the http {} level (loaded by all vhosts):
+# open_file_cache, gzip, sendfile, keepalive — these don't touch
+# location matching and are safe everywhere.
 echo ""
-echo "─── [6f/10] Nginx → static-file edge serving ───"
+echo "─── [6f/10] Nginx http-level perf tuning ───"
 if [ -n "$NGINX_BIN" ] && systemctl is-active --quiet nginx 2>/dev/null; then
-  cat > "$NGX_SNIPPETS/static-edge.conf" <<'NGXSTATIC'
-# bh-static-edge v1 — included inside server { } per vhost
-# Long-cache static assets, served direct from disk, never touch Apache.
-# Browser cache for 30 days; nginx open_file_cache for the file handles.
-location ~* \.(?:css|js|jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|pdf|zip)$ {
-    expires 30d;
-    add_header Cache-Control "public, immutable";
-    access_log off;
-    log_not_found off;
-    # If file exists on disk, serve it — else fall through to vhost's
-    # default location which already proxies to Apache.
-    try_files $uri @bh_static_miss;
-}
-location @bh_static_miss { return 404; }
-NGXSTATIC
+  # Roll back any prior buggy static-edge injection from older script versions
+  rm -f "$NGX_SNIPPETS/static-edge.conf"
+  if [ -n "$NGX_VHOST_DIR" ]; then
+    for VH in "$NGX_VHOST_DIR"/*.conf; do
+      grep -q "bh-static-edge-injected" "$VH" 2>/dev/null && \
+        sed -i '/bh-static-edge-injected/,+1d' "$VH"
+    done
+  fi
 
-  # http-level open-file-cache (huge static-perf boost; keep handles warm)
-  if ! grep -rq "open_file_cache" "$NGX_CONF_D" 2>/dev/null; then
-    cat > "$NGX_CONF_D/02-perf.conf" <<'NGXPERF'
-# bh-perf v1 — keeps file descriptors hot in nginx
+  # Check for each directive across the WHOLE nginx config tree (including
+  # nginx.conf itself) — many distros pre-set some of these. We only emit
+  # the lines that aren't already there, so we never get "duplicate".
+  ALL_NGX_CONF=$(find /etc/nginx /usr/local/nginx/conf -name "*.conf" -type f 2>/dev/null)
+  has() { echo "$ALL_NGX_CONF" | xargs grep -lE "^\s*$1\b" 2>/dev/null | grep -v "02-perf.conf" | head -1; }
+  PERF_CONF="$NGX_CONF_D/02-perf.conf"
+  rm -f "$PERF_CONF"
+  {
+    echo "# bh-perf v1 — http-level perf knobs (only directives missing elsewhere)"
+    [ -z "$(has open_file_cache)" ] && cat <<'EOP'
 open_file_cache          max=10000 inactive=60s;
 open_file_cache_valid    30s;
 open_file_cache_min_uses 2;
 open_file_cache_errors   on;
-
-# Larger gzip on the fly for HTML/JSON/CSS/JS
+EOP
+    [ -z "$(has gzip_types)" ] && cat <<'EOP'
 gzip               on;
 gzip_vary          on;
 gzip_proxied       any;
 gzip_comp_level    5;
 gzip_min_length    1024;
 gzip_types         text/plain text/css application/json application/javascript text/javascript application/xml application/xml+rss text/xml image/svg+xml application/vnd.ms-fontobject font/ttf font/otf font/eot;
+EOP
+    [ -z "$(has sendfile)" ]           && echo "sendfile           on;"
+    [ -z "$(has tcp_nopush)" ]         && echo "tcp_nopush         on;"
+    [ -z "$(has tcp_nodelay)" ]        && echo "tcp_nodelay        on;"
+    [ -z "$(has keepalive_timeout)" ]  && echo "keepalive_timeout  30;"
+    [ -z "$(has keepalive_requests)" ] && echo "keepalive_requests 1000;"
+    [ -z "$(has server_tokens)" ]      && echo "server_tokens      off;"
+  } > "$PERF_CONF"
+  # Drop the file if nothing was needed (it would just have the header)
+  [ "$(wc -l < "$PERF_CONF")" -le 1 ] && rm -f "$PERF_CONF" && \
+    echo "✓ all perf directives already set elsewhere" || \
+    echo "✓ wrote $PERF_CONF (added missing perf directives only)"
 
-# TCP nicer-defaults
-sendfile           on;
-tcp_nopush         on;
-tcp_nodelay        on;
-keepalive_timeout  30;
-keepalive_requests 1000;
-
-# Don't reveal nginx version
-server_tokens      off;
-NGXPERF
-    echo "✓ wrote $NGX_CONF_D/02-perf.conf (open_file_cache + gzip + tcp tuning)"
-  fi
-
-  # Patch every vhost to also include static-edge.conf (idempotent)
-  if [ -n "$NGX_VHOST_DIR" ]; then
-    PATCHED=0
-    for VH in "$NGX_VHOST_DIR"/*.conf; do
-      [ -f "$VH" ] || continue
-      grep -q "bh-static-edge-injected" "$VH" && continue
-      grep -qE '^\s*server\s*\{' "$VH" || continue
-      python3 - "$VH" <<'PYEOF' || true
-import sys, re
-p = sys.argv[1]
-with open(p) as f: c = f.read()
-inject = "    # bh-static-edge-injected\n    include /etc/nginx/snippets/static-edge.conf;\n"
-new, n = re.subn(r'(server\s*\{\s*\n)', r'\1' + inject, c, count=1)
-if n == 1:
-    with open(p, 'w') as f: f.write(new)
-PYEOF
-      grep -q "bh-static-edge-injected" "$VH" && PATCHED=$((PATCHED + 1))
-    done
-    echo "✓ static-edge injected into $PATCHED vhosts"
-  fi
-
-  # Validate + reload
   if "$NGINX_BIN" -t 2>/dev/null; then
-    systemctl reload nginx 2>/dev/null && echo "✓ nginx reloaded with edge caching"
+    systemctl reload nginx 2>/dev/null && echo "✓ nginx reloaded with perf tuning"
   else
-    echo "⚠ nginx config error — review with: nginx -t"
+    echo "⚠ nginx config error after perf tuning — review with: nginx -t"
+    rm -f "$NGX_CONF_D/02-perf.conf"
   fi
 else
-  echo "⊘ nginx not running — skipping static edge"
+  echo "⊘ nginx not running — skipping perf tuning"
 fi
 
 # ────────────────────────────────────────────────
