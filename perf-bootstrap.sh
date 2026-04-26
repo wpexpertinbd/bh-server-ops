@@ -964,13 +964,25 @@ set +e
 # inside curl-piped scripts.
 if ! command -v fail2ban-client >/dev/null 2>&1; then
   if command -v dnf >/dev/null 2>&1; then
+    # On AlmaLinux/Rocky, EPEL is sometimes installed but not enabled
+    # (CWP boxes especially). Three-step dance: install epel-release if
+    # missing, force-enable the repo, refresh metadata, then install.
     rpm -q epel-release >/dev/null 2>&1 || dnf install -y -q epel-release </dev/null >/dev/null 2>&1
+    dnf config-manager --set-enabled epel </dev/null >/dev/null 2>&1 || true
+    # PowerTools (AlmaLinux 8) / CRB (RHEL 9+) holds some deps
+    dnf config-manager --set-enabled powertools </dev/null >/dev/null 2>&1 || \
+      dnf config-manager --set-enabled crb </dev/null >/dev/null 2>&1 || true
+    dnf clean all </dev/null >/dev/null 2>&1
+    dnf makecache </dev/null >/dev/null 2>&1
     dnf install -y -q fail2ban fail2ban-firewalld </dev/null >/dev/null 2>&1 || \
       dnf install -y -q fail2ban </dev/null >/dev/null 2>&1
   elif command -v yum >/dev/null 2>&1; then
     rpm -q epel-release >/dev/null 2>&1 || yum install -y -q epel-release </dev/null >/dev/null 2>&1
+    yum-config-manager --enable epel </dev/null >/dev/null 2>&1 || true
+    yum makecache </dev/null >/dev/null 2>&1
     yum install -y -q fail2ban </dev/null >/dev/null 2>&1
   elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update </dev/null >/dev/null 2>&1
     apt-get install -y -q fail2ban </dev/null >/dev/null 2>&1
   fi
 fi
