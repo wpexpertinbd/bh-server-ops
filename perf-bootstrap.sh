@@ -1,6 +1,6 @@
 #!/bin/bash
 # ================================================================
-#  Universal Web Server Performance Bootstrap (v3.3)
+#  Universal Web Server Performance Bootstrap (v3.4)
 #  Works on: CWP, cPanel/EA4, RHEL/AlmaLinux/Rocky, Debian/Ubuntu
 #  Scales: 1-2 GB tiny VPS up to 64+ GB dedicated. All settings
 #          (Apache MPM, FPM children, OPcache, Redis) auto-tier
@@ -35,6 +35,7 @@ ENABLE_AUTO_RECOVERY_CRON="${ENABLE_AUTO_RECOVERY_CRON:-0}"
 MONITOR_SITES="${MONITOR_SITES:-}"           # auto-discover if empty
 TTFB_WARN_THRESHOLD="${TTFB_WARN_THRESHOLD:-10}"
 TTFB_RECOVER_THRESHOLD="${TTFB_RECOVER_THRESHOLD:-20}"
+APPLY_APACHE_HARDENING="${APPLY_APACHE_HARDENING:-1}"  # global hardening conf
 #################################################################################
 
 # CLI flag: -y / --yes → skip interactive prompts
@@ -196,7 +197,7 @@ detect() {
 detect
 
 echo "=============================================="
-echo "  Universal Perf Bootstrap v3.3"
+echo "  Universal Perf Bootstrap v3.4"
 echo "  $(date)"
 echo "=============================================="
 echo "Detected:"
@@ -270,12 +271,24 @@ if [ "$MODE" = "rollback" ]; then
   done < <(find /opt /etc /usr/local -name '*.bak-pre-tune' 2>/dev/null)
   echo "✓ Restored $RESTORED backup files"
 
-  # Remove our drop-in OPcache + sysctl
+  # Remove our drop-in OPcache + sysctl + hardening
   for INI_DIR in "${PHP_INI_DIRS[@]}"; do
     rm -f "$INI_DIR/99-opcache-tuned.ini"
   done
   rm -f /etc/sysctl.d/99-performance.conf
-  echo "✓ Removed drop-in configs (sysctl, OPcache 99-tuned)"
+
+  # Remove Apache hardening drop-in (any of the supported paths)
+  for HF in /usr/local/apache/conf.d/99-global-hardening.conf \
+            /etc/httpd/conf.d/99-global-hardening.conf \
+            /etc/apache2/conf-enabled/99-global-hardening.conf \
+            /etc/apache2/conf-available/99-global-hardening.conf; do
+    if [ -f "$HF" ]; then
+      chattr -i "$HF" 2>/dev/null || true
+      rm -f "$HF"
+    fi
+  done
+
+  echo "✓ Removed drop-in configs (sysctl, OPcache 99-tuned, hardening)"
 
   # Remove helpers
   rm -f /usr/local/sbin/tenant-cap /usr/local/sbin/saturation-monitor /usr/local/sbin/auto-recovery
@@ -322,6 +335,9 @@ if [ "$INTERACTIVE" = "1" ]; then
   ask_yn "Apply Redis cap (2GB + LRU)?" "y"
   APPLY_REDIS="$REPLY"
 
+  ask_yn "Apply Apache global hardening (block bad bots, sensitive files, PHP-in-uploads)?" "y"
+  APPLY_APACHE_HARDENING="$REPLY"
+
   ask_yn "Install /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}?" "y"
   INSTALL_HELPERS="$REPLY"
 
@@ -349,6 +365,7 @@ if [ "$INTERACTIVE" = "1" ]; then
   echo "  HEAVY_USERS:               ${HEAVY_USERS:-(none)}"
   echo "  Apache MPM tuning:         $([ "$APPLY_APACHE_MPM" = "1" ] && echo yes || echo no)"
   echo "  Redis cap:                 $([ "$APPLY_REDIS" = "1" ] && echo yes || echo no)"
+  echo "  Apache global hardening:   $([ "$APPLY_APACHE_HARDENING" = "1" ] && echo yes || echo no)"
   echo "  Install helpers:           $([ "$INSTALL_HELPERS" = "1" ] && echo yes || echo no)"
   echo "  Saturation-monitor cron:   $([ "$ENABLE_MONITOR_CRON" = "1" ] && echo yes || echo no)"
   echo "  Auto-recovery cron:        $([ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ] && echo yes || echo no)"
@@ -362,7 +379,7 @@ fi
 # ────────────────────────────────────────────────
 # 1. Kernel tunables
 # ────────────────────────────────────────────────
-echo "─── [1/9] Kernel tunables ───"
+echo "─── [1/10] Kernel tunables ───"
 cat > /etc/sysctl.d/99-performance.conf <<'EOF'
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
@@ -378,7 +395,7 @@ echo "✓ /etc/sysctl.d/99-performance.conf applied"
 # 2. Create swap if none exists (small VPS often ship without)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [2/9] Swap setup ───"
+echo "─── [2/10] Swap setup ───"
 EXISTING_SWAP_KB=$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "${EXISTING_SWAP_KB:-0}" -gt 0 ]; then
   echo "⊘ Swap already present ($((EXISTING_SWAP_KB / 1024)) MB) — skipping"
@@ -411,7 +428,7 @@ fi
 # 3. OPcache bump for every PHP-FPM ini.d found
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [3/9] OPcache tuning ───"
+echo "─── [3/10] OPcache tuning ───"
 if [ ${#PHP_INI_DIRS[@]} -eq 0 ]; then
   echo "⊘ No PHP ini directories detected — skipping"
 else
@@ -431,7 +448,7 @@ fi
 # 3. Per-user FPM pool tuning + request_terminate_timeout
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [4/9] Per-user FPM pool tuning ───"
+echo "─── [4/10] Per-user FPM pool tuning ───"
 TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0
 
 ensure_kv() {
@@ -485,7 +502,7 @@ fi
 # 4. CWP template patch (only if CWP detected)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [5/9] CWP template patch ───"
+echo "─── [5/10] CWP template patch ───"
 if [ -n "$CWP_TPL_DIR" ] && [ -d "$CWP_TPL_DIR" ]; then
   for T in "$CWP_TPL_DIR"/default.tpl "$CWP_TPL_DIR"/processes-40.tpl "$CWP_TPL_DIR"/processes-45.tpl; do
     [ -f "$T" ] || continue
@@ -507,7 +524,7 @@ fi
 # 5. Apache MPM bump (auto-detect MPM type)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [6/9] Apache MPM tuning ───"
+echo "─── [6/10] Apache MPM tuning ───"
 if [ "$APPLY_APACHE_MPM" = "1" ] && [ -n "$APACHE_BIN" ] && [ -f "$APACHE_MPM_CONF" ]; then
   CURRENT_MPM=$($APACHE_BIN -V 2>&1 | grep "Server MPM" | awk '{print $3}' | tr 'A-Z' 'a-z')
   echo "Current MPM: $CURRENT_MPM"
@@ -592,7 +609,7 @@ fi
 # 6. Redis cap
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [7/9] Redis cap ───"
+echo "─── [7/10] Redis cap ───"
 if [ "$APPLY_REDIS" = "1" ] && command -v redis-cli >/dev/null && systemctl is-active --quiet redis 2>/dev/null; then
   redis-cli CONFIG SET maxmemory "$REDIS_MAX" > /dev/null
   redis-cli CONFIG SET maxmemory-policy allkeys-lru > /dev/null
@@ -606,7 +623,7 @@ fi
 # 7. Reload services (graceful)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [8/9] Reload services ───"
+echo "─── [8/10] Reload services ───"
 for S in "${PHP_FPM_SERVICES[@]}"; do
   systemctl is-active --quiet "$S" 2>/dev/null && systemctl reload "$S" && echo "✓ reloaded $S"
 done
@@ -614,10 +631,99 @@ done
   systemctl reload "$APACHE_SERVICE" && echo "✓ reloaded $APACHE_SERVICE"
 
 # ────────────────────────────────────────────────
-# 8. Install helper scripts (tenant-cap, monitor, auto-recovery)
+# 9. Apache global security hardening (drop-in conf)
+# ────────────────────────────────────────────────
+# Static-rule hardening: blocks sensitive file exposure, hidden directories,
+# PHP-in-uploads (#1 malware persistence vector), aggressive bots/scrapers,
+# dangerous HTTP methods. Complements (does not replace) cpGuard / mod_security
+# / fail2ban which handle dynamic threats (login brute-force, WAF rules).
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [9/9] Install helper scripts ───"
+echo "─── [9/10] Apache global security hardening ───"
+if [ "$APPLY_APACHE_HARDENING" = "1" ] && [ -n "$APACHE_BIN" ]; then
+  # Pick the right drop-in path per distro
+  HARDENING_CONF=""
+  if   [ "$PANEL" = "cwp" ]    && [ -d /usr/local/apache/conf.d ]; then HARDENING_CONF=/usr/local/apache/conf.d/99-global-hardening.conf
+  elif [ "$PANEL" = "rhel" ]   && [ -d /etc/httpd/conf.d ];        then HARDENING_CONF=/etc/httpd/conf.d/99-global-hardening.conf
+  elif [ "$PANEL" = "debian" ] && [ -d /etc/apache2/conf-available ]; then HARDENING_CONF=/etc/apache2/conf-available/99-global-hardening.conf
+  fi
+
+  if [ -z "$HARDENING_CONF" ]; then
+    echo "⊘ No suitable Apache conf.d directory — skipping"
+  else
+    chattr -i "$HARDENING_CONF" 2>/dev/null || true
+    [ -f "$HARDENING_CONF" ] && [ ! -f "${HARDENING_CONF}.bak-pre-tune" ] && \
+      cp "$HARDENING_CONF" "${HARDENING_CONF}.bak-pre-tune"
+
+    cat > "$HARDENING_CONF" <<'HARDENEOF'
+# ===================================================================
+# Global Security Hardening — auto-managed by bh-server-ops bootstrap
+# Complements cpGuard / mod_security / fail2ban (dynamic threats).
+# Blocks: file exposure, hidden dirs, PHP-in-uploads, bad bots, TRACE.
+# ===================================================================
+
+# 1. Sensitive file exposure
+<FilesMatch "^(\.env(\..*)?|\.git.*|\.htaccess|\.htpasswd|\.user\.ini|composer\.(json|lock)|package(-lock)?\.json|yarn\.lock|wp-config(-sample)?\.php|configuration\.php|wp-cron\.php|xmlrpc\.php|readme\.html|license\.txt|install\.php|upgrade\.php|info\.php|phpinfo\.php|test\.php|adminer\.php|pma\.php)$">
+  Require all denied
+</FilesMatch>
+
+# 2. Hidden directories (.git, .svn, .hg, .DS_Store) — except /.well-known/
+<DirectoryMatch "/\.(?!well-known)">
+  Require all denied
+</DirectoryMatch>
+
+# 3. Disable TRACE/TRACK (XSS attack vector)
+TraceEnable Off
+
+# 4. Block PHP execution in upload directories (malware persistence vector)
+<LocationMatch "/(wp-content/uploads|uploads|public/storage|public_html/uploads|storage/app/public).*\.(php|phtml|php3|php4|php5|php7|phar|pl|py|jsp|asp|aspx|sh|cgi)$">
+  Require all denied
+</LocationMatch>
+
+# 5. Block direct access to WordPress internals
+<LocationMatch "/wp-includes/.*\.php$">
+  Require all denied
+</LocationMatch>
+
+# 6. Block aggressive bots / scrapers / AI crawlers
+SetEnvIfNoCase User-Agent "PetalBot|MJ12bot|DotBot|SemrushBot|AhrefsBot|Bytespider|YandexBot|seznambot|MegaIndex|BLEXBot|DataForSeoBot|GeedoShop|MauiBot|sogou|spbot|trendkite|garlik|webmeup|exabot|Lipperhey|psbot|360Spider" bad_bot
+SetEnvIfNoCase User-Agent "GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|FacebookBot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot" bad_bot
+SetEnvIfNoCase User-Agent "^$" bad_bot
+SetEnvIfNoCase User-Agent "^-?$" bad_bot
+
+<RequireAll>
+  Require all granted
+  Require not env bad_bot
+</RequireAll>
+
+# 7. Hide server version info
+ServerTokens Prod
+ServerSignature Off
+HARDENEOF
+
+    # Validate config before reload
+    if $APACHE_BIN -t 2>&1 | grep -q "Syntax OK"; then
+      # Enable on Debian (needs symlink in conf-enabled)
+      if [ "$PANEL" = "debian" ] && [ ! -L /etc/apache2/conf-enabled/99-global-hardening.conf ]; then
+        ln -sf "$HARDENING_CONF" /etc/apache2/conf-enabled/99-global-hardening.conf
+      fi
+      systemctl reload "$APACHE_SERVICE" 2>/dev/null
+      chattr +i "$HARDENING_CONF" 2>/dev/null || true
+      echo "✓ $HARDENING_CONF deployed + frozen"
+    else
+      echo "✗ Apache syntax error after hardening — restoring backup"
+      [ -f "${HARDENING_CONF}.bak-pre-tune" ] && cp "${HARDENING_CONF}.bak-pre-tune" "$HARDENING_CONF" || rm -f "$HARDENING_CONF"
+    fi
+  fi
+else
+  echo "⊘ Apache hardening skipped"
+fi
+
+# ────────────────────────────────────────────────
+# 10. Install helper scripts (tenant-cap, monitor, auto-recovery)
+# ────────────────────────────────────────────────
+echo ""
+echo "─── [10/10] Install helper scripts ───"
 if [ "$INSTALL_HELPERS" = "1" ]; then
   mkdir -p /usr/local/sbin
 

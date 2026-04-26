@@ -7,16 +7,18 @@ Server ops scripts — performance bootstrap, FPM/MPM tuning, monitoring, and re
 A single auto-detecting script that:
 
 1. Tunes the kernel for high-concurrency web workloads
-2. Bumps OPcache to 256 MB across every installed PHP version
-3. Tunes per-user PHP-FPM pools (with `request_terminate_timeout = 30s`)
-4. Patches CWP templates so future tenants inherit the tuning
-5. Bumps Apache MPM workers (RAM-scaled, frozen with `chattr +i`)
-6. Caps Redis memory + sets LRU eviction policy
-7. Reloads services gracefully (no downtime)
-8. Installs three helper commands:
-   - `tenant-cap` — instantly cap a noisy tenant's PHP workers
-   - `saturation-monitor` — cron logs slow sites to `/var/log/saturation.log`
-   - `auto-recovery` — cron auto-reloads services if a site is catastrophically slow (off by default)
+2. Auto-creates swap if none exists (small VPS often ship without)
+3. Bumps OPcache (RAM-scaled) across every installed PHP version
+4. Tunes per-user PHP-FPM pools (with `request_terminate_timeout = 30s`)
+5. Patches CWP templates so future tenants inherit the tuning
+6. Bumps Apache MPM workers (RAM-scaled, frozen with `chattr +i`)
+7. Caps Redis memory + sets LRU eviction policy
+8. Reloads services gracefully (no downtime)
+9. **Drops in `99-global-hardening.conf`** — blocks bad bots, sensitive file exposure, PHP-in-uploads, dangerous HTTP methods (complements cpGuard / mod_security / fail2ban)
+10. Installs three helper commands:
+    - `tenant-cap` — instantly cap a noisy tenant's PHP workers
+    - `saturation-monitor` — cron logs slow sites to `/var/log/saturation.log`
+    - `auto-recovery` — cron auto-reloads services if a site is catastrophically slow (off by default)
 
 Works on:
 - CWP / CloudLinux (alt-php paths)
