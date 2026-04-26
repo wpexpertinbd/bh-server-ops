@@ -37,6 +37,12 @@ chmod +x /root/perf-bootstrap.sh
 bash /root/perf-bootstrap.sh
 ```
 
+**Or one-liner (fully unattended, uses auto-detected defaults):**
+
+```bash
+curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh | bash -s -- -y
+```
+
 The script runs **interactive by default** — it auto-detects the environment (panel, Apache MPM, PHP versions, RAM), then prompts for:
 
 - **Action:** Install / Rollback / Quit
