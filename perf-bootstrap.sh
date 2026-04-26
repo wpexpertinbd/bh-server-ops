@@ -694,6 +694,10 @@ PYEOF
   if $APACHE_BIN -t 2>&1 | grep -q "Syntax OK"; then
     chattr +i "$APACHE_MPM_CONF" 2>/dev/null || true
     echo "✓ MPM config valid + frozen"
+    # MPM directives (ThreadsPerChild, ServerLimit) only re-read on a full
+    # RESTART, never on a reload. Without this, the new MaxRequestWorkers
+    # tier never takes effect and you stay capped at the old worker count.
+    MPM_NEEDS_RESTART=1
   else
     echo "✗ Syntax error — restoring backup"
     cp "${APACHE_MPM_CONF}.bak-pre-tune" "$APACHE_MPM_CONF"
@@ -1022,8 +1026,10 @@ if [ -n "$NGINX_BIN" ] && systemctl is-active --quiet nginx 2>/dev/null; then
   rm -f "$NGX_SNIPPETS/static-edge.conf"
   if [ -n "$NGX_VHOST_DIR" ]; then
     for VH in "$NGX_VHOST_DIR"/*.conf; do
-      grep -q "bh-static-edge-injected" "$VH" 2>/dev/null && \
+      [ -f "$VH" ] || continue
+      if grep -q "bh-static-edge-injected" "$VH" 2>/dev/null; then
         sed -i '/bh-static-edge-injected/,+1d' "$VH"
+      fi
     done
   fi
 
@@ -1127,7 +1133,15 @@ done
 
 # Apache reload — verify still active after reload, restart if dead
 if [ -n "$APACHE_SERVICE" ] && systemctl is-active --quiet "$APACHE_SERVICE" 2>/dev/null; then
-  systemctl reload "$APACHE_SERVICE" 2>/dev/null
+  # MPM-level changes (ServerLimit, ThreadsPerChild) only take effect on
+  # full restart. A reload keeps the old thread count, so the new
+  # MaxRequestWorkers tier never activates.
+  if [ "${MPM_NEEDS_RESTART:-0}" = "1" ]; then
+    echo "  MPM changed → full restart (required for ServerLimit/ThreadsPerChild to apply)"
+    systemctl restart "$APACHE_SERVICE" 2>/dev/null
+  else
+    systemctl reload "$APACHE_SERVICE" 2>/dev/null
+  fi
   sleep 2
   if systemctl is-active --quiet "$APACHE_SERVICE"; then
     echo "✓ reloaded $APACHE_SERVICE (still active)"
