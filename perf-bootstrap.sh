@@ -288,7 +288,17 @@ if [ "$MODE" = "rollback" ]; then
     fi
   done
 
-  echo "✓ Removed drop-in configs (sysctl, OPcache 99-tuned, hardening)"
+  # Strip our wp-cron/xmlrpc block from main httpd.conf (between markers)
+  for HC in /usr/local/apache/conf/httpd.conf \
+            /etc/httpd/conf/httpd.conf \
+            /etc/apache2/apache2.conf; do
+    if [ -f "$HC" ] && grep -q "BH-OPS-HARDENING-MARKER" "$HC"; then
+      sed -i '/# ── BH-OPS-HARDENING-MARKER ──/,/# ── END BH-OPS-HARDENING-MARKER ──/d' "$HC"
+      echo "✓ Removed BH-OPS hardening block from $HC"
+    fi
+  done
+
+  echo "✓ Removed drop-in configs (sysctl, OPcache 99-tuned, hardening, httpd.conf patches)"
 
   # Remove helpers
   rm -f /usr/local/sbin/tenant-cap /usr/local/sbin/saturation-monitor /usr/local/sbin/auto-recovery
@@ -707,7 +717,6 @@ HARDENEOF
       if [ "$PANEL" = "debian" ] && [ ! -L /etc/apache2/conf-enabled/99-global-hardening.conf ]; then
         ln -sf "$HARDENING_CONF" /etc/apache2/conf-enabled/99-global-hardening.conf
       fi
-      systemctl reload "$APACHE_SERVICE" 2>/dev/null
       chattr +i "$HARDENING_CONF" 2>/dev/null || true
       echo "✓ $HARDENING_CONF deployed + frozen"
     else
@@ -715,6 +724,49 @@ HARDENEOF
       [ -f "${HARDENING_CONF}.bak-pre-tune" ] && cp "${HARDENING_CONF}.bak-pre-tune" "$HARDENING_CONF" || rm -f "$HARDENING_CONF"
     fi
   fi
+
+  # ── ALSO patch main httpd.conf with wp-cron/xmlrpc block (belt-and-suspenders)
+  #    Some setups don't include conf.d/* reliably (legacy CWP, custom builds).
+  #    Adding to main config guarantees the block fires regardless.
+  HTTPD_CONF=""
+  case "$PANEL" in
+    cwp)    HTTPD_CONF=/usr/local/apache/conf/httpd.conf ;;
+    rhel)   HTTPD_CONF=/etc/httpd/conf/httpd.conf ;;
+    debian) HTTPD_CONF=/etc/apache2/apache2.conf ;;
+  esac
+
+  if [ -n "$HTTPD_CONF" ] && [ -f "$HTTPD_CONF" ]; then
+    # Idempotency check — skip if our marker OR an existing xmlrpc block is present
+    if grep -q "BH-OPS-HARDENING-MARKER\|<FilesMatch.*xmlrpc\\\\\.php" "$HTTPD_CONF"; then
+      echo "✓ httpd.conf already has wp-cron/xmlrpc block — skipping"
+    else
+      # Backup once
+      [ -f "${HTTPD_CONF}.bak-pre-tune" ] || cp "$HTTPD_CONF" "${HTTPD_CONF}.bak-pre-tune"
+
+      cat >> "$HTTPD_CONF" <<'HTTPDEOF'
+
+# ── BH-OPS-HARDENING-MARKER ── (managed by bh-server-ops bootstrap)
+# Block wp-cron.php and xmlrpc.php at main config level (belt-and-suspenders
+# alongside conf.d/99-global-hardening.conf). Tenants should use real cron
+# instead of wp-cron.php; xmlrpc.php has no legitimate use case in 99% of sites.
+<FilesMatch "^(wp-cron\.php|xmlrpc\.php)$">
+    Require all denied
+</FilesMatch>
+# ── END BH-OPS-HARDENING-MARKER ──
+HTTPDEOF
+
+      # Validate syntax — restore on failure
+      if $APACHE_BIN -t 2>&1 | grep -q "Syntax OK"; then
+        echo "✓ $HTTPD_CONF appended wp-cron/xmlrpc block"
+      else
+        echo "✗ Apache syntax error after httpd.conf patch — restoring backup"
+        cp "${HTTPD_CONF}.bak-pre-tune" "$HTTPD_CONF"
+      fi
+    fi
+  fi
+
+  # Reload Apache once at the end (covers both conf.d drop-in + httpd.conf patch)
+  systemctl reload "$APACHE_SERVICE" 2>/dev/null && echo "✓ reloaded $APACHE_SERVICE (hardening live)"
 else
   echo "⊘ Apache hardening skipped"
 fi
