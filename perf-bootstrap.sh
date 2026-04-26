@@ -54,27 +54,30 @@ fi
 # ────────────────────────────────────────────────
 # Compute proportional values so a 4 GB VPS doesn't get 64 GB defaults.
 # Format: <comment shows expected peak Apache+OPcache+Redis baseline>
-if   [ "$TARGET_RAM_GB" -ge 60 ]; then  # baseline ~10 GB (60GB+ box reports 62)
+# Tier thresholds are 2 GB below their nominal value because /proc/meminfo
+# always reports less than installed (kernel + firmware reserve ~2 GB on
+# big boxes, ~1 GB on small VPS). 64 GB box → 62 GB, 16 GB → 15 GB, etc.
+if   [ "$TARGET_RAM_GB" -ge 60 ]; then  # 64 GB-class
   MAX_WORKERS=1600;  THREADS_PER_CHILD=50;  SERVER_LIMIT=32
   LIGHT_CHILDREN=10; HEAVY_CHILDREN=20
   OPCACHE_MB=256;    OPCACHE_FILES=20000;   INTERNED_MB=16
   REDIS_MAX=2gb
-elif [ "$TARGET_RAM_GB" -ge 32 ]; then  # baseline ~6 GB
+elif [ "$TARGET_RAM_GB" -ge 30 ]; then  # 32 GB-class (reports ~30-31)
   MAX_WORKERS=800;   THREADS_PER_CHILD=50;  SERVER_LIMIT=16
   LIGHT_CHILDREN=10; HEAVY_CHILDREN=20
   OPCACHE_MB=256;    OPCACHE_FILES=20000;   INTERNED_MB=16
   REDIS_MAX=1gb
-elif [ "$TARGET_RAM_GB" -ge 16 ]; then  # baseline ~3 GB
+elif [ "$TARGET_RAM_GB" -ge 14 ]; then  # 16 GB-class (reports ~15)
   MAX_WORKERS=400;   THREADS_PER_CHILD=50;  SERVER_LIMIT=8
   LIGHT_CHILDREN=8;  HEAVY_CHILDREN=15
   OPCACHE_MB=192;    OPCACHE_FILES=15000;   INTERNED_MB=12
   REDIS_MAX=512mb
-elif [ "$TARGET_RAM_GB" -ge 8 ];  then  # baseline ~1.5 GB
+elif [ "$TARGET_RAM_GB" -ge 7 ];  then  # 8 GB-class (reports ~7)
   MAX_WORKERS=200;   THREADS_PER_CHILD=40;  SERVER_LIMIT=5
   LIGHT_CHILDREN=6;  HEAVY_CHILDREN=12
   OPCACHE_MB=128;    OPCACHE_FILES=10000;   INTERNED_MB=8
   REDIS_MAX=384mb
-elif [ "$TARGET_RAM_GB" -ge 4 ];  then  # baseline ~700 MB (small VPS)
+elif [ "$TARGET_RAM_GB" -ge 3 ];  then  # 4 GB-class (reports ~3.5)
   MAX_WORKERS=100;   THREADS_PER_CHILD=25;  SERVER_LIMIT=4
   LIGHT_CHILDREN=4;  HEAVY_CHILDREN=8
   OPCACHE_MB=96;     OPCACHE_FILES=8000;    INTERNED_MB=8
@@ -949,18 +952,27 @@ fi
 #                   = brute-force attempt, ban 1h
 echo ""
 echo "─── [6e/10] fail2ban (nginx + WP brute-force) ───"
+# Wrapped in `set +e` because package install can fail on locked-down
+# systems (no EPEL repo, network issues) and we don't want to kill the
+# whole bootstrap over an optional component.
+set +e
 if ! command -v fail2ban-client >/dev/null 2>&1; then
   if command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q fail2ban fail2ban-firewalld 2>/dev/null || dnf install -y -q fail2ban
+    # fail2ban lives in EPEL on RHEL-family — install epel-release first
+    rpm -q epel-release >/dev/null 2>&1 || dnf install -y -q epel-release 2>/dev/null
+    dnf install -y -q fail2ban fail2ban-firewalld 2>/dev/null || dnf install -y -q fail2ban 2>/dev/null
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y -q fail2ban
+    rpm -q epel-release >/dev/null 2>&1 || yum install -y -q epel-release 2>/dev/null
+    yum install -y -q fail2ban 2>/dev/null
   elif command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y -q fail2ban
+    apt-get install -y -q fail2ban 2>/dev/null
   fi
 fi
+set -e
 
 if command -v fail2ban-client >/dev/null 2>&1; then
-  mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
+  set +e   # don't kill the script if any single fail2ban op fails
+  mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d /etc/fail2ban/action.d
 
   # Filter: nginx 444 (bad bot)
   cat > /etc/fail2ban/filter.d/nginx-badbot.conf <<'F2BF'
@@ -1025,8 +1037,10 @@ F2BJ
   else
     echo "⚠ fail2ban installed but not running — check: journalctl -u fail2ban -n 50"
   fi
+  set -e
 else
-  echo "⊘ fail2ban not installable on this system — skipping"
+  echo "⊘ fail2ban not installable on this system (no EPEL repo? offline?) — skipping"
+  echo "  manual install: dnf install -y epel-release && dnf install -y fail2ban"
 fi
 
 # ────────────────────────────────────────────────
