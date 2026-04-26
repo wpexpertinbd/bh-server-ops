@@ -723,6 +723,198 @@ if [ -n "$BAD_WD" ]; then
 fi
 
 # ────────────────────────────────────────────────
+# 6c. Nginx anti-bot + rate limiting (when nginx fronts Apache)
+# ────────────────────────────────────────────────
+# Why this exists: when Apache is the backend behind nginx (default CWP
+# layout), bot traffic still consumes Apache workers — bots ignore robots.txt
+# and hammer dynamic URLs. Cheaper to drop them at the nginx edge with
+# `return 444` (closes connection, costs almost nothing) than to let them
+# reach Apache+ModSecurity. Also rate-limits /robots.txt itself which is
+# typically the most-hit URL on a hosting fleet (we saw 379 of 412 visible
+# requests on one server).
+#
+# Strategy:
+#   1. Drop /etc/nginx/conf.d/00-anti-bot.conf — http-level zones + UA map
+#   2. Drop /etc/nginx/snippets/anti-bot-server.conf — server-level enforcement
+#   3. Patch each existing CWP vhost in /etc/nginx/conf.d/vhosts/*.conf
+#      to `include` the snippet (idempotent via marker)
+#   4. Try to patch the CWP template so newly-created vhosts also get it
+echo ""
+echo "─── [6c/10] Nginx anti-bot + rate limit ───"
+
+NGINX_BIN=$(command -v nginx 2>/dev/null || echo "")
+if [ -z "$NGINX_BIN" ] || ! systemctl is-active --quiet nginx 2>/dev/null; then
+  echo "⊘ nginx not running — skipping anti-bot setup"
+else
+  # Detect vhost dir (CWP variants)
+  NGX_VHOST_DIR=""
+  for D in /etc/nginx/conf.d/vhosts /usr/local/nginx/conf/conf.d/vhosts /etc/nginx/sites-enabled; do
+    [ -d "$D" ] && NGX_VHOST_DIR="$D" && break
+  done
+  NGX_CONF_D=/etc/nginx/conf.d
+  [ -d /usr/local/nginx/conf/conf.d ] && [ ! -d "$NGX_CONF_D" ] && NGX_CONF_D=/usr/local/nginx/conf/conf.d
+  NGX_SNIPPETS=/etc/nginx/snippets
+  mkdir -p "$NGX_SNIPPETS"
+
+  echo "  nginx vhost dir: ${NGX_VHOST_DIR:-(none found — http-only setup)}"
+  echo "  nginx conf.d:    $NGX_CONF_D"
+
+  # ─ http-level: rate zones + bad-bot UA map ─
+  cat > "$NGX_CONF_D/00-anti-bot.conf" <<'NGXHTTP'
+# bh-anti-bot v1 — http-level zones + map (loaded before vhosts)
+limit_req_zone $binary_remote_addr zone=bot_rl:10m   rate=20r/s;
+limit_req_zone $binary_remote_addr zone=robots_rl:10m rate=2r/m;
+limit_req_status 429;
+
+map $http_user_agent $bh_bad_bot {
+    default                 0;
+    "~*ahrefsbot"           1;
+    "~*semrushbot"          1;
+    "~*mj12bot"             1;
+    "~*dotbot"              1;
+    "~*petalbot"            1;
+    "~*bytespider"          1;
+    "~*amazonbot"           1;
+    "~*claudebot"           1;
+    "~*gptbot"              1;
+    "~*chatgpt-user"        1;
+    "~*ccbot"               1;
+    "~*google-extended"     1;
+    "~*facebookexternalhit" 1;
+    "~*headlesschrome"      1;
+    "~*scrapy"              1;
+    "~*python-requests"     1;
+    "~*go-http-client"      1;
+    "~*libwww-perl"         1;
+    "~*\.(?:ru|cn|ir)/bot"  1;
+    ""                      1;  # empty UA
+}
+NGXHTTP
+
+  # ─ server-level: the actual enforcement, included from each vhost ─
+  cat > "$NGX_SNIPPETS/anti-bot-server.conf" <<'NGXSERVER'
+# bh-anti-bot v1 — included inside server { } of every vhost
+if ($bh_bad_bot) { return 444; }
+
+location = /robots.txt {
+    limit_req zone=robots_rl burst=2 nodelay;
+    access_log off;
+    log_not_found off;
+    try_files $uri @bh_robots_default;
+}
+location @bh_robots_default {
+    add_header Content-Type text/plain;
+    return 200 "User-agent: *\nDisallow:\n";
+}
+NGXSERVER
+
+  echo "✓ wrote $NGX_CONF_D/00-anti-bot.conf"
+  echo "✓ wrote $NGX_SNIPPETS/anti-bot-server.conf"
+
+  # ─ patch existing vhosts (idempotent via marker) ─
+  if [ -n "$NGX_VHOST_DIR" ]; then
+    PATCHED=0; SKIPPED=0; FAILED=0
+    for VH in "$NGX_VHOST_DIR"/*.conf; do
+      [ -f "$VH" ] || continue
+      # skip if already patched
+      if grep -q "bh-anti-bot-injected" "$VH"; then
+        SKIPPED=$((SKIPPED + 1))
+        continue
+      fi
+      # sanity: must contain a server { block to patch
+      grep -qE '^\s*server\s*\{' "$VH" || { SKIPPED=$((SKIPPED + 1)); continue; }
+      # inject include directive after the FIRST `server {` line
+      python3 - "$VH" <<'PYEOF' || FAILED=$((FAILED + 1))
+import sys, re
+p = sys.argv[1]
+with open(p) as f: c = f.read()
+inject = "    # bh-anti-bot-injected\n    include /etc/nginx/snippets/anti-bot-server.conf;\n"
+new, n = re.subn(r'(server\s*\{\s*\n)', r'\1' + inject, c, count=1)
+if n == 1:
+    with open(p, 'w') as f: f.write(new)
+PYEOF
+      if grep -q "bh-anti-bot-injected" "$VH"; then
+        PATCHED=$((PATCHED + 1))
+      else
+        FAILED=$((FAILED + 1))
+      fi
+    done
+    echo "✓ vhosts: patched=$PATCHED, already-done=$SKIPPED, failed=$FAILED"
+  fi
+
+  # ─ patch CWP nginx template (so newly-created vhosts also get it) ─
+  CWP_NGX_TPL=""
+  for T in /usr/local/cwpsrv/htdocs/resources/admin/cwp_files/nginx_*.conf \
+           /usr/local/cwpsrv/htdocs/resources/admin/templates/nginx_*.conf \
+           /etc/cwpnginx/conf.d/*.tpl; do
+    [ -f "$T" ] && CWP_NGX_TPL="$T" && break
+  done
+  if [ -n "$CWP_NGX_TPL" ]; then
+    if ! grep -q "bh-anti-bot-injected" "$CWP_NGX_TPL"; then
+      cp "$CWP_NGX_TPL" "${CWP_NGX_TPL}.bak-pre-antibot"
+      python3 - "$CWP_NGX_TPL" <<'PYEOF' || true
+import sys, re
+p = sys.argv[1]
+with open(p) as f: c = f.read()
+inject = "    # bh-anti-bot-injected\n    include /etc/nginx/snippets/anti-bot-server.conf;\n"
+new, n = re.subn(r'(server\s*\{\s*\n)', r'\1' + inject, c, count=1)
+if n == 1:
+    with open(p, 'w') as f: f.write(new)
+PYEOF
+      grep -q "bh-anti-bot-injected" "$CWP_NGX_TPL" \
+        && echo "✓ CWP nginx template patched: $CWP_NGX_TPL" \
+        || echo "⚠ couldn't auto-patch CWP template — patch manually if needed: $CWP_NGX_TPL"
+    else
+      echo "✓ CWP nginx template already patched"
+    fi
+  else
+    echo "⊘ CWP nginx template not found — only existing vhosts patched"
+  fi
+
+  # ─ enable a slim access log (visibility for future debugging) ─
+  # Many CWP setups disable nginx access logs entirely. Without them you
+  # can't see WHO is hammering you when the next slow-hour hits.
+  if ! grep -rq "access_log /var/log/nginx/access" "$NGX_CONF_D" 2>/dev/null; then
+    cat > "$NGX_CONF_D/01-access-log.conf" <<'NGXLOG'
+# bh-anti-bot v1 — slim access log for debugging bot floods
+log_format bh_slim '$remote_addr "$request" $status $body_bytes_sent "$http_user_agent"';
+access_log /var/log/nginx/access.log bh_slim buffer=32k flush=5s;
+NGXLOG
+    echo "✓ enabled slim nginx access log → /var/log/nginx/access.log"
+  fi
+
+  # ─ validate + reload ─
+  if "$NGINX_BIN" -t 2>/dev/null; then
+    systemctl reload nginx 2>/dev/null && echo "✓ nginx reloaded"
+  else
+    echo "✗ nginx config test failed — reverting anti-bot changes"
+    rm -f "$NGX_CONF_D/00-anti-bot.conf" "$NGX_CONF_D/01-access-log.conf"
+    [ -n "$CWP_NGX_TPL" ] && [ -f "${CWP_NGX_TPL}.bak-pre-antibot" ] && cp "${CWP_NGX_TPL}.bak-pre-antibot" "$CWP_NGX_TPL"
+    "$NGINX_BIN" -t
+  fi
+fi
+
+# ────────────────────────────────────────────────
+# 6d. PHP handler audit (warn if users on slow CGI)
+# ────────────────────────────────────────────────
+# php-cgi (suPHP/mod_php) spawns a fresh PHP process per request — no
+# OPcache reuse, ~100-250ms startup overhead. On a hosting fleet that's
+# the difference between 5 sites/sec and 50 sites/sec. We don't auto-
+# switch (CWP-specific operation, depends on user's PHP version), but
+# warn so the admin can fix in CWP UI.
+echo ""
+echo "─── [6d/10] PHP handler audit ───"
+CGI_USERS=$(ps -eo user,cmd 2>/dev/null | awk '/php-cgi/ && !/grep/ {print $1}' | sort -u | grep -vE '^(root|nobody|apache)$' || true)
+if [ -n "$CGI_USERS" ]; then
+  echo "⚠ Users running PHP via php-cgi (slow — should be PHP-FPM):"
+  echo "$CGI_USERS" | sed 's/^/    /'
+  echo "  Fix in CWP: User Account → List Accounts → Edit user → PHP Selector → PHP-FPM"
+  echo "  Each user moved to FPM is roughly 10× less Apache worker time per request."
+else
+  echo "✓ no users on slow php-cgi handler"
+fi
+
+# ────────────────────────────────────────────────
 # 6. Redis cap
 # ────────────────────────────────────────────────
 echo ""
