@@ -18,7 +18,7 @@ A single auto-detecting script that:
 10. Installs three helper commands:
     - `tenant-cap` — instantly cap a noisy tenant's PHP workers
     - `saturation-monitor` — cron logs slow sites to `/var/log/saturation.log`
-    - `auto-recovery` — cron auto-reloads services if a site is catastrophically slow (off by default)
+    - `auto-recovery` — cron auto-reloads services if a site is catastrophically slow
 
 Works on:
 - CWP / CloudLinux (alt-php paths)
@@ -46,7 +46,7 @@ The script runs **interactive by default** — it auto-detects the environment (
 - **Redis cap?** (yes/no)
 - **Install helpers?** (`tenant-cap`, `saturation-monitor`, `auto-recovery`)
 - **Saturation-monitor cron** (every 5 min — recommended yes)
-- **Auto-recovery cron** (every 3 min — default no, opt-in)
+- **Auto-recovery cron** (every 3 min — default yes, self-healing safety net)
 - **Sites to monitor** (auto-discover or provide explicit list)
 
 A summary is shown before any change. Press Enter on each prompt to accept the default in `[brackets]`.
@@ -142,16 +142,17 @@ saturation-monitor
 tail -20 /var/log/saturation.log
 ```
 
-### `auto-recovery` — self-healing reload (cron, 3 min, off by default)
+### `auto-recovery` — self-healing reload (cron, 3 min, **on by default**)
 
-Optional cron that runs every 3 minutes. If TTFB exceeds recovery threshold (default 20s):
-1. Graceful reload Apache
-2. Reload all running PHP-FPM services
-3. Flush Varnish cache
-4. Throttle: skips if last recovery was less than 10 minutes ago
-5. Logs to `/var/log/auto-recovery.log`
+Cron runs every 3 minutes. If TTFB exceeds recovery threshold (default 20s):
+1. Graceful reload Apache (zero downtime)
+2. If site still slow after 5 sec → escalates to `restart httpd` (1-2 sec blip, guaranteed clear of stuck workers)
+3. Reload all running PHP-FPM services
+4. Flush Varnish cache
+5. Throttle: skips if last recovery fired less than 10 min ago (prevents loops)
+6. Logs to `/var/log/auto-recovery.log`
 
-To enable, set `ENABLE_AUTO_RECOVERY_CRON=1` in the bootstrap script before running. **Recommendation:** observe `saturation-monitor` logs for a week first to see actual patterns, then enable auto-recovery only if needed.
+To disable, choose `n` at the prompt OR set `ENABLE_AUTO_RECOVERY_CRON=0`. Disable temporarily for diagnostic windows where you want saturation events to persist for inspection.
 
 ## RAM-tier scaling
 

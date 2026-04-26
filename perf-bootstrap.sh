@@ -31,7 +31,7 @@ TARGET_RAM_GB="${TARGET_RAM_GB:-auto}"       # 'auto' = detect from /proc/meminf
 
 INSTALL_HELPERS="${INSTALL_HELPERS:-1}"
 ENABLE_MONITOR_CRON="${ENABLE_MONITOR_CRON:-1}"
-ENABLE_AUTO_RECOVERY_CRON="${ENABLE_AUTO_RECOVERY_CRON:-0}"
+ENABLE_AUTO_RECOVERY_CRON="${ENABLE_AUTO_RECOVERY_CRON:-1}"
 MONITOR_SITES="${MONITOR_SITES:-}"           # auto-discover if empty
 TTFB_WARN_THRESHOLD="${TTFB_WARN_THRESHOLD:-10}"
 TTFB_RECOVER_THRESHOLD="${TTFB_RECOVER_THRESHOLD:-20}"
@@ -355,7 +355,7 @@ if [ "$INTERACTIVE" = "1" ]; then
     ask_yn "Enable saturation-monitor cron (every 5 min, logs slow sites)?" "y"
     ENABLE_MONITOR_CRON="$REPLY"
 
-    ask_yn "Enable auto-recovery cron (every 3 min, auto-reloads on saturation)?" "n"
+    ask_yn "Enable auto-recovery cron (every 3 min, auto-reloads on saturation)?" "y"
     ENABLE_AUTO_RECOVERY_CRON="$REPLY"
 
     if [ "$ENABLE_MONITOR_CRON" = "1" ] || [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
