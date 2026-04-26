@@ -623,6 +623,29 @@ if [ "$APPLY_APACHE_MPM" = "1" ] && [ -n "$APACHE_BIN" ] && [ -f "$APACHE_MPM_CO
   echo "Current MPM: $CURRENT_MPM"
   echo "Config file: $APACHE_MPM_CONF"
 
+  # Sanity: is the MPM conf file actually included by httpd.conf? CWP ships
+  # it commented out by default → all our tuning becomes a no-op while
+  # Apache silently runs on hardcoded built-in defaults (ServerLimit 16,
+  # ThreadsPerChild 25 = 400 workers max). Auto-uncomment if found.
+  HTTPD_CONF=$($APACHE_BIN -V 2>&1 | grep SERVER_CONFIG_FILE | sed 's/.*"\(.*\)".*/\1/')
+  case "$HTTPD_CONF" in /*) : ;; *) HTTPD_CONF="$(dirname $($APACHE_BIN -V 2>&1 | grep HTTPD_ROOT | sed 's/.*"\(.*\)".*/\1/'))/$HTTPD_CONF" ;; esac
+  HTTPD_ROOT=$($APACHE_BIN -V 2>&1 | grep HTTPD_ROOT | sed 's/.*"\(.*\)".*/\1/')
+  [ -d "$HTTPD_ROOT" ] && HTTPD_CONF="$HTTPD_ROOT/conf/httpd.conf"
+  if [ -f "$HTTPD_CONF" ]; then
+    INCLUDE_REL=$(echo "$APACHE_MPM_CONF" | sed "s|$HTTPD_ROOT/||")
+    if grep -qE "^\s*#\s*Include\s+(${INCLUDE_REL}|conf/extra/httpd-mpm.conf)" "$HTTPD_CONF"; then
+      echo "⚠ httpd-mpm.conf include is COMMENTED OUT in $HTTPD_CONF — uncommenting"
+      cp "$HTTPD_CONF" "${HTTPD_CONF}.bak-pre-mpm-include"
+      sed -i 's|^\s*#\s*Include\s\+conf/extra/httpd-mpm.conf|Include conf/extra/httpd-mpm.conf|' "$HTTPD_CONF"
+      echo "  ✓ uncommented — MPM conf will now actually load"
+    elif ! grep -qE "^\s*Include\s+(${INCLUDE_REL}|conf/extra/httpd-mpm.conf)" "$HTTPD_CONF"; then
+      echo "⚠ httpd-mpm.conf is not Include'd anywhere — adding line to $HTTPD_CONF"
+      echo "Include conf/extra/httpd-mpm.conf" >> "$HTTPD_CONF"
+    else
+      echo "✓ httpd-mpm.conf is properly included"
+    fi
+  fi
+
   # MAX_WORKERS, THREADS_PER_CHILD, SERVER_LIMIT already computed in the
   # RAM TIER block at the top of the script — use those values.
   THREADS=$THREADS_PER_CHILD
