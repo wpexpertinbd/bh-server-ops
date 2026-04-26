@@ -526,6 +526,24 @@ echo ""
 echo "─── [4/10] Per-user FPM pool tuning ───"
 TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0
 
+# Auto-detect Laravel/Symfony users by presence of `artisan` file in any
+# of their docroots. Saves having to maintain HEAVY_USERS by hand. Only
+# adds users that aren't already in HEAVY_USERS or SKIP_USERS.
+DETECTED_HEAVY=""
+for HOMEDIR in /home/*; do
+  [ -d "$HOMEDIR" ] || continue
+  USER=$(basename "$HOMEDIR")
+  case " $HEAVY_USERS $SKIP_USERS " in *" $USER "*) continue ;; esac
+  # any artisan file anywhere in user's home (depth 4 covers most layouts)
+  if find "$HOMEDIR" -maxdepth 4 -name "artisan" -type f 2>/dev/null | head -1 | grep -q .; then
+    DETECTED_HEAVY="$DETECTED_HEAVY $USER"
+  fi
+done
+if [ -n "$DETECTED_HEAVY" ]; then
+  echo "  Auto-detected Laravel/Symfony users:$DETECTED_HEAVY"
+  HEAVY_USERS="$HEAVY_USERS$DETECTED_HEAVY"
+fi
+
 ensure_kv() {
   local conf="$1" key="$2" value="$3"
   if grep -q "^${key}\b" "$conf"; then
@@ -759,12 +777,9 @@ else
   echo "  nginx vhost dir: ${NGX_VHOST_DIR:-(none found — http-only setup)}"
   echo "  nginx conf.d:    $NGX_CONF_D"
 
-  # ─ http-level: rate zones + bad-bot UA map ─
+  # ─ http-level: bad-bot UA map (zones removed — used by fail2ban now) ─
   cat > "$NGX_CONF_D/00-anti-bot.conf" <<'NGXHTTP'
-# bh-anti-bot v1 — http-level zones + map (loaded before vhosts)
-limit_req_zone $binary_remote_addr zone=bot_rl:10m   rate=20r/s;
-limit_req_zone $binary_remote_addr zone=robots_rl:10m rate=2r/m;
-limit_req_status 429;
+# bh-anti-bot v1 — http-level UA map (loaded before vhosts)
 
 map $http_user_agent $bh_bad_bot {
     default                 0;
@@ -792,20 +807,20 @@ map $http_user_agent $bh_bad_bot {
 NGXHTTP
 
   # ─ server-level: the actual enforcement, included from each vhost ─
+  # ONLY block-style rules — never try to "rate-limit then forward",
+  # because we don't know the vhost's upstream from inside an include.
+  # Brute-force protection on /wp-login.php is handled by fail2ban below.
   cat > "$NGX_SNIPPETS/anti-bot-server.conf" <<'NGXSERVER'
-# bh-anti-bot v1 — included inside server { } of every vhost
+# bh-anti-bot v1 — included at the top of every server { }
+
+# 1. Drop bad-UA scrapers (444 = close connection, zero bytes sent back)
 if ($bh_bad_bot) { return 444; }
 
-location = /robots.txt {
-    limit_req zone=robots_rl burst=2 nodelay;
-    access_log off;
-    log_not_found off;
-    try_files $uri @bh_robots_default;
-}
-location @bh_robots_default {
-    add_header Content-Type text/plain;
-    return 200 "User-agent: *\nDisallow:\n";
-}
+# 2. Block paths with no legitimate use + constant attack targets
+location = /xmlrpc.php       { deny all; access_log off; log_not_found off; return 444; }
+location ~* /wp-config\.php  { deny all; return 444; }
+location ~* /\.(env|git|svn|htaccess|htpasswd|DS_Store)(/|$) { deny all; return 444; }
+location ~* /(?:eval-stdin|wlwmanifest|adminer|phpunit|phpinfo)\.php$ { deny all; return 444; }
 NGXSERVER
 
   echo "✓ wrote $NGX_CONF_D/00-anti-bot.conf"
@@ -892,6 +907,171 @@ NGXLOG
     [ -n "$CWP_NGX_TPL" ] && [ -f "${CWP_NGX_TPL}.bak-pre-antibot" ] && cp "${CWP_NGX_TPL}.bak-pre-antibot" "$CWP_NGX_TPL"
     "$NGINX_BIN" -t
   fi
+fi
+
+# ────────────────────────────────────────────────
+# 6e. fail2ban for nginx 444s + WP brute-force
+# ────────────────────────────────────────────────
+# Drops repeat-offender IPs at the firewall level so they never reach
+# nginx again. Two jails:
+#   - nginx-badbot: any IP that gets 444'd more than 10 times in 10 min
+#                   = persistent scraper, ban 24h
+#   - wp-login:     any IP with 5+ POST /wp-login.php in 5 min
+#                   = brute-force attempt, ban 1h
+echo ""
+echo "─── [6e/10] fail2ban (nginx + WP brute-force) ───"
+if ! command -v fail2ban-client >/dev/null 2>&1; then
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q fail2ban fail2ban-firewalld 2>/dev/null || dnf install -y -q fail2ban
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q fail2ban
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y -q fail2ban
+  fi
+fi
+
+if command -v fail2ban-client >/dev/null 2>&1; then
+  mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
+
+  # Filter: nginx 444 (bad bot)
+  cat > /etc/fail2ban/filter.d/nginx-badbot.conf <<'F2BF'
+[Definition]
+failregex = ^<HOST>\s+"[A-Z]+\s+\S+.*"\s+444\s
+ignoreregex =
+F2BF
+
+  # Filter: WP login POST
+  cat > /etc/fail2ban/filter.d/wp-login.conf <<'F2BF'
+[Definition]
+failregex = ^<HOST>\s+"POST\s+(?:[^"]*/)?wp-login\.php[^"]*"
+ignoreregex =
+F2BF
+
+  # Jail config — only active if nginx access log exists
+  NGX_LOG=/var/log/nginx/access.log
+  cat > /etc/fail2ban/jail.d/bh-nginx.conf <<F2BJ
+[DEFAULT]
+banaction = iptables-multiport
+backend   = auto
+
+[nginx-badbot]
+enabled  = true
+port     = http,https
+filter   = nginx-badbot
+logpath  = $NGX_LOG
+maxretry = 10
+findtime = 600
+bantime  = 86400
+
+[wp-login]
+enabled  = true
+port     = http,https
+filter   = wp-login
+logpath  = $NGX_LOG
+maxretry = 5
+findtime = 300
+bantime  = 3600
+F2BJ
+
+  systemctl enable --now fail2ban 2>/dev/null
+  systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban 2>/dev/null
+  sleep 1
+  if systemctl is-active --quiet fail2ban; then
+    echo "✓ fail2ban active — jails:"
+    fail2ban-client status 2>/dev/null | grep -E "Jail list" | sed 's/^/    /'
+  else
+    echo "⚠ fail2ban installed but not running — check: journalctl -u fail2ban -n 50"
+  fi
+else
+  echo "⊘ fail2ban not installable on this system — skipping"
+fi
+
+# ────────────────────────────────────────────────
+# 6f. Static-file edge serving (let nginx handle JS/CSS/images,
+#     never bother Apache for them — biggest single speed win)
+# ────────────────────────────────────────────────
+# Most "5-10 second page loads" client complaints aren't really PHP
+# being slow — they're 50+ static asset requests each going through
+# nginx → Apache → mod_proxy_fcgi → file read. Letting nginx serve
+# them direct-from-disk drops that to ~1ms per asset.
+echo ""
+echo "─── [6f/10] Nginx → static-file edge serving ───"
+if [ -n "$NGINX_BIN" ] && systemctl is-active --quiet nginx 2>/dev/null; then
+  cat > "$NGX_SNIPPETS/static-edge.conf" <<'NGXSTATIC'
+# bh-static-edge v1 — included inside server { } per vhost
+# Long-cache static assets, served direct from disk, never touch Apache.
+# Browser cache for 30 days; nginx open_file_cache for the file handles.
+location ~* \.(?:css|js|jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|pdf|zip)$ {
+    expires 30d;
+    add_header Cache-Control "public, immutable";
+    access_log off;
+    log_not_found off;
+    # If file exists on disk, serve it — else fall through to vhost's
+    # default location which already proxies to Apache.
+    try_files $uri @bh_static_miss;
+}
+location @bh_static_miss { return 404; }
+NGXSTATIC
+
+  # http-level open-file-cache (huge static-perf boost; keep handles warm)
+  if ! grep -rq "open_file_cache" "$NGX_CONF_D" 2>/dev/null; then
+    cat > "$NGX_CONF_D/02-perf.conf" <<'NGXPERF'
+# bh-perf v1 — keeps file descriptors hot in nginx
+open_file_cache          max=10000 inactive=60s;
+open_file_cache_valid    30s;
+open_file_cache_min_uses 2;
+open_file_cache_errors   on;
+
+# Larger gzip on the fly for HTML/JSON/CSS/JS
+gzip               on;
+gzip_vary          on;
+gzip_proxied       any;
+gzip_comp_level    5;
+gzip_min_length    1024;
+gzip_types         text/plain text/css application/json application/javascript text/javascript application/xml application/xml+rss text/xml image/svg+xml application/vnd.ms-fontobject font/ttf font/otf font/eot;
+
+# TCP nicer-defaults
+sendfile           on;
+tcp_nopush         on;
+tcp_nodelay        on;
+keepalive_timeout  30;
+keepalive_requests 1000;
+
+# Don't reveal nginx version
+server_tokens      off;
+NGXPERF
+    echo "✓ wrote $NGX_CONF_D/02-perf.conf (open_file_cache + gzip + tcp tuning)"
+  fi
+
+  # Patch every vhost to also include static-edge.conf (idempotent)
+  if [ -n "$NGX_VHOST_DIR" ]; then
+    PATCHED=0
+    for VH in "$NGX_VHOST_DIR"/*.conf; do
+      [ -f "$VH" ] || continue
+      grep -q "bh-static-edge-injected" "$VH" && continue
+      grep -qE '^\s*server\s*\{' "$VH" || continue
+      python3 - "$VH" <<'PYEOF' || true
+import sys, re
+p = sys.argv[1]
+with open(p) as f: c = f.read()
+inject = "    # bh-static-edge-injected\n    include /etc/nginx/snippets/static-edge.conf;\n"
+new, n = re.subn(r'(server\s*\{\s*\n)', r'\1' + inject, c, count=1)
+if n == 1:
+    with open(p, 'w') as f: f.write(new)
+PYEOF
+      grep -q "bh-static-edge-injected" "$VH" && PATCHED=$((PATCHED + 1))
+    done
+    echo "✓ static-edge injected into $PATCHED vhosts"
+  fi
+
+  # Validate + reload
+  if "$NGINX_BIN" -t 2>/dev/null; then
+    systemctl reload nginx 2>/dev/null && echo "✓ nginx reloaded with edge caching"
+  else
+    echo "⚠ nginx config error — review with: nginx -t"
+  fi
+else
+  echo "⊘ nginx not running — skipping static edge"
 fi
 
 # ────────────────────────────────────────────────
