@@ -956,16 +956,22 @@ echo "─── [6e/10] fail2ban (nginx + WP brute-force) ───"
 # systems (no EPEL repo, network issues) and we don't want to kill the
 # whole bootstrap over an optional component.
 set +e
+# CRITICAL: every install call MUST have `</dev/null` to detach stdin.
+# When the script is run via `curl | bash`, bash reads its commands from
+# stdin. If dnf/yum/apt inherits that pipe, they silently consume the
+# rest of the script as input → script appears to exit mid-section with
+# no error. Wasted hours on this. Always redirect stdin for installers
+# inside curl-piped scripts.
 if ! command -v fail2ban-client >/dev/null 2>&1; then
   if command -v dnf >/dev/null 2>&1; then
-    # fail2ban lives in EPEL on RHEL-family — install epel-release first
-    rpm -q epel-release >/dev/null 2>&1 || dnf install -y -q epel-release 2>/dev/null
-    dnf install -y -q fail2ban fail2ban-firewalld 2>/dev/null || dnf install -y -q fail2ban 2>/dev/null
+    rpm -q epel-release >/dev/null 2>&1 || dnf install -y -q epel-release </dev/null >/dev/null 2>&1
+    dnf install -y -q fail2ban fail2ban-firewalld </dev/null >/dev/null 2>&1 || \
+      dnf install -y -q fail2ban </dev/null >/dev/null 2>&1
   elif command -v yum >/dev/null 2>&1; then
-    rpm -q epel-release >/dev/null 2>&1 || yum install -y -q epel-release 2>/dev/null
-    yum install -y -q fail2ban 2>/dev/null
+    rpm -q epel-release >/dev/null 2>&1 || yum install -y -q epel-release </dev/null >/dev/null 2>&1
+    yum install -y -q fail2ban </dev/null >/dev/null 2>&1
   elif command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y -q fail2ban 2>/dev/null
+    apt-get install -y -q fail2ban </dev/null >/dev/null 2>&1
   fi
 fi
 set -e
