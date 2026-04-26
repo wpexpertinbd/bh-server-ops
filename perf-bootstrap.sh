@@ -637,8 +637,26 @@ echo "─── [8/10] Reload services ───"
 for S in "${PHP_FPM_SERVICES[@]}"; do
   systemctl is-active --quiet "$S" 2>/dev/null && systemctl reload "$S" && echo "✓ reloaded $S"
 done
-[ -n "$APACHE_SERVICE" ] && systemctl is-active --quiet "$APACHE_SERVICE" 2>/dev/null && \
-  systemctl reload "$APACHE_SERVICE" && echo "✓ reloaded $APACHE_SERVICE"
+
+# Apache reload — verify still active after reload, restart if dead
+if [ -n "$APACHE_SERVICE" ] && systemctl is-active --quiet "$APACHE_SERVICE" 2>/dev/null; then
+  systemctl reload "$APACHE_SERVICE" 2>/dev/null
+  sleep 2
+  if systemctl is-active --quiet "$APACHE_SERVICE"; then
+    echo "✓ reloaded $APACHE_SERVICE (still active)"
+  else
+    echo "⚠ $APACHE_SERVICE died after reload — auto-restarting..."
+    systemctl restart "$APACHE_SERVICE" 2>&1
+    sleep 2
+    if systemctl is-active --quiet "$APACHE_SERVICE"; then
+      echo "✓ $APACHE_SERVICE restarted successfully"
+    else
+      echo "✗ $APACHE_SERVICE restart FAILED — manual intervention required:"
+      echo "    systemctl status $APACHE_SERVICE"
+      echo "    tail -20 /usr/local/apache/logs/error_log"
+    fi
+  fi
+fi
 
 # ────────────────────────────────────────────────
 # 9. Apache global security hardening (drop-in conf)
@@ -766,7 +784,35 @@ HTTPDEOF
   fi
 
   # Reload Apache once at the end (covers both conf.d drop-in + httpd.conf patch)
-  systemctl reload "$APACHE_SERVICE" 2>/dev/null && echo "✓ reloaded $APACHE_SERVICE (hardening live)"
+  # Verify Apache STAYS active after reload — auto-restart if it dies.
+  if $APACHE_BIN -t 2>&1 | grep -q "Syntax OK"; then
+    systemctl reload "$APACHE_SERVICE" 2>/dev/null
+    sleep 2
+    if systemctl is-active --quiet "$APACHE_SERVICE"; then
+      echo "✓ reloaded $APACHE_SERVICE (hardening live, still active)"
+    else
+      echo "⚠ $APACHE_SERVICE died after hardening reload — auto-restarting..."
+      systemctl restart "$APACHE_SERVICE" 2>&1
+      sleep 2
+      if systemctl is-active --quiet "$APACHE_SERVICE"; then
+        echo "✓ $APACHE_SERVICE restarted successfully"
+      else
+        echo "✗ $APACHE_SERVICE failed to start — REVERTING hardening:"
+        chattr -i "$HARDENING_CONF" 2>/dev/null || true
+        rm -f "$HARDENING_CONF"
+        [ -f "${HTTPD_CONF}.bak-pre-tune" ] && cp "${HTTPD_CONF}.bak-pre-tune" "$HTTPD_CONF"
+        systemctl restart "$APACHE_SERVICE" 2>&1
+        echo "✗ Reverted. Check: systemctl status $APACHE_SERVICE"
+      fi
+    fi
+  else
+    echo "✗ Apache config has syntax errors — REVERTING hardening:"
+    $APACHE_BIN -t 2>&1 | head -10
+    chattr -i "$HARDENING_CONF" 2>/dev/null || true
+    rm -f "$HARDENING_CONF"
+    [ -f "${HTTPD_CONF}.bak-pre-tune" ] && cp "${HTTPD_CONF}.bak-pre-tune" "$HTTPD_CONF"
+    systemctl reload "$APACHE_SERVICE" 2>/dev/null
+  fi
 else
   echo "⊘ Apache hardening skipped"
 fi
