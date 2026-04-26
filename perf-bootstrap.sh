@@ -713,16 +713,20 @@ TraceEnable Off
   Require all denied
 </LocationMatch>
 
-# 6. Block aggressive bots / scrapers / AI crawlers
-SetEnvIfNoCase User-Agent "PetalBot|MJ12bot|DotBot|SemrushBot|AhrefsBot|Bytespider|YandexBot|seznambot|MegaIndex|BLEXBot|DataForSeoBot|GeedoShop|MauiBot|sogou|spbot|trendkite|garlik|webmeup|exabot|Lipperhey|psbot|360Spider" bad_bot
-SetEnvIfNoCase User-Agent "GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|FacebookBot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot" bad_bot
-SetEnvIfNoCase User-Agent "^$" bad_bot
-SetEnvIfNoCase User-Agent "^-?$" bad_bot
+# 6. Block aggressive bots / scrapers / AI crawlers via mod_rewrite
+#    (mod_rewrite works at server-config level on all Apache builds;
+#     <RequireAll> can fail at server-config on some CWP/CloudLinux builds)
+<IfModule mod_rewrite.c>
+  RewriteEngine On
 
-<RequireAll>
-  Require all granted
-  Require not env bad_bot
-</RequireAll>
+  # SEO/scraper bots
+  RewriteCond %{HTTP_USER_AGENT} (PetalBot|MJ12bot|DotBot|SemrushBot|AhrefsBot|Bytespider|YandexBot|seznambot|MegaIndex|BLEXBot|DataForSeoBot|GeedoShop|MauiBot|sogou|spbot|trendkite|garlik|webmeup|exabot|Lipperhey|psbot|360Spider) [NC,OR]
+  # AI training bots
+  RewriteCond %{HTTP_USER_AGENT} (GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot) [NC,OR]
+  # Empty / dash-only User-Agent (no legitimate client sends these)
+  RewriteCond %{HTTP_USER_AGENT} ^-?$
+  RewriteRule .* - [F,L]
+</IfModule>
 
 # 7. Hide server version info
 ServerTokens Prod
