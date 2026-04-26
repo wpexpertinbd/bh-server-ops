@@ -133,6 +133,14 @@ declare -a PHP_FPM_USER_DIRS=()
 declare -a PHP_FPM_SERVICES=()
 CWP_TPL_DIR=""
 
+# Security stack detection (cpGuard / CSF / mod_security / fail2ban / Imunify)
+HAS_CPGUARD=0
+HAS_CSF=0
+HAS_MODSEC=0
+HAS_FAIL2BAN=0
+HAS_IMUNIFY=0
+MODSEC_RULESET=""
+
 detect() {
   if [ -x /usr/local/apache/bin/httpd ]; then
     PANEL="cwp"
@@ -192,6 +200,40 @@ detect() {
     CONF_DIR=$(dirname "$D")/conf.d
     [ -d "$CONF_DIR" ] && PHP_INI_DIRS+=("$CONF_DIR")
   done
+
+  # ── Security stack detection ──
+  # cpGuard (CWP plugin / standalone)
+  if [ -d /etc/cpguard ] || systemctl is-active --quiet cpguard 2>/dev/null; then
+    HAS_CPGUARD=1
+  fi
+
+  # CSF firewall
+  if command -v csf >/dev/null 2>&1 || [ -f /etc/csf/csf.conf ]; then
+    HAS_CSF=1
+  fi
+
+  # mod_security (any flavor)
+  if [ -n "$APACHE_BIN" ] && $APACHE_BIN -M 2>/dev/null | grep -q "security2_module"; then
+    HAS_MODSEC=1
+    # Identify which ruleset is active
+    if grep -rq "comodo" /etc/modsecurity* /usr/local/apache/conf/extra/modsec* /etc/cpguard* 2>/dev/null; then
+      MODSEC_RULESET="Comodo CRS"
+    elif grep -rq "OWASP" /etc/modsecurity* /usr/local/apache/conf/extra/modsec* 2>/dev/null; then
+      MODSEC_RULESET="OWASP CRS"
+    else
+      MODSEC_RULESET="generic"
+    fi
+  fi
+
+  # fail2ban
+  if systemctl is-active --quiet fail2ban 2>/dev/null || command -v fail2ban-client >/dev/null 2>&1; then
+    HAS_FAIL2BAN=1
+  fi
+
+  # Imunify360 / ImunifyAV (CloudLinux/cPanel)
+  if [ -d /etc/imunify360 ] || systemctl is-active --quiet imunify360 2>/dev/null; then
+    HAS_IMUNIFY=1
+  fi
 }
 
 detect
@@ -212,6 +254,29 @@ echo "  PHP-FPM services: ${PHP_FPM_SERVICES[*]}"
 echo "  PHP ini.d dirs: ${PHP_INI_DIRS[*]}"
 echo "  RAM (TARGET_RAM_GB): ${TARGET_RAM_GB} GB"
 echo ""
+echo "Security stack detected:"
+echo "  cpGuard:       $([ "$HAS_CPGUARD" = 1 ] && echo "✓ active" || echo "✗ not installed")"
+echo "  CSF firewall:  $([ "$HAS_CSF" = 1 ] && echo "✓ active" || echo "✗ not installed")"
+echo "  mod_security:  $([ "$HAS_MODSEC" = 1 ] && echo "✓ active ($MODSEC_RULESET)" || echo "✗ not loaded")"
+echo "  fail2ban:      $([ "$HAS_FAIL2BAN" = 1 ] && echo "✓ active" || echo "✗ not running")"
+echo "  Imunify360:    $([ "$HAS_IMUNIFY" = 1 ] && echo "✓ active" || echo "✗ not installed")"
+echo ""
+
+# Advisory: warn if NO dynamic-threat protection found
+if [ "$HAS_CPGUARD" = 0 ] && [ "$HAS_CSF" = 0 ] && [ "$HAS_FAIL2BAN" = 0 ] && [ "$HAS_IMUNIFY" = 0 ]; then
+  echo "⚠ WARNING: No firewall / login-bruteforce protection detected."
+  echo "  This script applies STATIC hardening (file blocks, bot UA filters)."
+  echo "  For DYNAMIC threats (login bruteforce, scrapers rotating IPs):"
+  echo "    - Install CSF firewall:  https://configserver.com/csf/"
+  echo "    - Or install fail2ban:   yum install fail2ban / apt install fail2ban"
+  echo "    - cpGuard (CWP):         https://cpguard.com/"
+  echo ""
+elif [ "$HAS_CPGUARD" = 0 ] && [ "$HAS_MODSEC" = 0 ] && [ "$HAS_IMUNIFY" = 0 ]; then
+  echo "ℹ No WAF (mod_security/cpGuard/Imunify) detected — bots get blocked"
+  echo "  by Apache hardening conf only. Consider adding mod_security with"
+  echo "  Comodo CRS or OWASP CRS for dynamic WAF rules."
+  echo ""
+fi
 
 if [ -z "$APACHE_BIN" ] && [ ${#PHP_FPM_USER_DIRS[@]} -eq 0 ]; then
   echo "✗ No Apache or PHP-FPM detected. Nothing to do."
