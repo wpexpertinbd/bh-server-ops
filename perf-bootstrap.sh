@@ -1030,19 +1030,24 @@ if [ -n "$NGINX_BIN" ] && systemctl is-active --quiet nginx 2>/dev/null; then
   # Check for each directive across the WHOLE nginx config tree (including
   # nginx.conf itself) — many distros pre-set some of these. We only emit
   # the lines that aren't already there, so we never get "duplicate".
+  # NOTE: explicit `set +e` around this block — `[ -z ... ] && cat` returns
+  # non-zero when the directive already exists, which would kill the
+  # whole script under `set -e`.
+  set +e
   ALL_NGX_CONF=$(find /etc/nginx /usr/local/nginx/conf -name "*.conf" -type f 2>/dev/null)
   has() { echo "$ALL_NGX_CONF" | xargs grep -lE "^\s*$1\b" 2>/dev/null | grep -v "02-perf.conf" | head -1; }
   PERF_CONF="$NGX_CONF_D/02-perf.conf"
   rm -f "$PERF_CONF"
   {
     echo "# bh-perf v1 — http-level perf knobs (only directives missing elsewhere)"
-    [ -z "$(has open_file_cache)" ] && cat <<'EOP'
+    if [ -z "$(has open_file_cache)" ]; then cat <<'EOP'
 open_file_cache          max=10000 inactive=60s;
 open_file_cache_valid    30s;
 open_file_cache_min_uses 2;
 open_file_cache_errors   on;
 EOP
-    [ -z "$(has gzip_types)" ] && cat <<'EOP'
+    fi
+    if [ -z "$(has gzip_types)" ]; then cat <<'EOP'
 gzip               on;
 gzip_vary          on;
 gzip_proxied       any;
@@ -1050,17 +1055,22 @@ gzip_comp_level    5;
 gzip_min_length    1024;
 gzip_types         text/plain text/css application/json application/javascript text/javascript application/xml application/xml+rss text/xml image/svg+xml application/vnd.ms-fontobject font/ttf font/otf font/eot;
 EOP
+    fi
     [ -z "$(has sendfile)" ]           && echo "sendfile           on;"
     [ -z "$(has tcp_nopush)" ]         && echo "tcp_nopush         on;"
     [ -z "$(has tcp_nodelay)" ]        && echo "tcp_nodelay        on;"
     [ -z "$(has keepalive_timeout)" ]  && echo "keepalive_timeout  30;"
     [ -z "$(has keepalive_requests)" ] && echo "keepalive_requests 1000;"
     [ -z "$(has server_tokens)" ]      && echo "server_tokens      off;"
+    true   # ensure block returns 0
   } > "$PERF_CONF"
-  # Drop the file if nothing was needed (it would just have the header)
-  [ "$(wc -l < "$PERF_CONF")" -le 1 ] && rm -f "$PERF_CONF" && \
-    echo "✓ all perf directives already set elsewhere" || \
+  if [ "$(wc -l < "$PERF_CONF" 2>/dev/null || echo 0)" -le 1 ]; then
+    rm -f "$PERF_CONF"
+    echo "✓ all perf directives already set elsewhere"
+  else
     echo "✓ wrote $PERF_CONF (added missing perf directives only)"
+  fi
+  set -e
 
   if "$NGINX_BIN" -t 2>/dev/null; then
     systemctl reload nginx 2>/dev/null && echo "✓ nginx reloaded with perf tuning"
