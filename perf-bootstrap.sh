@@ -687,46 +687,56 @@ if [ "$APPLY_APACHE_HARDENING" = "1" ] && [ -n "$APACHE_BIN" ]; then
 # ===================================================================
 # Global Security Hardening — auto-managed by bh-server-ops bootstrap
 # Complements cpGuard / mod_security / fail2ban (dynamic threats).
-# Blocks: file exposure, hidden dirs, PHP-in-uploads, bad bots, TRACE.
+#
+# Uses LocationMatch (URL-based) instead of FilesMatch (filename-based)
+# because FilesMatch at server-config level doesn't always propagate to
+# per-vhost contexts on CWP. Bot blocks live inside <Directory "/home">
+# so they apply to all tenant DocumentRoots.
 # ===================================================================
 
-# 1. Sensitive file exposure
-<FilesMatch "^(\.env(\..*)?|\.git.*|\.htaccess|\.htpasswd|\.user\.ini|composer\.(json|lock)|package(-lock)?\.json|yarn\.lock|wp-config(-sample)?\.php|configuration\.php|wp-cron\.php|xmlrpc\.php|readme\.html|license\.txt|install\.php|upgrade\.php|info\.php|phpinfo\.php|test\.php|adminer\.php|pma\.php)$">
+# 1. Sensitive file exposure (URL-based — propagates to all vhosts)
+<LocationMatch "(?i)^/(\.env(\..*)?|\.git/|\.htaccess|\.htpasswd|\.user\.ini|composer\.(json|lock)|package(-lock)?\.json|yarn\.lock|wp-config(-sample)?\.php|configuration\.php|wp-cron\.php|xmlrpc\.php|readme\.html|license\.txt|install\.php|upgrade\.php|info\.php|phpinfo\.php|test\.php|adminer\.php|pma\.php)(/.*)?$">
   Require all denied
-</FilesMatch>
+</LocationMatch>
 
-# 2. Hidden directories (.git, .svn, .hg, .DS_Store) — except /.well-known/
-<DirectoryMatch "/\.(?!well-known)">
+# 2. Hidden directories (.git, .svn, .hg) — explicit list (avoid lookahead)
+<LocationMatch "(?i)^/\.(git|svn|hg|bzr|DS_Store|idea|vscode|cache|aws|ssh|env|history)(/|$)">
   Require all denied
-</DirectoryMatch>
+</LocationMatch>
 
 # 3. Disable TRACE/TRACK (XSS attack vector)
 TraceEnable Off
 
 # 4. Block PHP execution in upload directories (malware persistence vector)
-<LocationMatch "/(wp-content/uploads|uploads|public/storage|public_html/uploads|storage/app/public).*\.(php|phtml|php3|php4|php5|php7|phar|pl|py|jsp|asp|aspx|sh|cgi)$">
+<LocationMatch "(?i)^/.*/(wp-content/uploads|uploads|public/storage|storage/app/public)/.*\.(php|phtml|php3|php4|php5|php7|phar|pl|py|jsp|asp|aspx|sh|cgi)(\?.*)?$">
+  Require all denied
+</LocationMatch>
+<LocationMatch "(?i)^/(wp-content/uploads|uploads|public/storage|storage/app/public)/.*\.(php|phtml|php3|php4|php5|php7|phar|pl|py|jsp|asp|aspx|sh|cgi)(\?.*)?$">
   Require all denied
 </LocationMatch>
 
 # 5. Block direct access to WordPress internals
-<LocationMatch "/wp-includes/.*\.php$">
+<LocationMatch "(?i)^/wp-includes/.*\.php$">
   Require all denied
 </LocationMatch>
 
-# 6. Block aggressive bots / scrapers / AI crawlers via mod_rewrite
-#    (mod_rewrite works at server-config level on all Apache builds;
-#     <RequireAll> can fail at server-config on some CWP/CloudLinux builds)
-<IfModule mod_rewrite.c>
-  RewriteEngine On
+# 6. Block aggressive bots inside /home (all tenant DocumentRoots).
+#    Server-config-level mod_rewrite isn't inherited by vhosts on CWP,
+#    so we anchor the rules to /home which CWP uses for tenant homes.
+<Directory "/home">
+  <IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteOptions InheritDown
 
-  # SEO/scraper bots
-  RewriteCond %{HTTP_USER_AGENT} (PetalBot|MJ12bot|DotBot|SemrushBot|AhrefsBot|Bytespider|YandexBot|seznambot|MegaIndex|BLEXBot|DataForSeoBot|GeedoShop|MauiBot|sogou|spbot|trendkite|garlik|webmeup|exabot|Lipperhey|psbot|360Spider) [NC,OR]
-  # AI training bots
-  RewriteCond %{HTTP_USER_AGENT} (GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot) [NC,OR]
-  # Empty / dash-only User-Agent (no legitimate client sends these)
-  RewriteCond %{HTTP_USER_AGENT} ^-?$
-  RewriteRule .* - [F,L]
-</IfModule>
+    # SEO/scraper bots
+    RewriteCond %{HTTP_USER_AGENT} (PetalBot|MJ12bot|DotBot|SemrushBot|AhrefsBot|Bytespider|YandexBot|seznambot|MegaIndex|BLEXBot|DataForSeoBot|GeedoShop|MauiBot|sogou|spbot|trendkite|garlik|webmeup|exabot|Lipperhey|psbot|360Spider) [NC,OR]
+    # AI training bots
+    RewriteCond %{HTTP_USER_AGENT} (GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot) [NC,OR]
+    # Empty / dash-only User-Agent (no legitimate client sends these)
+    RewriteCond %{HTTP_USER_AGENT} ^-?$
+    RewriteRule .* - [F,L]
+  </IfModule>
+</Directory>
 
 # 7. Hide server version info
 ServerTokens Prod
