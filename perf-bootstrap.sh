@@ -36,6 +36,11 @@ MONITOR_SITES="${MONITOR_SITES:-}"           # auto-discover if empty
 TTFB_WARN_THRESHOLD="${TTFB_WARN_THRESHOLD:-10}"
 TTFB_RECOVER_THRESHOLD="${TTFB_RECOVER_THRESHOLD:-20}"
 APPLY_APACHE_HARDENING="${APPLY_APACHE_HARDENING:-1}"  # global hardening conf
+# Space-separated IPs that bypass nginx anti-bot rules. Use this to allowlist
+# your other fleet servers (DNS slave, monitoring, Blesta, etc.) so server-
+# to-server API calls don't get caught by the bot filter. Example:
+#   TRUSTED_IPS="103.174.50.38 91.99.16.149 142.91.103.158" bash perf-bootstrap.sh -y
+TRUSTED_IPS="${TRUSTED_IPS:-}"
 #################################################################################
 
 # CLI flag: -y / --yes → skip interactive prompts
@@ -807,6 +812,28 @@ else
   echo "  nginx vhost dir: ${NGX_VHOST_DIR:-(none found — http-only setup)}"
   echo "  nginx conf.d:    $NGX_CONF_D"
 
+  # ─ http-level: trusted IPs (skip anti-bot for these) ─
+  if [ -n "$TRUSTED_IPS" ]; then
+    {
+      echo "# bh-trusted v1 — IPs that bypass anti-bot (master/slave fleet sync)"
+      echo "geo \$bh_trusted_ip {"
+      echo "    default 0;"
+      echo "    127.0.0.1/32 1;"
+      for ip in $TRUSTED_IPS; do echo "    $ip/32 1;"; done
+      echo "}"
+    } > "$NGX_CONF_D/00-trusted-ips.conf"
+    echo "✓ wrote $NGX_CONF_D/00-trusted-ips.conf ($(echo $TRUSTED_IPS | wc -w) IPs allowlisted)"
+  else
+    # always create a stub so the snippet's `if ($bh_trusted_ip)` is valid
+    cat > "$NGX_CONF_D/00-trusted-ips.conf" <<'EOTR'
+# bh-trusted v1 — stub (no TRUSTED_IPS configured)
+geo $bh_trusted_ip {
+    default 0;
+    127.0.0.1/32 1;
+}
+EOTR
+  fi
+
   # ─ http-level: bad-bot UA map (zones removed — used by fail2ban now) ─
   cat > "$NGX_CONF_D/00-anti-bot.conf" <<'NGXHTTP'
 # bh-anti-bot v1 — http-level UA map (loaded before vhosts)
@@ -848,12 +875,16 @@ NGXHTTP
   # because we don't know the vhost's upstream from inside an include.
   # Brute-force protection on /wp-login.php is handled by fail2ban below.
   cat > "$NGX_SNIPPETS/anti-bot-server.conf" <<'NGXSERVER'
-# bh-anti-bot v1 — included at the top of every server { }
+# bh-anti-bot v3 — included at the top of every server { }
+# Trusted IPs bypass UA-based blocking (master/slave fleet sync, etc.)
+# Path-based blocks below ALWAYS fire (xmlrpc/.env are never legit).
 
-# 1. Drop bad-UA scrapers (444 = close connection, zero bytes sent back)
-if ($bh_bad_bot) { return 444; }
+set $bh_block 0;
+if ($bh_bad_bot)    { set $bh_block 1; }
+if ($bh_trusted_ip) { set $bh_block 0; }
+if ($bh_block = 1)  { return 444; }
 
-# 2. Block paths with no legitimate use + constant attack targets
+# Block paths with no legitimate use + constant attack targets
 location = /xmlrpc.php       { deny all; access_log off; log_not_found off; return 444; }
 location ~* /wp-config\.php  { deny all; return 444; }
 location ~* /\.(env|git|svn|htaccess|htpasswd|DS_Store)(/|$) { deny all; return 444; }
