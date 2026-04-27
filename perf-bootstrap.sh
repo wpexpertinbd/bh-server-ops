@@ -813,6 +813,7 @@ else
 
 map $http_user_agent $bh_bad_bot {
     default                 0;
+    # SEO-spy crawlers (not search engines — these scrape for paid SEO tools)
     "~*ahrefsbot"           1;
     "~*semrushbot"          1;
     "~*mj12bot"             1;
@@ -820,19 +821,23 @@ map $http_user_agent $bh_bad_bot {
     "~*petalbot"            1;
     "~*bytespider"          1;
     "~*amazonbot"           1;
+    # AI training crawlers (NOT search engines — Googlebot is allowed)
     "~*claudebot"           1;
     "~*gptbot"              1;
     "~*chatgpt-user"        1;
     "~*ccbot"               1;
     "~*google-extended"     1;
-    "~*facebookexternalhit" 1;
+    # Generic scraper toolkits
     "~*headlesschrome"      1;
     "~*scrapy"              1;
     "~*python-requests"     1;
     "~*go-http-client"      1;
     "~*libwww-perl"         1;
-    "~*\.(?:ru|cn|ir)/bot"  1;
     ""                      1;  # empty UA
+    # NOTE: Real search engines (Googlebot, Bingbot, DuckDuckBot, YandexBot,
+    # BaiduSpider, Applebot) are NOT in this list and crawl normally.
+    # facebookexternalhit is also NOT blocked — it's needed for social
+    # share previews (Facebook/Messenger fetches og:image, og:title via it).
 }
 NGXHTTP
 
