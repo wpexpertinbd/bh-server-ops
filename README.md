@@ -43,30 +43,56 @@ bash /root/perf-bootstrap.sh
 curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh | bash -s -- -y
 ```
 
-### For a multi-server fleet (master + slave + monitoring boxes)
+### Pick the command that matches the server type
 
-Pass your other server IPs so they bypass the anti-bot WAF (server-to-server API calls don't get blocked):
+Replace `<ip-list>` with **all your fleet's server IPs**, space-separated, e.g. `"1.2.3.4 5.6.7.8 9.10.11.12"`.
 
+**Master / shared hosting / reseller server** (full WAF + tuning):
 ```bash
-TRUSTED_IPS="<master-ip> <slave-ip> <monitor-ip>" \
+TRUSTED_IPS="<ip-list>" \
   bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
 ```
 
-Save persistently so re-runs always include the list:
-```bash
-echo 'export TRUSTED_IPS="<master-ip> <slave-ip> <monitor-ip>"' >> /root/.bash_profile
-```
-
-### For a SLAVE / API-only server (DNS slave portal, monitoring backend, Blesta API)
-
-These servers serve programmatic clients with unusual User-Agents. Anti-bot rules will block legitimate API auth. Use slave mode:
-
+**Slave / DNS portal / Blesta API / monitoring backend** (skip WAF, keep tuning):
 ```bash
 IS_SLAVE_SERVER=1 \
+TRUSTED_IPS="<ip-list>" \
   bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
 ```
 
-Slave mode skips: nginx anti-bot WAF, Apache global hardening, fail2ban nginx jails. Keeps: kernel/sysctl, OPcache, MPM tuning, FPM pool tuning, Redis cap.
+**Standalone single-server** (no fleet):
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
+```
+
+### What slave mode skips
+
+`IS_SLAVE_SERVER=1` skips three things that block legitimate server-to-server API auth:
+- nginx anti-bot WAF (returns 444 to programmatic clients with empty/unusual UAs)
+- Apache global hardening (mod_rewrite bot blocks)
+- fail2ban nginx jails (would auto-ban repeating master IPs)
+
+It still applies: kernel/sysctl, OPcache, MPM tuning, FPM pool tuning, Redis cap, helper scripts.
+
+### Make settings persistent across re-runs
+
+The script reads env vars at runtime. Put your fleet's IPs (and slave flag, if applicable) in `/root/.bash_profile` so you don't have to retype them:
+
+```bash
+# On every server, run ONCE:
+cat >> /root/.bash_profile <<'EOF'
+export TRUSTED_IPS="<ip-list>"
+# uncomment the next line ONLY on slave/API-only servers
+# export IS_SLAVE_SERVER=1
+EOF
+source /root/.bash_profile
+```
+
+After that, future runs are just:
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
+```
+…and the env vars are picked up automatically.
 
 The script runs **interactive by default** — it auto-detects the environment (panel, Apache MPM, PHP versions, RAM), then prompts for:
 
