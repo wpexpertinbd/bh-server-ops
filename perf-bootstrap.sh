@@ -833,11 +833,13 @@ map $http_user_agent $bh_bad_bot {
     "~*python-requests"     1;
     "~*go-http-client"      1;
     "~*libwww-perl"         1;
-    ""                      1;  # empty UA
     # NOTE: Real search engines (Googlebot, Bingbot, DuckDuckBot, YandexBot,
     # BaiduSpider, Applebot) are NOT in this list and crawl normally.
-    # facebookexternalhit is also NOT blocked — it's needed for social
-    # share previews (Facebook/Messenger fetches og:image, og:title via it).
+    # facebookexternalhit is also NOT blocked — needed for social share previews.
+    # Empty User-Agent is NOT blocked either — legitimate server-to-server API
+    # clients (CWP DNS slave sync, Blesta hooks, internal monitoring scripts)
+    # routinely send no UA. Blocking empty UA broke DNS slave sync on a
+    # production CWP fleet — never again.
 }
 NGXHTTP
 
