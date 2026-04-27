@@ -39,8 +39,15 @@ APPLY_APACHE_HARDENING="${APPLY_APACHE_HARDENING:-1}"  # global hardening conf
 # Space-separated IPs that bypass nginx anti-bot rules. Use this to allowlist
 # your other fleet servers (DNS slave, monitoring, Blesta, etc.) so server-
 # to-server API calls don't get caught by the bot filter. Example:
-#   TRUSTED_IPS="103.174.50.38 91.99.16.149 142.91.103.158" bash perf-bootstrap.sh -y
+#   TRUSTED_IPS="<ip1> <ip2> <ip3>" bash perf-bootstrap.sh -y
 TRUSTED_IPS="${TRUSTED_IPS:-}"
+
+# IS_SLAVE_SERVER=1 → server runs an API-only app (CWP DNS slave portal,
+# monitoring backend, Blesta API node, etc.) where every request comes
+# from machine clients with unusual UAs. The anti-bot WAF and Apache
+# hardening rules will block legitimate API traffic. Skip them.
+# Kernel/OPcache/MPM/fail2ban-SSH still apply.
+IS_SLAVE_SERVER="${IS_SLAVE_SERVER:-0}"
 #################################################################################
 
 # CLI flag: -y / --yes → skip interactive prompts
@@ -412,14 +419,24 @@ if [ "$INTERACTIVE" = "1" ]; then
   ask "Heavy app users (Laravel/Symfony, space-separated, blank for none)" "$HEAVY_USERS"
   HEAVY_USERS="$REPLY"
 
+  ask_yn "Is this a SLAVE / API-only server (DNS slave, monitoring backend, Blesta API)?
+  Y skips anti-bot + Apache hardening (which break server-to-server API auth).
+  N runs the full WAF stack (right answer for shared hosting / sites)" "n"
+  IS_SLAVE_SERVER="$REPLY"
+
   ask_yn "Apply Apache MPM tuning?" "y"
   APPLY_APACHE_MPM="$REPLY"
 
   ask_yn "Apply Redis cap (2GB + LRU)?" "y"
   APPLY_REDIS="$REPLY"
 
-  ask_yn "Apply Apache global hardening (block bad bots, sensitive files, PHP-in-uploads)?" "y"
-  APPLY_APACHE_HARDENING="$REPLY"
+  if [ "$IS_SLAVE_SERVER" = "1" ]; then
+    APPLY_APACHE_HARDENING=0
+    echo "  → slave/API mode: Apache hardening skipped"
+  else
+    ask_yn "Apply Apache global hardening (block bad bots, sensitive files, PHP-in-uploads)?" "y"
+    APPLY_APACHE_HARDENING="$REPLY"
+  fi
 
   ask_yn "Install /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}?" "y"
   INSTALL_HELPERS="$REPLY"
@@ -796,7 +813,10 @@ echo ""
 echo "─── [6c/10] Nginx anti-bot + rate limit ───"
 
 NGINX_BIN=$(command -v nginx 2>/dev/null || echo "")
-if [ -z "$NGINX_BIN" ] || ! systemctl is-active --quiet nginx 2>/dev/null; then
+if [ "$IS_SLAVE_SERVER" = "1" ]; then
+  echo "⊘ slave/API mode — skipping anti-bot (would block server-to-server API auth)"
+  echo "  to enable: rerun with IS_SLAVE_SERVER=0"
+elif [ -z "$NGINX_BIN" ] || ! systemctl is-active --quiet nginx 2>/dev/null; then
   echo "⊘ nginx not running — skipping anti-bot setup"
 else
   # Detect vhost dir (CWP variants)
@@ -990,6 +1010,10 @@ fi
 #                   = brute-force attempt, ban 1h
 echo ""
 echo "─── [6e/10] fail2ban (nginx + WP brute-force) ───"
+if [ "$IS_SLAVE_SERVER" = "1" ]; then
+  echo "⊘ slave/API mode — skipping fail2ban nginx jails (could ban legit API clients)"
+  echo "  fail2ban can still be installed manually for SSH protection"
+else
 # Wrapped in `set +e` because package install can fail on locked-down
 # systems (no EPEL repo, network issues) and we don't want to kill the
 # whole bootstrap over an optional component.
@@ -1098,6 +1122,7 @@ else
   echo "⊘ fail2ban not installable on this system (no EPEL repo? offline?) — skipping"
   echo "  manual install: dnf install -y epel-release && dnf install -y fail2ban"
 fi
+fi   # close: if [ "$IS_SLAVE_SERVER" = "1" ]; then ... else ...
 
 # ────────────────────────────────────────────────
 # 6f. Nginx http-level perf tuning (open_file_cache + gzip + keepalive)

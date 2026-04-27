@@ -43,6 +43,31 @@ bash /root/perf-bootstrap.sh
 curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh | bash -s -- -y
 ```
 
+### For a multi-server fleet (master + slave + monitoring boxes)
+
+Pass your other server IPs so they bypass the anti-bot WAF (server-to-server API calls don't get blocked):
+
+```bash
+TRUSTED_IPS="<master-ip> <slave-ip> <monitor-ip>" \
+  bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
+```
+
+Save persistently so re-runs always include the list:
+```bash
+echo 'export TRUSTED_IPS="<master-ip> <slave-ip> <monitor-ip>"' >> /root/.bash_profile
+```
+
+### For a SLAVE / API-only server (DNS slave portal, monitoring backend, Blesta API)
+
+These servers serve programmatic clients with unusual User-Agents. Anti-bot rules will block legitimate API auth. Use slave mode:
+
+```bash
+IS_SLAVE_SERVER=1 \
+  bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
+```
+
+Slave mode skips: nginx anti-bot WAF, Apache global hardening, fail2ban nginx jails. Keeps: kernel/sysctl, OPcache, MPM tuning, FPM pool tuning, Redis cap.
+
 The script runs **interactive by default** — it auto-detects the environment (panel, Apache MPM, PHP versions, RAM), then prompts for:
 
 - **Action:** Install / Rollback / Quit
