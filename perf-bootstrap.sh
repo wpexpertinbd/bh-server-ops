@@ -430,10 +430,7 @@ if [ "$INTERACTIVE" = "1" ]; then
   ask_yn "Apply Redis cap (2GB + LRU)?" "y"
   APPLY_REDIS="$REPLY"
 
-  if [ "$IS_SLAVE_SERVER" = "1" ]; then
-    APPLY_APACHE_HARDENING=0
-    echo "  → slave/API mode: Apache hardening skipped"
-  else
+  if [ "$IS_SLAVE_SERVER" != "1" ]; then
     ask_yn "Apply Apache global hardening (block bad bots, sensitive files, PHP-in-uploads)?" "y"
     APPLY_APACHE_HARDENING="$REPLY"
   fi
@@ -474,6 +471,15 @@ if [ "$INTERACTIVE" = "1" ]; then
   ask_yn "Proceed with these settings?" "y"
   [ "$REPLY" = "0" ] && { echo "Aborted."; exit 0; }
   echo ""
+fi
+
+# Slave-mode safety overrides — apply in BOTH interactive AND non-interactive
+# (-y / curl|bash) modes. Without this, IS_SLAVE_SERVER=1 had no effect when
+# the interactive block was skipped, and Apache hardening got re-applied
+# (which silently breaks API auth on slave servers). Found in production.
+if [ "$IS_SLAVE_SERVER" = "1" ]; then
+  APPLY_APACHE_HARDENING=0
+  echo "  → slave/API mode active: Apache hardening forced OFF"
 fi
 
 # ────────────────────────────────────────────────
