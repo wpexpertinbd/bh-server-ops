@@ -94,6 +94,48 @@ bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/mai
 ```
 …and the env vars are picked up automatically.
 
+## Daily health check (when a client complains "site is slow")
+
+Four commands, 30 seconds, tells you if it's a real server problem or not:
+
+```bash
+# 1. Apache worker saturation + avg response time
+curl -s http://127.0.0.1:8181/server-status?auto | grep -E "BusyWorkers|IdleWorkers|DurationPerReq|ReqPerSec"
+
+# 2. fail2ban — has anyone been banned recently?
+fail2ban-client status nginx-badbot 2>/dev/null | grep -E "Currently|Total"
+fail2ban-client status wp-login    2>/dev/null | grep -E "Currently|Total"
+
+# 3. What URLs are Apache workers serving right now? (find the noisy site/path)
+curl -s "http://127.0.0.1:8181/server-status" | grep -oE '(GET|POST) [^ <]+' | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
+
+# 4. Trend over the last hour (slow-watch cron logs)
+tail -50 /root/slow-watch.log
+```
+
+Healthy looks like:
+- `IdleWorkers` > 50% of total
+- `DurationPerReq` < 1000 ms
+- No new fail2ban bans every minute
+- No single URL dominating scoreboard
+
+If any of those are bad, the URL list (#3) usually points at the noisy site to investigate.
+
+## Apache MPM and tier verification
+
+```bash
+# What tier did the script pick?
+grep -A 9 "mpm_event_module" /usr/local/apache/conf/extra/httpd-mpm.conf
+
+# Confirm Apache loaded it (scoreboard size = ServerLimit × ThreadsPerChild)
+curl -s http://127.0.0.1:8181/server-status?auto | grep Scoreboard | sed 's/Scoreboard: //' | wc -c
+# 401 chars = old default (problem) | 1601/3201/5001 = tier applied correctly
+
+# Was the Include line uncommented?
+grep "httpd-mpm" /usr/local/apache/conf/httpd.conf
+# should NOT have a leading #
+```
+
 The script runs **interactive by default** — it auto-detects the environment (panel, Apache MPM, PHP versions, RAM), then prompts for:
 
 - **Action:** Install / Rollback / Quit
