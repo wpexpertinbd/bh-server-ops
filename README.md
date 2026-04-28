@@ -255,24 +255,36 @@ To disable, choose `n` at the prompt OR set `ENABLE_AUTO_RECOVERY_CRON=0`. Disab
 
 ## RAM-tier scaling
 
-Every memory-hungry setting (Apache MPM, FPM children, OPcache, Redis) auto-scales together based on detected RAM. Same script works from a tiny 1 vCPU/2 GB VPS to a 64 GB dedicated box.
+Every memory-hungry setting (Apache MPM, FPM children, OPcache, Redis) auto-scales together based on detected RAM. Same script works from a tiny 1 vCPU/2 GB VPS to a 256 GB dedicated beast.
 
-| RAM tier | Apache MaxWorkers | FPM children (light/heavy) | OPcache | Redis cap |
+Thresholds are intentionally a few GB below the nominal class — `/proc/meminfo` always reports less than installed (kernel + firmware reserve ~2 GB on big boxes, ~1 GB on small VPS). 64 GB box reports ~62 GB, 128 GB reports ~125, etc.
+
+| Detected RAM | Apache MaxWorkers | FPM children (light/heavy) | OPcache | Redis cap |
 |---|---|---|---|---|
-| ≥ 64 GB | 1600 (32×50) | 10 / 20 | 256 MB | 2 GB |
-| ≥ 32 GB | 800 (16×50) | 10 / 20 | 256 MB | 1 GB |
-| ≥ 16 GB | 400 (8×50) | 8 / 15 | 192 MB | 512 MB |
-| ≥ 8 GB | 200 (5×40) | 6 / 12 | 128 MB | 384 MB |
-| **≥ 4 GB** | **100 (4×25)** | **4 / 8** | **96 MB** | **256 MB** |
-| **< 4 GB** | **50 (2×25)** | **3 / 5** | **64 MB** | **128 MB** |
+| **≥ 240 GB** (256 GB-class) | **5000 (100×50)** | **15 / 30** | **512 MB** | **8 GB** |
+| **≥ 120 GB** (128 GB-class) | **3200 (64×50)** | **12 / 25** | **384 MB** | **4 GB** |
+| ≥ 60 GB (64 GB-class) | 1600 (32×50) | 10 / 20 | 256 MB | 2 GB |
+| ≥ 30 GB (32 GB-class) | 800 (16×50) | 10 / 20 | 256 MB | 1 GB |
+| ≥ 14 GB (16 GB-class) | 400 (8×50) | 8 / 15 | 192 MB | 512 MB |
+| ≥ 7 GB (8 GB-class) | 200 (5×40) | 6 / 12 | 128 MB | 384 MB |
+| ≥ 3 GB (4 GB-class) | 100 (4×25) | 4 / 8 | 96 MB | 256 MB |
+| < 3 GB (1-2 GB VPS) | 50 (2×25) | 3 / 5 | 64 MB | 128 MB |
 
-Total baseline (Apache + OPcache + Redis):
-- 64 GB box: ~10 GB used (15% of RAM)
-- 8 GB box: ~1.5 GB used (19%)
-- 4 GB box: ~700 MB used (17%)
-- 2 GB box: ~400 MB used (20%)
+Total baseline (Apache workers + OPcache + Redis):
+- 256 GB box: ~160 GB used (62% of RAM) — leaves ~96 GB for DB, FPM, OS cache
+- 128 GB box: ~100 GB used (78%)
+- 64 GB box: ~50 GB used (78%)
+- 16 GB box: ~12 GB used (75%)
+- 8 GB box: ~6 GB used (75%)
+- 4 GB box: ~2.5 GB used (62%)
+- 2 GB box: ~1 GB used (50%)
 
-Tenant FPM workers get the rest of available RAM.
+Tenant FPM children + MariaDB share the rest.
+
+Force a specific tier if auto-detect is wrong (e.g. lying hypervisor):
+```bash
+TARGET_RAM_GB=128 bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
+```
 
 ## Swap setup
 
