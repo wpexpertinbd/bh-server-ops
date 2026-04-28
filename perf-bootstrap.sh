@@ -69,7 +69,17 @@ fi
 # Tier thresholds are 2 GB below their nominal value because /proc/meminfo
 # always reports less than installed (kernel + firmware reserve ~2 GB on
 # big boxes, ~1 GB on small VPS). 64 GB box → 62 GB, 16 GB → 15 GB, etc.
-if   [ "$TARGET_RAM_GB" -ge 60 ]; then  # 64 GB-class
+if   [ "$TARGET_RAM_GB" -ge 240 ]; then  # 256 GB-class (reports ~245-250)
+  MAX_WORKERS=5000;  THREADS_PER_CHILD=50;  SERVER_LIMIT=100
+  LIGHT_CHILDREN=15; HEAVY_CHILDREN=30
+  OPCACHE_MB=512;    OPCACHE_FILES=50000;   INTERNED_MB=32
+  REDIS_MAX=8gb
+elif [ "$TARGET_RAM_GB" -ge 120 ]; then  # 128 GB-class (reports ~125-126)
+  MAX_WORKERS=3200;  THREADS_PER_CHILD=50;  SERVER_LIMIT=64
+  LIGHT_CHILDREN=12; HEAVY_CHILDREN=25
+  OPCACHE_MB=384;    OPCACHE_FILES=30000;   INTERNED_MB=24
+  REDIS_MAX=4gb
+elif [ "$TARGET_RAM_GB" -ge 60 ]; then  # 64 GB-class (reports ~62)
   MAX_WORKERS=1600;  THREADS_PER_CHILD=50;  SERVER_LIMIT=32
   LIGHT_CHILDREN=10; HEAVY_CHILDREN=20
   OPCACHE_MB=256;    OPCACHE_FILES=20000;   INTERNED_MB=16
