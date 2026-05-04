@@ -842,6 +842,58 @@ else
   done
   NGX_CONF_D=/etc/nginx/conf.d
   [ -d /usr/local/nginx/conf/conf.d ] && [ ! -d "$NGX_CONF_D" ] && NGX_CONF_D=/usr/local/nginx/conf/conf.d
+
+  # ─ fd-limit auto-raise ─
+  # nginx -t opens every per-vhost log file + cert + map. On large fleets
+  # (observed on s1: 672 vhosts, default ulimit 1024) it hits "Too many open
+  # files" mid-parse, bails before bh.d/*.conf loads, and the resulting
+  # "unknown bh_bad_bot variable" error LOOKS like a config bug but is
+  # actually fd starvation. Auto-raise BEFORE nginx -t to avoid the trap.
+  CUR_NOFILE=$(ulimit -n 2>/dev/null || echo 1024)
+  VHOST_COUNT=0
+  [ -n "$NGX_VHOST_DIR" ] && VHOST_COUNT=$(find "$NGX_VHOST_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
+  # Need ~10 fds per vhost (access log + error log + cert + key + chain +
+  # snippet includes). Round up + headroom = 65536 on any box with 200+ vhosts.
+  TARGET_NOFILE=65536
+  if [ "$VHOST_COUNT" -gt 200 ] || [ "$CUR_NOFILE" -lt 4096 ]; then
+    # 1) systemd override for nginx.service so daemon has high LimitNOFILE
+    if [ -d /etc/systemd/system ]; then
+      mkdir -p /etc/systemd/system/nginx.service.d
+      if [ ! -f /etc/systemd/system/nginx.service.d/bh-nofile.conf ] || \
+         ! grep -q "LimitNOFILE=$TARGET_NOFILE" /etc/systemd/system/nginx.service.d/bh-nofile.conf 2>/dev/null; then
+        cat > /etc/systemd/system/nginx.service.d/bh-nofile.conf <<EOF
+[Service]
+LimitNOFILE=$TARGET_NOFILE
+EOF
+        systemctl daemon-reload 2>/dev/null
+        echo "✓ systemd nginx LimitNOFILE=$TARGET_NOFILE (was default 1024)"
+      fi
+    fi
+    # 2) tell nginx itself to actually use the higher limit (worker_rlimit_nofile)
+    if [ -f "$NGX_MAIN_CONF_EARLY" ] || [ -f /etc/nginx/nginx.conf ]; then
+      NGX_CONF_FOR_RLIMIT=/etc/nginx/nginx.conf
+      [ -f /usr/local/nginx/conf/nginx.conf ] && [ ! -f "$NGX_CONF_FOR_RLIMIT" ] && NGX_CONF_FOR_RLIMIT=/usr/local/nginx/conf/nginx.conf
+      if ! grep -qE '^\s*worker_rlimit_nofile' "$NGX_CONF_FOR_RLIMIT"; then
+        sed -i "1i worker_rlimit_nofile $TARGET_NOFILE;" "$NGX_CONF_FOR_RLIMIT"
+        echo "✓ added 'worker_rlimit_nofile $TARGET_NOFILE;' to $NGX_CONF_FOR_RLIMIT"
+      fi
+    fi
+    # 3) limits.conf — for any future shell sessions / scripts
+    if [ -d /etc/security/limits.d ]; then
+      cat > /etc/security/limits.d/99-bh-nofile.conf <<EOF
+* soft nofile $TARGET_NOFILE
+* hard nofile $((TARGET_NOFILE * 2))
+root soft nofile $TARGET_NOFILE
+root hard nofile $((TARGET_NOFILE * 2))
+EOF
+      echo "✓ /etc/security/limits.d/99-bh-nofile.conf written"
+    fi
+    # 4) raise THIS shell's limit so the upcoming nginx -t can succeed
+    ulimit -n "$TARGET_NOFILE" 2>/dev/null && echo "✓ raised current shell ulimit -n to $TARGET_NOFILE (was $CUR_NOFILE)"
+    # 5) bounce nginx so the new daemon LimitNOFILE actually takes effect
+    #    (reload doesn't change rlimit; only restart does)
+    systemctl restart nginx 2>/dev/null && echo "✓ nginx restarted to pick up new fd limit"
+  fi
   NGX_SNIPPETS=/etc/nginx/snippets
   mkdir -p "$NGX_SNIPPETS"
 
