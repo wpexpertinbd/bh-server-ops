@@ -854,13 +854,54 @@ else
   mkdir -p "$NGX_BH_D"
   if [ -f "$NGX_MAIN_CONF" ] && ! grep -qF "include $NGX_BH_D/" "$NGX_MAIN_CONF"; then
     # Insert before the first conf.d/*.conf include so maps load before vhosts.
-    if grep -qE '^\s*include\s+/etc/nginx/conf\.d/\*\.conf;' "$NGX_MAIN_CONF"; then
-      sed -i "0,/include \/etc\/nginx\/conf\.d\/\*\.conf;/{s||include $NGX_BH_D/*.conf;\n    include /etc/nginx/conf.d/*.conf;|}" "$NGX_MAIN_CONF"
+    # Use awk (not sed) for whitespace-tolerant matching — different nginx
+    # packagings format the include line differently (single vs multi space,
+    # tabs, trailing space before semicolon).
+    cp "$NGX_MAIN_CONF" "${NGX_MAIN_CONF}.bak-pre-bhd-include"
+    awk -v incl="    include $NGX_BH_D/*.conf;" '
+      !done && /include[[:space:]]+\/etc\/nginx\/conf\.d\/\*\.conf[[:space:]]*;/ {
+        print incl
+        done = 1
+      }
+      { print }
+      END { exit (done ? 0 : 1) }
+    ' "$NGX_MAIN_CONF" > "${NGX_MAIN_CONF}.tmp"
+    if [ $? -eq 0 ] && grep -qF "include $NGX_BH_D/" "${NGX_MAIN_CONF}.tmp"; then
+      mv "${NGX_MAIN_CONF}.tmp" "$NGX_MAIN_CONF"
+      echo "✓ added 'include $NGX_BH_D/*.conf;' to $NGX_MAIN_CONF (before conf.d include)"
     else
-      # No standard conf.d include — append inside http {} via marker.
-      sed -i "/^http\s*{/a\    include $NGX_BH_D/*.conf;" "$NGX_MAIN_CONF"
+      # Fallback: no conf.d/*.conf include found — append inside the http{} block
+      # by inserting after the opening 'http {' line.
+      rm -f "${NGX_MAIN_CONF}.tmp"
+      awk -v incl="    include $NGX_BH_D/*.conf;" '
+        !done && /^[[:space:]]*http[[:space:]]*\{/ {
+          print
+          print incl
+          done = 1
+          next
+        }
+        { print }
+        END { exit (done ? 0 : 1) }
+      ' "$NGX_MAIN_CONF" > "${NGX_MAIN_CONF}.tmp"
+      if [ $? -eq 0 ] && grep -qF "include $NGX_BH_D/" "${NGX_MAIN_CONF}.tmp"; then
+        mv "${NGX_MAIN_CONF}.tmp" "$NGX_MAIN_CONF"
+        echo "✓ added 'include $NGX_BH_D/*.conf;' to $NGX_MAIN_CONF (after http{} open)"
+      else
+        rm -f "${NGX_MAIN_CONF}.tmp"
+        echo "✗ could NOT insert 'include $NGX_BH_D/*.conf;' into $NGX_MAIN_CONF"
+        echo "  add this line manually inside the http{} block, then re-run."
+        echo "  skipping anti-bot setup to avoid leaving nginx in a broken state."
+        # Skip the rest of the anti-bot block by faking the maps-not-loaded condition
+        SKIP_ANTIBOT=1
+      fi
     fi
-    echo "✓ added 'include $NGX_BH_D/*.conf;' to $NGX_MAIN_CONF"
+  fi
+  # Hard verify: the include must actually be in nginx.conf before we proceed,
+  # otherwise the maps we're about to write will sit unused and nginx -t will
+  # fail with 'unknown bh_bad_bot variable' the moment any vhost is reloaded.
+  if [ "${SKIP_ANTIBOT:-0}" != "1" ] && ! grep -qF "include $NGX_BH_D/" "$NGX_MAIN_CONF"; then
+    echo "✗ post-check: include line missing from $NGX_MAIN_CONF — aborting anti-bot setup"
+    SKIP_ANTIBOT=1
   fi
   # If a previous bootstrap version dropped maps in conf.d/, remove them now
   # to avoid "duplicate map" errors once bh.d/ is loaded.
@@ -870,6 +911,9 @@ else
   echo "  nginx maps dir:  $NGX_BH_D"
   echo "  nginx conf.d:    $NGX_CONF_D"
 
+if [ "${SKIP_ANTIBOT:-0}" = "1" ]; then
+  echo "⊘ anti-bot setup skipped (couldn't wire up include in $NGX_MAIN_CONF)"
+else
   # ─ http-level: trusted IPs (skip anti-bot for these) ─
   if [ -n "$TRUSTED_IPS" ]; then
     {
@@ -1038,9 +1082,14 @@ NGXLOG
   else
     echo "✗ nginx config test failed — reverting anti-bot changes"
     rm -f "$NGX_BH_D/00-anti-bot.conf" "$NGX_BH_D/00-trusted-ips.conf" "$NGX_CONF_D/01-access-log.conf"
+    rm -f "$NGX_SNIPPETS/anti-bot-server.conf"
+    # Revert the include line we added to nginx.conf so we don't leave a dangling reference
+    [ -f "${NGX_MAIN_CONF}.bak-pre-bhd-include" ] && cp "${NGX_MAIN_CONF}.bak-pre-bhd-include" "$NGX_MAIN_CONF"
     [ -n "$CWP_NGX_TPL" ] && [ -f "${CWP_NGX_TPL}.bak-pre-antibot" ] && cp "${CWP_NGX_TPL}.bak-pre-antibot" "$CWP_NGX_TPL"
     "$NGINX_BIN" -t
+    echo "  reverted. nginx.conf restored from ${NGX_MAIN_CONF}.bak-pre-bhd-include"
   fi
+fi  # close SKIP_ANTIBOT guard
 fi
 
 # ────────────────────────────────────────────────
