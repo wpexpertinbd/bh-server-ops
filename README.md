@@ -60,6 +60,11 @@ TRUSTED_IPS="<ip-list>" \
   bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
 ```
 
+**Shortcut for slaves where `TRUSTED_IPS` is already exported in `/root/.bash_profile`** — no need to retype the IP list, just add the slave flag inline:
+```bash
+IS_SLAVE_SERVER=1 bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
+```
+
 **Standalone single-server** (no fleet):
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
