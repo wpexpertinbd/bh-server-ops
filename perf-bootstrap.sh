@@ -845,7 +845,29 @@ else
   NGX_SNIPPETS=/etc/nginx/snippets
   mkdir -p "$NGX_SNIPPETS"
 
+  # ─ http-level maps live OUTSIDE conf.d/ so CWP regen / yum reinstall nginx
+  #   can't wipe them (which would leave the vhost-included snippet referencing
+  #   undefined $bh_bad_bot / $bh_trusted_ip vars and refuse to start nginx).
+  NGX_MAIN_CONF=/etc/nginx/nginx.conf
+  [ -f /usr/local/nginx/conf/nginx.conf ] && [ ! -f "$NGX_MAIN_CONF" ] && NGX_MAIN_CONF=/usr/local/nginx/conf/nginx.conf
+  NGX_BH_D=/etc/nginx/bh.d
+  mkdir -p "$NGX_BH_D"
+  if [ -f "$NGX_MAIN_CONF" ] && ! grep -qF "include $NGX_BH_D/" "$NGX_MAIN_CONF"; then
+    # Insert before the first conf.d/*.conf include so maps load before vhosts.
+    if grep -qE '^\s*include\s+/etc/nginx/conf\.d/\*\.conf;' "$NGX_MAIN_CONF"; then
+      sed -i "0,/include \/etc\/nginx\/conf\.d\/\*\.conf;/{s||include $NGX_BH_D/*.conf;\n    include /etc/nginx/conf.d/*.conf;|}" "$NGX_MAIN_CONF"
+    else
+      # No standard conf.d include — append inside http {} via marker.
+      sed -i "/^http\s*{/a\    include $NGX_BH_D/*.conf;" "$NGX_MAIN_CONF"
+    fi
+    echo "✓ added 'include $NGX_BH_D/*.conf;' to $NGX_MAIN_CONF"
+  fi
+  # If a previous bootstrap version dropped maps in conf.d/, remove them now
+  # to avoid "duplicate map" errors once bh.d/ is loaded.
+  rm -f "$NGX_CONF_D/00-anti-bot.conf" "$NGX_CONF_D/00-trusted-ips.conf"
+
   echo "  nginx vhost dir: ${NGX_VHOST_DIR:-(none found — http-only setup)}"
+  echo "  nginx maps dir:  $NGX_BH_D"
   echo "  nginx conf.d:    $NGX_CONF_D"
 
   # ─ http-level: trusted IPs (skip anti-bot for these) ─
@@ -857,11 +879,11 @@ else
       echo "    127.0.0.1/32 1;"
       for ip in $TRUSTED_IPS; do echo "    $ip/32 1;"; done
       echo "}"
-    } > "$NGX_CONF_D/00-trusted-ips.conf"
-    echo "✓ wrote $NGX_CONF_D/00-trusted-ips.conf ($(echo $TRUSTED_IPS | wc -w) IPs allowlisted)"
+    } > "$NGX_BH_D/00-trusted-ips.conf"
+    echo "✓ wrote $NGX_BH_D/00-trusted-ips.conf ($(echo $TRUSTED_IPS | wc -w) IPs allowlisted)"
   else
     # always create a stub so the snippet's `if ($bh_trusted_ip)` is valid
-    cat > "$NGX_CONF_D/00-trusted-ips.conf" <<'EOTR'
+    cat > "$NGX_BH_D/00-trusted-ips.conf" <<'EOTR'
 # bh-trusted v1 — stub (no TRUSTED_IPS configured)
 geo $bh_trusted_ip {
     default 0;
@@ -871,7 +893,7 @@ EOTR
   fi
 
   # ─ http-level: bad-bot UA map (zones removed — used by fail2ban now) ─
-  cat > "$NGX_CONF_D/00-anti-bot.conf" <<'NGXHTTP'
+  cat > "$NGX_BH_D/00-anti-bot.conf" <<'NGXHTTP'
 # bh-anti-bot v1 — http-level UA map (loaded before vhosts)
 
 map $http_user_agent $bh_bad_bot {
@@ -927,8 +949,14 @@ location ~* /\.(env|git|svn|htaccess|htpasswd|DS_Store)(/|$) { deny all; return 
 location ~* /(?:eval-stdin|wlwmanifest|adminer|phpunit|phpinfo)\.php$ { deny all; return 444; }
 NGXSERVER
 
-  echo "✓ wrote $NGX_CONF_D/00-anti-bot.conf"
+  echo "✓ wrote $NGX_BH_D/00-anti-bot.conf"
   echo "✓ wrote $NGX_SNIPPETS/anti-bot-server.conf"
+
+  # Snapshot the generated maps so auto-recovery can self-heal if anything
+  # ever wipes them at runtime (CWP regen, careless cleanup, etc.).
+  mkdir -p /var/lib/bh-server-ops
+  cp -f "$NGX_BH_D/00-anti-bot.conf"    /var/lib/bh-server-ops/00-anti-bot.conf
+  cp -f "$NGX_BH_D/00-trusted-ips.conf" /var/lib/bh-server-ops/00-trusted-ips.conf
 
   # ─ patch existing vhosts (idempotent via marker) ─
   if [ -n "$NGX_VHOST_DIR" ]; then
@@ -1009,7 +1037,7 @@ NGXLOG
     systemctl reload nginx 2>/dev/null && echo "✓ nginx reloaded"
   else
     echo "✗ nginx config test failed — reverting anti-bot changes"
-    rm -f "$NGX_CONF_D/00-anti-bot.conf" "$NGX_CONF_D/01-access-log.conf"
+    rm -f "$NGX_BH_D/00-anti-bot.conf" "$NGX_BH_D/00-trusted-ips.conf" "$NGX_CONF_D/01-access-log.conf"
     [ -n "$CWP_NGX_TPL" ] && [ -f "${CWP_NGX_TPL}.bak-pre-antibot" ] && cp "${CWP_NGX_TPL}.bak-pre-antibot" "$CWP_NGX_TPL"
     "$NGINX_BIN" -t
   fi
@@ -1553,6 +1581,26 @@ MONITOR
 THRESHOLD=$TTFB_RECOVER_THRESHOLD
 SITES="$MONITOR_SITES"
 LOG=/var/log/auto-recovery.log
+
+# ── Self-heal: anti-bot maps wiped from /etc/nginx/bh.d/? ──
+# If the vhost-included snippet references \$bh_bad_bot / \$bh_trusted_ip but
+# the map files defining them are gone, nginx will refuse to start on the next
+# restart. Restore from snapshot if missing.
+if [ -f /etc/nginx/snippets/anti-bot-server.conf ] && [ -d /var/lib/bh-server-ops ]; then
+    HEALED=0
+    mkdir -p /etc/nginx/bh.d
+    for F in 00-anti-bot.conf 00-trusted-ips.conf; do
+        if [ -f /var/lib/bh-server-ops/\$F ] && [ ! -f /etc/nginx/bh.d/\$F ]; then
+            cp /var/lib/bh-server-ops/\$F /etc/nginx/bh.d/\$F
+            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Healed missing /etc/nginx/bh.d/\$F" >> \$LOG
+            HEALED=1
+        fi
+    done
+    if [ "\$HEALED" = "1" ] && command -v nginx >/dev/null 2>&1; then
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null \
+            && echo "[\$(date '+%Y-%m-%d %H:%M:%S')] nginx reloaded after self-heal" >> \$LOG
+    fi
+fi
 
 if [ -z "\$SITES" ] && [ -d /etc/cwpsrv ]; then
     SITES=\$(find /etc/cwpsrv -maxdepth 3 -name '*.conf' 2>/dev/null | xargs -I{} grep -hE '^\s*server_name' {} 2>/dev/null | awk '{print \$2}' | tr -d ';' | grep -vE '^(www\\.|webmail\\.|mail\\.|cpanel\\.|ftp\\.)' | sort -u | head -5)

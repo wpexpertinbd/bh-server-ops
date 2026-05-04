@@ -14,11 +14,11 @@ A single auto-detecting script that:
 6. Bumps Apache MPM workers (RAM-scaled, frozen with `chattr +i`)
 7. Caps Redis memory + sets LRU eviction policy
 8. Reloads services gracefully (no downtime)
-9. **Drops in `99-global-hardening.conf`** — blocks bad bots, sensitive file exposure, PHP-in-uploads, dangerous HTTP methods (complements cpGuard / mod_security / fail2ban)
+9. **Drops in nginx anti-bot WAF** — http-level UA map + trusted-IP allowlist + per-vhost server snippet that blocks SEO/AI scrapers and constant attack paths (xmlrpc, /.env, /.git, etc.). Files live in `/etc/nginx/bh.d/` (outside `conf.d/` so CWP regen / `yum reinstall nginx` can't wipe them) and are auto-included via a one-line `include /etc/nginx/bh.d/*.conf;` added to `nginx.conf`. Snapshotted to `/var/lib/bh-server-ops/` so the `auto-recovery` cron can restore them within 3 minutes if anything ever does delete them.
 10. Installs three helper commands:
     - `tenant-cap` — instantly cap a noisy tenant's PHP workers
     - `saturation-monitor` — cron logs slow sites to `/var/log/saturation.log`
-    - `auto-recovery` — cron auto-reloads services if a site is catastrophically slow
+    - `auto-recovery` — cron auto-reloads services if a site is catastrophically slow + self-heals missing nginx anti-bot maps
 
 Works on:
 - CWP / CloudLinux (alt-php paths)
@@ -243,7 +243,13 @@ tail -20 /var/log/saturation.log
 
 ### `auto-recovery` — self-healing reload (cron, 3 min, **on by default**)
 
-Cron runs every 3 minutes. If TTFB exceeds recovery threshold (default 20s):
+Cron runs every 3 minutes. Two responsibilities:
+
+**Self-heal (always runs first, no threshold):**
+If `/etc/nginx/snippets/anti-bot-server.conf` exists but either of the http-level maps in `/etc/nginx/bh.d/` is missing, the maps are restored from the snapshot at `/var/lib/bh-server-ops/` and nginx is reloaded. Bounds the worst-case "nginx down because something wiped a conf file" outage to 3 minutes. (The snippet references `$bh_bad_bot` / `$bh_trusted_ip` — if those maps disappear, nginx refuses to start. CWP regen and `yum reinstall nginx` have both been observed wiping `/etc/nginx/conf.d/`, which is why the maps live in `bh.d/` now and are also snapshotted.)
+
+**TTFB recovery (fires on threshold breach):**
+If TTFB exceeds recovery threshold (default 20s):
 1. Graceful reload Apache (zero downtime)
 2. If site still slow after 5 sec → escalates to `restart httpd` (1-2 sec blip, guaranteed clear of stuck workers)
 3. Reload all running PHP-FPM services
@@ -340,6 +346,23 @@ done
 rm -f /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}
 crontab -l | grep -v 'saturation-monitor\|auto-recovery' | crontab -
 ```
+
+## Files this script creates / modifies
+
+| Path | Purpose | Survives `yum reinstall nginx`? |
+|---|---|---|
+| `/etc/nginx/bh.d/00-anti-bot.conf` | http-level UA map (`$bh_bad_bot`) | ✅ custom dir, untouched by package mgr |
+| `/etc/nginx/bh.d/00-trusted-ips.conf` | http-level allowlist (`$bh_trusted_ip`) | ✅ custom dir, untouched by package mgr |
+| `/etc/nginx/snippets/anti-bot-server.conf` | server-level enforcement, `include`d by every vhost | ✅ |
+| `/etc/nginx/conf.d/01-access-log.conf` | slim access log so bot floods are visible | ⚠️ in conf.d/, may be wiped by package update |
+| `/etc/nginx/nginx.conf` | gets one `include /etc/nginx/bh.d/*.conf;` line added (idempotent) | ✅ usually preserved as `.rpmsave` on reinstall |
+| `/var/lib/bh-server-ops/` | snapshot copy of the bh.d maps for `auto-recovery` self-heal | ✅ |
+| `/usr/local/apache/conf/extra/httpd-mpm.conf` | RAM-tier MPM config | ✅ frozen with `chattr +i` after edit |
+| `/etc/sysctl.d/99-bh-tune.conf` | kernel tuning | ✅ |
+| FPM pool files at `/opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf` | per-user FPM tuning | ✅ |
+| `/usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}` | helpers | ✅ |
+
+The "untouched" guarantees are based on observed CWP / yum behaviour as of late 2026 — `/etc/nginx/conf.d/` is the directory most likely to get swept (CWP nginx vhost regen + `yum reinstall nginx` have both been observed clearing it). If you find files vanishing from `bh.d/` on your fleet, please open an issue with the trigger.
 
 ## Why this exists
 
