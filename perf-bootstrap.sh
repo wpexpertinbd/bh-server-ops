@@ -690,6 +690,244 @@ else
 fi
 
 # ────────────────────────────────────────────────
+# 5b. HTTP/3 enablement — MUST run before any nginx-touching section
+#     (otherwise the nginx package swap reinstalls and our anti-bot /
+#     perf configs end up applied against the wrong binary)
+# ────────────────────────────────────────────────
+echo ""
+echo "─── [5b/10] HTTP/3 (codeit nginx + QUIC templates) ───"
+
+if [ "$ENABLE_HTTP3" != "1" ]; then
+  echo "⊘ HTTP/3 enablement skipped (set ENABLE_HTTP3=1 to enable)"
+elif [ "$IS_SLAVE_SERVER" = "1" ]; then
+  echo "⊘ slave/API mode — skipping HTTP/3 (browsers don't talk to slave APIs)"
+elif ! grep -qiE 'release 8' /etc/redhat-release 2>/dev/null /etc/almalinux-release 2>/dev/null /etc/system-release 2>/dev/null; then
+  echo "⊘ HTTP/3 swap targets EL8 only (codeit build is EL8-specific) — skipping"
+elif ! command -v nginx >/dev/null 2>&1; then
+  echo "⊘ nginx not installed — skipping HTTP/3"
+else
+  CWP_NGINX_TPL_DIR=/usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx
+  H3_BACKUP_DIR="/var/backups/bh-http3/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$H3_BACKUP_DIR"
+
+  # ─ A. Detect if already on codeit build ─
+  CURRENT_RELEASE=$(rpm -qi nginx 2>/dev/null | awk -F': ' '/^Release/ {print $2; exit}')
+  if echo "$CURRENT_RELEASE" | grep -q 'codeit'; then
+    echo "✓ nginx already on codeit build ($CURRENT_RELEASE) — skipping package swap"
+  else
+    echo "  Current nginx release: ${CURRENT_RELEASE:-unknown} — swap needed"
+
+    # ─ B. Disable F5 nginx-mainline repo if present ─
+    if [ -f /etc/yum.repos.d/nginx.repo ]; then
+      cp /etc/yum.repos.d/nginx.repo "$H3_BACKUP_DIR/nginx.repo"
+      yum-config-manager --disable nginx-mainline >/dev/null 2>&1 || \
+        sed -i '/\[nginx-mainline\]/,/^\[/{s/^enabled=1/enabled=0/}' /etc/yum.repos.d/nginx.repo
+      echo "  ✓ disabled F5 nginx-mainline repo"
+    fi
+
+    # ─ C. Add codeit stable repo (mainline URL is 404 as of 2026-05; stable has H3 builds) ─
+    if [ ! -f /etc/yum.repos.d/codeit.el8.repo ]; then
+      cat > /etc/yum.repos.d/codeit.el8.repo <<'CODEITREPO'
+[CodeIT]
+name=CodeIT repo
+baseurl=https://repo.codeit.guru/packages/centos/8/$basearch
+enabled=1
+gpgkey=https://repo.codeit.guru/RPM-GPG-KEY-MasterOfDevon
+gpgcheck=1
+CODEITREPO
+      yum clean all >/dev/null 2>&1
+      yum makecache >/dev/null 2>&1
+      echo "  ✓ added codeit stable repo"
+    fi
+
+    # ─ D. Remove stock brotli (codeit's libbrotli ships same file paths) ─
+    if rpm -q brotli >/dev/null 2>&1; then
+      DEPS=$(rpm -q --whatrequires brotli libbrotlidec libbrotlienc libbrotlicommon 2>&1 | grep -v 'no package requires' | grep -v '^$' || true)
+      if [ -n "$DEPS" ]; then
+        echo "  ⚠ brotli has dependents — aborting HTTP/3 swap to avoid breakage:"
+        echo "$DEPS" | sed 's/^/    /'
+        ENABLE_HTTP3=0
+      else
+        rpm -e --nodeps brotli && echo "  ✓ removed stock brotli (no dependents)"
+      fi
+    fi
+
+    # ─ E. Install codeit nginx + libbrotli + openssl-quic-libs (direct URLs bypass DNF modular filter) ─
+    if [ "$ENABLE_HTTP3" = "1" ]; then
+      CODEIT_BASE="https://repo.codeit.guru/packages/centos/8/x86_64"
+      LATEST_NGINX=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'nginx-[0-9.]+-[0-9]+\.module_codeit_mainline\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
+      LATEST_BROTLI=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'libbrotli-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
+      LATEST_OSSL=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'openssl-quic-libs-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
+      if [ -z "$LATEST_NGINX" ] || [ -z "$LATEST_BROTLI" ] || [ -z "$LATEST_OSSL" ]; then
+        echo "  ✗ couldn't discover codeit package URLs (network/repo issue) — skipping HTTP/3"
+        ENABLE_HTTP3=0
+      else
+        echo "  installing: $LATEST_NGINX + $LATEST_BROTLI + $LATEST_OSSL"
+        if yum install -y "$CODEIT_BASE/$LATEST_BROTLI" "$CODEIT_BASE/$LATEST_OSSL" "$CODEIT_BASE/$LATEST_NGINX" >/dev/null 2>&1; then
+          echo "  ✓ codeit nginx stack installed"
+          [ -f /etc/nginx/nginx.conf.rpmnew ] && mv /etc/nginx/nginx.conf.rpmnew /etc/nginx/nginx.conf.rpmnew.ignored
+          NEW_OSSL=$(nginx -V 2>&1 | grep -oE 'OpenSSL [0-9.]+' | head -1)
+          echo "  ✓ now built with: $NEW_OSSL (was OpenSSL 1.1.1k)"
+        else
+          echo "  ✗ codeit nginx install failed — skipping rest of HTTP/3 setup"
+          ENABLE_HTTP3=0
+        fi
+      fi
+    fi
+  fi
+
+  # ─ F. Self-signed default cert for QUIC binder (only if missing) ─
+  if [ "$ENABLE_HTTP3" = "1" ]; then
+    if [ ! -f /etc/pki/tls/certs/default.bundle ] || [ ! -f /etc/pki/tls/private/default.key ]; then
+      mkdir -p /etc/pki/tls/certs /etc/pki/tls/private
+      openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout /etc/pki/tls/private/default.key \
+        -out /etc/pki/tls/certs/default.bundle \
+        -days 1825 -subj "/CN=default" >/dev/null 2>&1
+      chmod 600 /etc/pki/tls/private/default.key
+      echo "  ✓ generated self-signed default cert (5-year, for QUIC binder)"
+    else
+      echo "✓ default cert already present"
+    fi
+
+    # ─ G. Global QUIC reuseport binder at /etc/nginx/bh.d/global_quic.conf ─
+    #    (perf-bootstrap wires include /etc/nginx/bh.d/*.conf later in section 6c)
+    NGX_BH_D=/etc/nginx/bh.d
+    mkdir -p "$NGX_BH_D"
+    if [ ! -f "$NGX_BH_D/global_quic.conf" ]; then
+      cat > "$NGX_BH_D/global_quic.conf" <<'QUICCONF'
+# BH-HTTP3-GLOBAL
+# Reuseport binder for QUIC — only ONE server block per box can carry
+# `reuseport` on UDP 443. This block owns the socket but does NOT serve
+# content. Real H3 traffic is routed via SNI to per-vhost `listen 443 quic;`
+# directives emitted by the CWP vhost template (BH-HTTP3-INJECT block).
+server {
+    listen 443 quic reuseport;
+    listen [::]:443 quic reuseport;
+    server_name _;
+    ssl_certificate      /etc/pki/tls/certs/default.bundle;
+    ssl_certificate_key  /etc/pki/tls/private/default.key;
+    ssl_protocols TLSv1.3;
+    ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
+    return 444;
+}
+# END BH-HTTP3-GLOBAL
+QUICCONF
+      echo "  ✓ wrote $NGX_BH_D/global_quic.conf"
+    else
+      echo "✓ $NGX_BH_D/global_quic.conf already present — leaving as-is"
+    fi
+
+    # ─ H. Patch CWP vhost templates (idempotent — skip if BH-HTTP3-INJECT tag present) ─
+    if [ -d "$CWP_NGINX_TPL_DIR" ]; then
+      for TPL in default.stpl http3.stpl; do
+        F="$CWP_NGINX_TPL_DIR/$TPL"
+        [ -f "$F" ] || continue
+        if grep -q 'BH-HTTP3-INJECT' "$F"; then
+          echo "✓ $TPL already patched — skipping"
+          continue
+        fi
+        cp "$F" "$H3_BACKUP_DIR/$TPL"
+        # Inject after FIRST "listen ... ssl http2" only (main server block,
+        # not webmail/mail/cpanel/ftp where H3 is pointless overhead)
+        awk '
+          BEGIN { done = 0 }
+          /listen .*ssl http2/ && done == 0 {
+            print
+            print "    # BH-HTTP3-INJECT"
+            print "    listen %ip%:%nginx_port% quic;"
+            print "    http3 on;"
+            print "    # END BH-HTTP3-INJECT"
+            done = 1
+            next
+          }
+          { print }
+        ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+        echo "  ✓ patched $TPL (backup: $H3_BACKUP_DIR/$TPL)"
+      done
+    else
+      echo "⊘ $CWP_NGINX_TPL_DIR not found — skipping template patch"
+    fi
+
+    # ─ I. Open UDP 443 in whichever firewall is active ─
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+      if ! firewall-cmd --list-ports 2>/dev/null | grep -q '443/udp'; then
+        firewall-cmd --permanent --add-port=443/udp >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        echo "  ✓ firewalld: opened UDP 443"
+      else
+        echo "✓ firewalld: UDP 443 already open"
+      fi
+    elif [ -f /etc/csf/csf.conf ] && systemctl is-active --quiet csf 2>/dev/null; then
+      if ! grep -E '^UDP_IN' /etc/csf/csf.conf | grep -q '\b443\b'; then
+        sed -i 's/^\(UDP_IN = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
+        sed -i 's/^\(UDP_OUT = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
+        csf -r >/dev/null 2>&1
+        echo "  ✓ csf: opened UDP 443"
+      else
+        echo "✓ csf: UDP 443 already open"
+      fi
+    else
+      echo "  ⚠ no active firewall detected — open UDP 443 manually if needed"
+    fi
+
+    # ─ J. Install heal cron — re-injects template tag if CWP updates wipe it ─
+    cat > /usr/local/sbin/bh-http3-template-heal.sh <<'HEALSCRIPT'
+#!/bin/bash
+# BH-HTTP3-TEMPLATE-HEAL — runs every 5 min via cron
+# Re-injects BH-HTTP3-INJECT block into CWP nginx vhost templates if
+# CWP package updates wiped it. Idempotent — no-op if tag present.
+TPL_DIR=/usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx
+HEALED=0
+for TPL in default.stpl http3.stpl; do
+  F="$TPL_DIR/$TPL"
+  [ -f "$F" ] || continue
+  if ! grep -q 'BH-HTTP3-INJECT' "$F"; then
+    awk '
+      BEGIN { done = 0 }
+      /listen .*ssl http2/ && done == 0 {
+        print
+        print "    # BH-HTTP3-INJECT"
+        print "    listen %ip%:%nginx_port% quic;"
+        print "    http3 on;"
+        print "    # END BH-HTTP3-INJECT"
+        done = 1
+        next
+      }
+      { print }
+    ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+    HEALED=$((HEALED+1))
+  fi
+done
+if [ $HEALED -gt 0 ]; then
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
+  echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED template(s)" >> /var/log/bh-http3-heal.log
+fi
+HEALSCRIPT
+    chmod +x /usr/local/sbin/bh-http3-template-heal.sh
+    cat > /etc/cron.d/bh-http3-heal <<'HEALCRON'
+# BH-HTTP3-HEAL — re-inject H3 lines into CWP templates if wiped
+*/5 * * * * root /usr/local/sbin/bh-http3-template-heal.sh >/dev/null 2>&1
+HEALCRON
+    touch /var/log/bh-http3-heal.log
+    echo "  ✓ heal cron installed (every 5 min)"
+
+    # ─ K. Quick nginx -t — if broken, restore template backups.
+    #    Full nginx reload happens in section [8/10] after anti-bot/perf work.
+    if ! nginx -t >/dev/null 2>&1; then
+      echo "  ✗ nginx -t failed after H3 setup — restoring template backups"
+      for TPL in default.stpl http3.stpl; do
+        [ -f "$H3_BACKUP_DIR/$TPL" ] && cp "$H3_BACKUP_DIR/$TPL" "$CWP_NGINX_TPL_DIR/$TPL"
+      done
+      rm -f "$NGX_BH_D/global_quic.conf"
+      echo "  ⚠ HTTP/3 rolled back — inspect: nginx -t"
+    else
+      echo "  ✓ nginx -t passes (final reload happens in section [8/10])"
+    fi
+  fi
+fi
+
+# ────────────────────────────────────────────────
 # 5. Apache MPM bump (auto-detect MPM type)
 # ────────────────────────────────────────────────
 echo ""
@@ -1630,250 +1868,6 @@ else
   echo "⊘ Apache hardening skipped"
 fi
 
-# ────────────────────────────────────────────────
-# 9b. HTTP/3 enablement — swap stock nginx for codeit's QUIC-capable build,
-#     write global QUIC binder + per-vhost template patches, install heal cron
-# ────────────────────────────────────────────────
-echo ""
-echo "─── [9b/10] HTTP/3 (codeit nginx + QUIC templates) ───"
-
-if [ "$ENABLE_HTTP3" != "1" ]; then
-  echo "⊘ HTTP/3 enablement skipped (set ENABLE_HTTP3=1 to enable)"
-elif [ "$IS_SLAVE_SERVER" = "1" ]; then
-  echo "⊘ slave/API mode — skipping HTTP/3 (browsers don't talk to slave APIs)"
-elif ! grep -qiE 'release 8' /etc/redhat-release 2>/dev/null /etc/almalinux-release 2>/dev/null /etc/system-release 2>/dev/null; then
-  echo "⊘ HTTP/3 swap targets EL8 only (codeit build is EL8-specific) — skipping"
-elif ! command -v nginx >/dev/null 2>&1; then
-  echo "⊘ nginx not installed — skipping HTTP/3"
-else
-  CWP_NGINX_TPL_DIR=/usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx
-  H3_BACKUP_DIR="/var/backups/bh-http3/$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$H3_BACKUP_DIR"
-
-  # ─ A. Detect if already on codeit build ─
-  CURRENT_RELEASE=$(rpm -qi nginx 2>/dev/null | awk -F': ' '/^Release/ {print $2; exit}')
-  if echo "$CURRENT_RELEASE" | grep -q 'codeit'; then
-    echo "✓ nginx already on codeit build ($CURRENT_RELEASE) — skipping package swap"
-  else
-    echo "  Current nginx release: ${CURRENT_RELEASE:-unknown} — swap needed"
-
-    # ─ B. Disable F5 nginx-mainline repo if present ─
-    if [ -f /etc/yum.repos.d/nginx.repo ]; then
-      cp /etc/yum.repos.d/nginx.repo "$H3_BACKUP_DIR/nginx.repo"
-      yum-config-manager --disable nginx-mainline >/dev/null 2>&1 || \
-        sed -i '/\[nginx-mainline\]/,/^\[/{s/^enabled=1/enabled=0/}' /etc/yum.repos.d/nginx.repo
-      echo "  ✓ disabled F5 nginx-mainline repo"
-    fi
-
-    # ─ C. Add codeit stable repo (mainline URL is 404 as of 2026-05; stable has H3 builds) ─
-    if [ ! -f /etc/yum.repos.d/codeit.el8.repo ]; then
-      cat > /etc/yum.repos.d/codeit.el8.repo <<'CODEITREPO'
-[CodeIT]
-name=CodeIT repo
-baseurl=https://repo.codeit.guru/packages/centos/8/$basearch
-enabled=1
-gpgkey=https://repo.codeit.guru/RPM-GPG-KEY-MasterOfDevon
-gpgcheck=1
-CODEITREPO
-      yum clean all >/dev/null 2>&1
-      yum makecache >/dev/null 2>&1
-      echo "  ✓ added codeit stable repo"
-    fi
-
-    # ─ D. Remove stock brotli (codeit's libbrotli ships same file paths) ─
-    if rpm -q brotli >/dev/null 2>&1; then
-      DEPS=$(rpm -q --whatrequires brotli libbrotlidec libbrotlienc libbrotlicommon 2>&1 | grep -v 'no package requires' | grep -v '^$' || true)
-      if [ -n "$DEPS" ]; then
-        echo "  ⚠ brotli has dependents — aborting HTTP/3 swap to avoid breakage:"
-        echo "$DEPS" | sed 's/^/    /'
-        ENABLE_HTTP3=0
-      else
-        rpm -e --nodeps brotli && echo "  ✓ removed stock brotli (no dependents)"
-      fi
-    fi
-
-    # ─ E. Install codeit nginx + libbrotli + openssl-quic-libs (direct URLs bypass DNF modular filter) ─
-    if [ "$ENABLE_HTTP3" = "1" ]; then
-      CODEIT_BASE="https://repo.codeit.guru/packages/centos/8/x86_64"
-      # Discover current versions from repo directory listing
-      LATEST_NGINX=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'nginx-[0-9.]+-[0-9]+\.module_codeit_mainline\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
-      LATEST_BROTLI=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'libbrotli-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
-      LATEST_OSSL=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'openssl-quic-libs-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
-      if [ -z "$LATEST_NGINX" ] || [ -z "$LATEST_BROTLI" ] || [ -z "$LATEST_OSSL" ]; then
-        echo "  ✗ couldn't discover codeit package URLs (network/repo issue) — skipping HTTP/3"
-        ENABLE_HTTP3=0
-      else
-        echo "  installing: $LATEST_NGINX + $LATEST_BROTLI + $LATEST_OSSL"
-        if yum install -y "$CODEIT_BASE/$LATEST_BROTLI" "$CODEIT_BASE/$LATEST_OSSL" "$CODEIT_BASE/$LATEST_NGINX" >/dev/null 2>&1; then
-          echo "  ✓ codeit nginx stack installed"
-          [ -f /etc/nginx/nginx.conf.rpmnew ] && mv /etc/nginx/nginx.conf.rpmnew /etc/nginx/nginx.conf.rpmnew.ignored
-          NEW_OSSL=$(nginx -V 2>&1 | grep -oE 'OpenSSL [0-9.]+' | head -1)
-          echo "  ✓ now built with: $NEW_OSSL (was OpenSSL 1.1.1k)"
-        else
-          echo "  ✗ codeit nginx install failed — skipping rest of HTTP/3 setup"
-          ENABLE_HTTP3=0
-        fi
-      fi
-    fi
-  fi
-
-  # ─ F. Self-signed default cert for QUIC binder (only if missing) ─
-  if [ "$ENABLE_HTTP3" = "1" ]; then
-    if [ ! -f /etc/pki/tls/certs/default.bundle ] || [ ! -f /etc/pki/tls/private/default.key ]; then
-      mkdir -p /etc/pki/tls/certs /etc/pki/tls/private
-      openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout /etc/pki/tls/private/default.key \
-        -out /etc/pki/tls/certs/default.bundle \
-        -days 1825 -subj "/CN=default" >/dev/null 2>&1
-      chmod 600 /etc/pki/tls/private/default.key
-      echo "  ✓ generated self-signed default cert (5-year, for QUIC binder)"
-    else
-      echo "✓ default cert already present"
-    fi
-
-    # ─ G. Global QUIC reuseport binder at /etc/nginx/bh.d/global_quic.conf ─
-    #    (perf-bootstrap already wires include /etc/nginx/bh.d/*.conf — no nginx.conf edit)
-    NGX_BH_D=/etc/nginx/bh.d
-    mkdir -p "$NGX_BH_D"
-    if [ ! -f "$NGX_BH_D/global_quic.conf" ]; then
-      cat > "$NGX_BH_D/global_quic.conf" <<'QUICCONF'
-# BH-HTTP3-GLOBAL
-# Reuseport binder for QUIC — only ONE server block per box can carry
-# `reuseport` on UDP 443. This block owns the socket but does NOT serve
-# content. Real H3 traffic is routed via SNI to per-vhost `listen 443 quic;`
-# directives emitted by the CWP vhost template (BH-HTTP3-INJECT block).
-server {
-    listen 443 quic reuseport;
-    listen [::]:443 quic reuseport;
-    server_name _;
-    ssl_certificate      /etc/pki/tls/certs/default.bundle;
-    ssl_certificate_key  /etc/pki/tls/private/default.key;
-    ssl_protocols TLSv1.3;
-    ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
-    return 444;
-}
-# END BH-HTTP3-GLOBAL
-QUICCONF
-      echo "  ✓ wrote $NGX_BH_D/global_quic.conf"
-    else
-      echo "✓ $NGX_BH_D/global_quic.conf already present — leaving as-is"
-    fi
-
-    # ─ H. Patch CWP vhost templates (idempotent — skip if BH-HTTP3-INJECT tag present) ─
-    if [ -d "$CWP_NGINX_TPL_DIR" ]; then
-      for TPL in default.stpl http3.stpl; do
-        F="$CWP_NGINX_TPL_DIR/$TPL"
-        [ -f "$F" ] || continue
-        if grep -q 'BH-HTTP3-INJECT' "$F"; then
-          echo "✓ $TPL already patched — skipping"
-          continue
-        fi
-        cp "$F" "$H3_BACKUP_DIR/$TPL"
-        # Inject after FIRST "listen ... ssl http2" only (main server block,
-        # not webmail/mail/cpanel/ftp where H3 is pointless overhead)
-        awk '
-          BEGIN { done = 0 }
-          /listen .*ssl http2/ && done == 0 {
-            print
-            print "    # BH-HTTP3-INJECT"
-            print "    listen %ip%:%nginx_port% quic;"
-            print "    http3 on;"
-            print "    # END BH-HTTP3-INJECT"
-            done = 1
-            next
-          }
-          { print }
-        ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-        echo "  ✓ patched $TPL (backup: $H3_BACKUP_DIR/$TPL)"
-      done
-    else
-      echo "⊘ $CWP_NGINX_TPL_DIR not found — skipping template patch"
-    fi
-
-    # ─ I. Open UDP 443 in whichever firewall is active ─
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
-      if ! firewall-cmd --list-ports 2>/dev/null | grep -q '443/udp'; then
-        firewall-cmd --permanent --add-port=443/udp >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        echo "  ✓ firewalld: opened UDP 443"
-      else
-        echo "✓ firewalld: UDP 443 already open"
-      fi
-    elif [ -f /etc/csf/csf.conf ] && systemctl is-active --quiet csf 2>/dev/null; then
-      if ! grep -E '^UDP_IN' /etc/csf/csf.conf | grep -q '\b443\b'; then
-        sed -i 's/^\(UDP_IN = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
-        sed -i 's/^\(UDP_OUT = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
-        csf -r >/dev/null 2>&1
-        echo "  ✓ csf: opened UDP 443"
-      else
-        echo "✓ csf: UDP 443 already open"
-      fi
-    else
-      echo "  ⚠ no active firewall detected — open UDP 443 manually if needed"
-    fi
-
-    # ─ J. Install heal cron — re-injects template tag if CWP updates wipe it ─
-    cat > /usr/local/sbin/bh-http3-template-heal.sh <<'HEALSCRIPT'
-#!/bin/bash
-# BH-HTTP3-TEMPLATE-HEAL — runs every 5 min via cron
-# Re-injects BH-HTTP3-INJECT block into CWP nginx vhost templates if
-# CWP package updates wiped it. Idempotent — no-op if tag present.
-TPL_DIR=/usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx
-HEALED=0
-for TPL in default.stpl http3.stpl; do
-  F="$TPL_DIR/$TPL"
-  [ -f "$F" ] || continue
-  if ! grep -q 'BH-HTTP3-INJECT' "$F"; then
-    awk '
-      BEGIN { done = 0 }
-      /listen .*ssl http2/ && done == 0 {
-        print
-        print "    # BH-HTTP3-INJECT"
-        print "    listen %ip%:%nginx_port% quic;"
-        print "    http3 on;"
-        print "    # END BH-HTTP3-INJECT"
-        done = 1
-        next
-      }
-      { print }
-    ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-    HEALED=$((HEALED+1))
-  fi
-done
-if [ $HEALED -gt 0 ]; then
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
-  echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED template(s)" >> /var/log/bh-http3-heal.log
-fi
-HEALSCRIPT
-    chmod +x /usr/local/sbin/bh-http3-template-heal.sh
-    cat > /etc/cron.d/bh-http3-heal <<'HEALCRON'
-# BH-HTTP3-HEAL — re-inject H3 lines into CWP templates if wiped
-*/5 * * * * root /usr/local/sbin/bh-http3-template-heal.sh >/dev/null 2>&1
-HEALCRON
-    touch /var/log/bh-http3-heal.log
-    echo "  ✓ heal cron installed (every 5 min)"
-
-    # ─ K. Test config + reload nginx ─
-    if nginx -t >/dev/null 2>&1; then
-      systemctl reload nginx
-      echo "  ✓ nginx reloaded with HTTP/3 enabled"
-      echo ""
-      echo "  Next steps (manual):"
-      echo "    1. CWP admin → Settings → Edit Settings → 'Rebuild Apache + nginx'"
-      echo "       (so existing vhosts pick up the new template — heal cron handles future drift)"
-      echo "    2. Test from a CLIENT browser → DevTools → Network → Protocol column should show 'h3'"
-      echo "       (curl from this box may not have H3 support)"
-    else
-      echo "  ✗ nginx -t failed — restoring template backups"
-      for TPL in default.stpl http3.stpl; do
-        [ -f "$H3_BACKUP_DIR/$TPL" ] && cp "$H3_BACKUP_DIR/$TPL" "$CWP_NGINX_TPL_DIR/$TPL"
-      done
-      rm -f "$NGX_BH_D/global_quic.conf"
-      nginx -t && systemctl reload nginx
-      echo "  ⚠ HTTP/3 enablement rolled back — inspect /var/log/nginx/error.log"
-    fi
-  fi
-fi
 
 # ────────────────────────────────────────────────
 # 10. Install helper scripts (tenant-cap, monitor, auto-recovery)
