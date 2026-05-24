@@ -820,6 +820,7 @@ QUICCONF
 
     # ─ H. Patch CWP vhost templates (idempotent — skip if BH-HTTP3-INJECT tag present) ─
     if [ -d "$CWP_NGINX_TPL_DIR" ]; then
+      # H.1 — Patch default.stpl + http3.stpl (whichever exist) with H3 listen lines
       for TPL in default.stpl http3.stpl; do
         F="$CWP_NGINX_TPL_DIR/$TPL"
         [ -f "$F" ] || continue
@@ -845,6 +846,23 @@ QUICCONF
         ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
         echo "  ✓ patched $TPL (backup: $H3_BACKUP_DIR/$TPL)"
       done
+
+      # H.2 — Auto-create http3.stpl by cloning the patched default.stpl, if missing.
+      #       Fresh CWP installs don't ship http3.stpl. Having it gives a per-user
+      #       fallback: admin assigns http3 template to a user → that user keeps H3
+      #       even if default.stpl gets overwritten by a CWP update later.
+      if [ ! -f "$CWP_NGINX_TPL_DIR/http3.stpl" ] && [ -f "$CWP_NGINX_TPL_DIR/default.stpl" ]; then
+        cp "$CWP_NGINX_TPL_DIR/default.stpl" "$CWP_NGINX_TPL_DIR/http3.stpl"
+        echo "  ✓ created http3.stpl (clone of patched default.stpl — per-user H3 fallback)"
+      fi
+
+      # H.3 — Auto-create http3.tpl by cloning default.tpl, if missing.
+      #       Port-80 template — no H3 changes needed (H3 is HTTPS-only) but CWP
+      #       expects both .tpl + .stpl when an admin assigns the "http3" template.
+      if [ ! -f "$CWP_NGINX_TPL_DIR/http3.tpl" ] && [ -f "$CWP_NGINX_TPL_DIR/default.tpl" ]; then
+        cp "$CWP_NGINX_TPL_DIR/default.tpl" "$CWP_NGINX_TPL_DIR/http3.tpl"
+        echo "  ✓ created http3.tpl (clone of default.tpl — port 80 fallback)"
+      fi
     else
       echo "⊘ $CWP_NGINX_TPL_DIR not found — skipping template patch"
     fi
@@ -875,8 +893,10 @@ QUICCONF
     cat > /usr/local/sbin/bh-http3-template-heal.sh <<'HEALSCRIPT'
 #!/bin/bash
 # BH-HTTP3-TEMPLATE-HEAL — runs every 5 min via cron
-# Re-injects BH-HTTP3-INJECT block into CWP nginx vhost templates if
-# CWP package updates wiped it. Idempotent — no-op if tag present.
+# 1. Re-injects BH-HTTP3-INJECT block into CWP nginx vhost templates if
+#    CWP package updates wiped it.
+# 2. Recreates http3.stpl / http3.tpl from default.{stpl,tpl} if missing.
+# Idempotent — no-op if everything is in place.
 TPL_DIR=/usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx
 HEALED=0
 for TPL in default.stpl http3.stpl; do
@@ -899,6 +919,15 @@ for TPL in default.stpl http3.stpl; do
     HEALED=$((HEALED+1))
   fi
 done
+# Recreate http3.{stpl,tpl} from default.{stpl,tpl} if missing
+if [ ! -f "$TPL_DIR/http3.stpl" ] && [ -f "$TPL_DIR/default.stpl" ]; then
+  cp "$TPL_DIR/default.stpl" "$TPL_DIR/http3.stpl"
+  HEALED=$((HEALED+1))
+fi
+if [ ! -f "$TPL_DIR/http3.tpl" ] && [ -f "$TPL_DIR/default.tpl" ]; then
+  cp "$TPL_DIR/default.tpl" "$TPL_DIR/http3.tpl"
+  HEALED=$((HEALED+1))
+fi
 if [ $HEALED -gt 0 ]; then
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
   echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED template(s)" >> /var/log/bh-http3-heal.log
