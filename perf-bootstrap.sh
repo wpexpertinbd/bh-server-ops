@@ -690,15 +690,33 @@ EOF
   # ─ Install heal cron (every 5 min) ─
   cat > /usr/local/sbin/bh-fpm-pool-heal.sh <<'HEALSCRIPT'
 #!/bin/bash
-# BH-FPM-POOL-HEAL — every 5 min, re-detect heavy users + ensure pm.max_children
-# matches HEAVY_CHILDREN tier value. Defends against CWP pool regen AND any
-# script logic bug that misclassified users on first run.
+# BH-FPM-POOL-HEAL — every 5 min, re-detect heavy users + ensure their pool
+# config has the FULL heavy-mode settings (not just max_children). Defends
+# against CWP pool regen AND any script logic bug that misclassified users.
+#
+# Heavy mode = pm=dynamic + pm.max_children=HEAVY_CHILDREN + start/min/max
+# spare servers + (no pm.process_idle_timeout, which is ondemand-only).
 
 CONF=/var/lib/bh-server-ops/fpm-config
 [ -f "$CONF" ] || exit 0
 . "$CONF"
 [ -n "$HEAVY_CHILDREN" ] || exit 0
 SKIP_USERS="${SKIP_USERS:-nobody}"
+
+START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
+MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
+MAX_SPARE=$(( HEAVY_CHILDREN / 2 )); [ $MAX_SPARE -lt 4 ] && MAX_SPARE=4
+
+# Idempotent key=value setter, anchored on '=' so short keys like 'pm'
+# don't accidentally clobber 'pm.max_children' etc.
+ensure_kv() {
+  local conf="$1" key="$2" value="$3"
+  if grep -qE "^${key}[[:space:]]*=" "$conf"; then
+    sed -i -E "s|^${key}[[:space:]]*=.*|${key} = ${value}|" "$conf"
+  else
+    echo "${key} = ${value}" >> "$conf"
+  fi
+}
 
 HAVE_MYSQL=0
 command -v mysql >/dev/null 2>&1 && mysql -N -B -e "SELECT 1" >/dev/null 2>&1 && HAVE_MYSQL=1
@@ -728,11 +746,30 @@ for USER in $DETECTED; do
   for DIR in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users; do
     POOL="$DIR/$USER.conf"
     [ -f "$POOL" ] || continue
-    CURRENT=$(grep -oE '^pm\.max_children = [0-9]+' "$POOL" | awk '{print $3}')
-    if [ -n "$CURRENT" ] && [ "$CURRENT" != "$HEAVY_CHILDREN" ]; then
-      sed -i "s/^pm\.max_children = .*/pm.max_children = $HEAVY_CHILDREN/" "$POOL"
-      HEALED=$((HEALED+1))
+
+    # Check if full heavy state is already present — only act on drift
+    CUR_PM=$(grep -oE '^pm[[:space:]]*=[[:space:]]*[a-z]+' "$POOL" | head -1 | awk '{print $3}')
+    CUR_CHILDREN=$(grep -oE '^pm\.max_children[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
+    CUR_START=$(grep -oE '^pm\.start_servers[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
+
+    if [ "$CUR_PM" = "dynamic" ] && [ "$CUR_CHILDREN" = "$HEAVY_CHILDREN" ] && [ "$CUR_START" = "$START_SVR" ]; then
+      continue  # already healthy
     fi
+
+    # Dedupe stale duplicate `pm = X` lines (from older buggy ensure_kv)
+    awk '/^pm[[:space:]]*=/{if(d++)next} {print}' "$POOL" > "$POOL.tmp" && mv "$POOL.tmp" "$POOL"
+
+    ensure_kv "$POOL" "pm" "dynamic"
+    ensure_kv "$POOL" "pm.max_children" "$HEAVY_CHILDREN"
+    ensure_kv "$POOL" "pm.max_requests" "500"
+    ensure_kv "$POOL" "pm.start_servers" "$START_SVR"
+    ensure_kv "$POOL" "pm.min_spare_servers" "$MIN_SPARE"
+    ensure_kv "$POOL" "pm.max_spare_servers" "$MAX_SPARE"
+    ensure_kv "$POOL" "request_terminate_timeout" "30s"
+    # process_idle_timeout is ondemand-only — strip it in dynamic mode
+    sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$POOL"
+
+    HEALED=$((HEALED+1))
   done
 done
 
@@ -740,7 +777,7 @@ if [ $HEALED -gt 0 ]; then
   for SVC in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php-fpm[0-9]+\.service$'); do
     systemctl reload "$SVC" >/dev/null 2>&1
   done
-  echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED heavy pool(s) [back to pm.max_children=$HEAVY_CHILDREN]" >> /var/log/bh-fpm-heal.log
+  echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED heavy pool(s) [full heavy config restored]" >> /var/log/bh-fpm-heal.log
 fi
 HEALSCRIPT
   chmod +x /usr/local/sbin/bh-fpm-pool-heal.sh
