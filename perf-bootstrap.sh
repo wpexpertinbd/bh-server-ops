@@ -909,22 +909,23 @@ QUICCONF
     fi
 
     # ─ I. Open UDP 443 in whichever firewall is active ─
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
+    #     CSF first — its daemon is `lfd`, not `csf`. CWP boxes typically run CSF.
+    if command -v csf >/dev/null 2>&1 && [ -f /etc/csf/csf.conf ]; then
+      if grep -E '^UDP_IN' /etc/csf/csf.conf | grep -qE '(^|,)443(,|"|$)'; then
+        echo "✓ csf: UDP 443 already open"
+      else
+        sed -i 's/^\(UDP_IN = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
+        sed -i 's/^\(UDP_OUT = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
+        csf -r >/dev/null 2>&1
+        echo "  ✓ csf: opened UDP 443"
+      fi
+    elif systemctl is-active --quiet firewalld 2>/dev/null; then
       if ! firewall-cmd --list-ports 2>/dev/null | grep -q '443/udp'; then
         firewall-cmd --permanent --add-port=443/udp >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
         echo "  ✓ firewalld: opened UDP 443"
       else
         echo "✓ firewalld: UDP 443 already open"
-      fi
-    elif [ -f /etc/csf/csf.conf ] && systemctl is-active --quiet csf 2>/dev/null; then
-      if ! grep -E '^UDP_IN' /etc/csf/csf.conf | grep -q '\b443\b'; then
-        sed -i 's/^\(UDP_IN = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
-        sed -i 's/^\(UDP_OUT = "[^"]*\)"/\1,443"/' /etc/csf/csf.conf
-        csf -r >/dev/null 2>&1
-        echo "  ✓ csf: opened UDP 443"
-      else
-        echo "✓ csf: UDP 443 already open"
       fi
     else
       echo "  ⚠ no active firewall detected — open UDP 443 manually if needed"
