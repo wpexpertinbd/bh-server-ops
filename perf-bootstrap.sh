@@ -621,9 +621,13 @@ if [ -n "$DETECTED_HEAVY" ]; then
 fi
 
 ensure_kv() {
+  # Set key=value in a php-fpm-style INI file. Anchors on `=` so writing
+  # short keys like `pm` does NOT mangle longer keys like `pm.max_children`
+  # (regex `^pm.*` previously matched ALL pm.* lines, replacing them with
+  # `pm = dynamic` and causing 4 duplicate pm= lines in production).
   local conf="$1" key="$2" value="$3"
-  if grep -q "^${key}\b" "$conf"; then
-    sed -i "s|^${key}.*|${key} = ${value}|" "$conf"
+  if grep -qE "^${key}[[:space:]]*=" "$conf"; then
+    sed -i -E "s|^${key}[[:space:]]*=.*|${key} = ${value}|" "$conf"
   else
     echo "${key} = ${value}" >> "$conf"
   fi
