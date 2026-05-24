@@ -861,7 +861,12 @@ QUICCONF
 
     # ─ H. Patch CWP vhost templates (idempotent — skip if BH-HTTP3-INJECT tag present) ─
     if [ -d "$CWP_NGINX_TPL_DIR" ]; then
-      # H.1 — Patch default.stpl + http3.stpl (whichever exist) with H3 listen lines
+      # H.1 — Patch default.stpl + http3.stpl (whichever exist) with H3 listen lines.
+      # Anchor: FIRST line containing "listen ... ssl" (matches any of:
+      #   "listen :443 ssl http2;"   (legacy literal)
+      #   "listen :443 ssl %http2%;" (CWP placeholder syntax)
+      #   "listen :443 ssl;"         (nginx 1.30+ split syntax)
+      # ). Skips webmail/mail/cpanel/ftp blocks (those come later, anchor=first).
       for TPL in default.stpl http3.stpl; do
         F="$CWP_NGINX_TPL_DIR/$TPL"
         [ -f "$F" ] || continue
@@ -870,11 +875,9 @@ QUICCONF
           continue
         fi
         cp "$F" "$H3_BACKUP_DIR/$TPL"
-        # Inject after FIRST "listen ... ssl http2" only (main server block,
-        # not webmail/mail/cpanel/ftp where H3 is pointless overhead)
         awk '
           BEGIN { done = 0 }
-          /listen .*ssl http2/ && done == 0 {
+          /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && done == 0 {
             print
             print "    # BH-HTTP3-INJECT"
             print "    listen %ip%:%nginx_port% quic;"
@@ -885,7 +888,19 @@ QUICCONF
           }
           { print }
         ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-        echo "  ✓ patched $TPL (backup: $H3_BACKUP_DIR/$TPL)"
+        # Verify the injection actually happened (anchor matched). If not,
+        # restore the backup and report so we don't silently ship a broken
+        # patch like before (CWP %http2% placeholder bug, fleet of 319 vhosts
+        # silently un-H3'd).
+        if grep -q 'BH-HTTP3-INJECT' "$F"; then
+          echo "  ✓ patched $TPL (backup: $H3_BACKUP_DIR/$TPL)"
+        else
+          cp "$H3_BACKUP_DIR/$TPL" "$F"
+          echo "  ✗ $TPL: awk anchor didn't match — restored from backup"
+          echo "     first 'listen' line in this file is:"
+          grep -nE '^[[:space:]]*listen' "$F" | head -1 | sed 's/^/       /'
+          echo "     report this so the anchor regex can be extended."
+        fi
       done
 
       # H.2 — Auto-create http3.stpl by cloning the patched default.stpl, if missing.
@@ -950,9 +965,10 @@ for TPL in default.stpl http3.stpl; do
   F="$TPL_DIR/$TPL"
   [ -f "$F" ] || continue
   if ! grep -q 'BH-HTTP3-INJECT' "$F"; then
+    cp "$F" "$F.bh-pre-heal"
     awk '
       BEGIN { done = 0 }
-      /listen .*ssl http2/ && done == 0 {
+      /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && done == 0 {
         print
         print "    # BH-HTTP3-INJECT"
         print "    listen %ip%:%nginx_port% quic;"
@@ -963,7 +979,14 @@ for TPL in default.stpl http3.stpl; do
       }
       { print }
     ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-    HEALED=$((HEALED+1))
+    if grep -q 'BH-HTTP3-INJECT' "$F"; then
+      HEALED=$((HEALED+1))
+      rm -f "$F.bh-pre-heal"
+    else
+      cp "$F.bh-pre-heal" "$F"
+      rm -f "$F.bh-pre-heal"
+      echo "$(date '+%Y-%m-%d %H:%M:%S') WARN $TPL: anchor regex didn't match — left untouched" >> /var/log/bh-http3-heal.log
+    fi
   fi
 done
 # Recreate http3.{stpl,tpl} from default.{stpl,tpl} if missing
