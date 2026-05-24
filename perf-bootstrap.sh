@@ -567,21 +567,51 @@ echo ""
 echo "─── [4/10] Per-user FPM pool tuning ───"
 TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0
 
-# Auto-detect Laravel/Symfony users by presence of `artisan` file in any
-# of their docroots. Saves having to maintain HEAVY_USERS by hand. Only
-# adds users that aren't already in HEAVY_USERS or SKIP_USERS.
+# Auto-detect heavy users by multiple signals. Saves having to maintain
+# HEAVY_USERS by hand — works in -y / curl|bash mode too.
+# SKIP_USERS is a hard escape hatch: any user listed there is NEVER tuned,
+# even if heavy signals match (use this to protect a tenant from changes).
+# Signals: Laravel/Symfony (artisan), WooCommerce, Magento (M1/M2),
+# OpenCart, large MySQL DB (>1 GB owned by user).
 DETECTED_HEAVY=""
+HAVE_MYSQL=0
+command -v mysql >/dev/null 2>&1 && mysql -N -B -e "SELECT 1" >/dev/null 2>&1 && HAVE_MYSQL=1
 for HOMEDIR in /home/*; do
   [ -d "$HOMEDIR" ] || continue
   USER=$(basename "$HOMEDIR")
   case " $HEAVY_USERS $SKIP_USERS " in *" $USER "*) continue ;; esac
-  # any artisan file anywhere in user's home (depth 4 covers most layouts)
+  REASONS=""
+  # Laravel/Symfony — any artisan file in home (depth 4 covers most layouts)
   if find "$HOMEDIR" -maxdepth 4 -name "artisan" -type f 2>/dev/null | head -1 | grep -q .; then
+    REASONS="${REASONS}Laravel/Symfony, "
+  fi
+  # WooCommerce — plugin folder under any wp-content
+  if find "$HOMEDIR" -maxdepth 6 -type d -name "woocommerce" -path "*/wp-content/plugins/woocommerce" 2>/dev/null | head -1 | grep -q .; then
+    REASONS="${REASONS}WooCommerce, "
+  fi
+  # Magento 2 (app/etc/env.php) or Magento 1 (app/Mage.php)
+  if find "$HOMEDIR" -maxdepth 5 -type f \( -path "*/app/etc/env.php" -o -path "*/app/Mage.php" \) 2>/dev/null | head -1 | grep -q .; then
+    REASONS="${REASONS}Magento, "
+  fi
+  # OpenCart — system/library/cart/cart.php
+  if find "$HOMEDIR" -maxdepth 5 -type f -path "*/system/library/cart/cart.php" 2>/dev/null | head -1 | grep -q .; then
+    REASONS="${REASONS}OpenCart, "
+  fi
+  # MySQL DB size — sum bytes across DBs prefixed "<user>_" or named "<user>"
+  if [ "$HAVE_MYSQL" = 1 ]; then
+    DB_BYTES=$(mysql -N -B -e "SELECT IFNULL(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema = '${USER}' OR table_schema LIKE '${USER}\\_%'" 2>/dev/null)
+    if [ -n "$DB_BYTES" ] && [ "$DB_BYTES" -gt 1073741824 ] 2>/dev/null; then
+      DB_GB=$(awk "BEGIN{printf \"%.1f\", $DB_BYTES/1073741824}")
+      REASONS="${REASONS}${DB_GB} GB DB, "
+    fi
+  fi
+  if [ -n "$REASONS" ]; then
+    REASONS="${REASONS%, }"
+    echo "  ✓ $USER: $REASONS → heavy pool"
     DETECTED_HEAVY="$DETECTED_HEAVY $USER"
   fi
 done
 if [ -n "$DETECTED_HEAVY" ]; then
-  echo "  Auto-detected Laravel/Symfony users:$DETECTED_HEAVY"
   HEAVY_USERS="$HEAVY_USERS$DETECTED_HEAVY"
 fi
 

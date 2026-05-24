@@ -157,7 +157,7 @@ A summary is shown before any change. Press Enter on each prompt to accept the d
 
 ### Non-interactive run (curl pipe, automation, etc.)
 
-When stdin isn't a TTY (e.g. `curl ... | bash`) or you pass `-y`, the script uses built-in defaults silently:
+When stdin isn't a TTY (e.g. `curl ... | bash`) or you pass `-y`, the script uses built-in defaults silently. Heavy users are **auto-detected** by scanning `/home/*` for Laravel/Symfony (`artisan`), WooCommerce, Magento (M1/M2), OpenCart, or MySQL DBs >1 GB owned by the user — these tenants get the heavy FPM pool automatically, no `HEAVY_USERS` env needed:
 
 ```bash
 # Pass defaults via flag
@@ -171,6 +171,9 @@ bash perf-bootstrap.sh -y
 
 # Pipe-from-curl (treated as non-interactive)
 curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh | bash
+
+# Protect a fragile tenant from any tuning (hard escape hatch — wins over auto-detect)
+SKIP_USERS="fragileuser" bash perf-bootstrap.sh -y
 ```
 
 ### Rollback
