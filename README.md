@@ -267,6 +267,29 @@ If TTFB exceeds recovery threshold (default 20s):
 
 To disable, choose `n` at the prompt OR set `ENABLE_AUTO_RECOVERY_CRON=0`. Disable temporarily for diagnostic windows where you want saturation events to persist for inspection.
 
+## HTTP/3 (real, not advertise-only)
+
+EL8's stock nginx links against OpenSSL 1.1.1k which has zero QUIC API — so `--with-http_v3_module` loads but TLS handshakes silently fail. The script swaps to codeit.guru's nginx build (linked against `openssl-quic-libs-4.0.0`) which actually serves H3. System OpenSSL stays untouched; only nginx changes.
+
+What the `ENABLE_HTTP3=1` path (default with `-y`) does, all idempotent:
+
+1. Detects current nginx — if already on a `.codeit.el8` build, skips the swap
+2. Disables F5's `nginx-mainline` repo, adds codeit's stable repo
+3. Removes stock `brotli` only if nothing depends on it (auto-aborts H3 otherwise)
+4. Installs `libbrotli` + `openssl-quic-libs` + `nginx` from codeit (via direct RPM URLs to bypass DNF modular filtering)
+5. Generates `/etc/pki/tls/{certs/default.bundle,private/default.key}` (5-year self-signed) for the QUIC binder, only if missing
+6. Drops `/etc/nginx/bh.d/global_quic.conf` (reuseport binder, returns 444 for unmatched SNI — real H3 routes via SNI to per-vhost listeners), only if absent
+7. Patches CWP vhost templates at `/usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/nginx/{default,http3}.stpl` — injects `listen %ip%:%nginx_port% quic;` + `http3 on;` into the MAIN server block (skips webmail/mail/cpanel/ftp), tagged `# BH-HTTP3-INJECT`
+8. Opens UDP 443 in csf or firewalld (auto-detect)
+9. Installs `/usr/local/sbin/bh-http3-template-heal.sh` + 5-min cron — re-injects the template tag if CWP package updates wipe it
+10. `nginx -t` + reload; if test fails, restores template backups and rolls back
+
+To skip on a specific box (e.g. slave/API node where browsers never connect):
+```bash
+ENABLE_HTTP3=0 bash perf-bootstrap.sh -y
+```
+`IS_SLAVE_SERVER=1` also auto-skips H3 (no point serving QUIC to machine clients).
+
 ## RAM-tier scaling
 
 Every memory-hungry setting (Apache MPM, FPM children, OPcache, Redis) auto-scales together based on detected RAM. Same script works from a tiny 1 vCPU/2 GB VPS to a 256 GB dedicated beast.
