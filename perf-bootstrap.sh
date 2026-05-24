@@ -747,17 +747,23 @@ for USER in $DETECTED; do
     POOL="$DIR/$USER.conf"
     [ -f "$POOL" ] || continue
 
-    # Check if full heavy state is already present — only act on drift
+    # Check if full heavy state is already present AND clean (no duplicates)
     CUR_PM=$(grep -oE '^pm[[:space:]]*=[[:space:]]*[a-z]+' "$POOL" | head -1 | awk '{print $3}')
     CUR_CHILDREN=$(grep -oE '^pm\.max_children[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
     CUR_START=$(grep -oE '^pm\.start_servers[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
+    PM_LINE_COUNT=$(grep -cE '^pm[[:space:]]*=' "$POOL")
 
-    if [ "$CUR_PM" = "dynamic" ] && [ "$CUR_CHILDREN" = "$HEAVY_CHILDREN" ] && [ "$CUR_START" = "$START_SVR" ]; then
-      continue  # already healthy
+    # Healthy iff: dynamic mode + correct sizes + EXACTLY ONE pm= line (no duplicates).
+    # The PM_LINE_COUNT=1 check is what catches the legacy ensure_kv bug that
+    # left 4× duplicate `pm = dynamic` lines in heavy users' configs.
+    if [ "$CUR_PM" = "dynamic" ] && [ "$CUR_CHILDREN" = "$HEAVY_CHILDREN" ] \
+       && [ "$CUR_START" = "$START_SVR" ] && [ "$PM_LINE_COUNT" = "1" ]; then
+      continue
     fi
 
-    # Dedupe stale duplicate `pm = X` lines (from older buggy ensure_kv)
-    awk '/^pm[[:space:]]*=/{if(d++)next} {print}' "$POOL" > "$POOL.tmp" && mv "$POOL.tmp" "$POOL"
+    # Strip ALL `pm = (dynamic|ondemand)` lines first — ensure_kv re-adds ONE
+    # correct line below. Handles any mix of legacy duplicates / wrong mode.
+    sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
 
     ensure_kv "$POOL" "pm" "dynamic"
     ensure_kv "$POOL" "pm.max_children" "$HEAVY_CHILDREN"
