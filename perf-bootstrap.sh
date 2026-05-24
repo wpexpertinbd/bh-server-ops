@@ -878,47 +878,63 @@ QUICCONF
         fi
 
         # State C — manually H3'd without BH tags → skip with warning.
-        # Detection: file contains a `listen ... quic;` or `http3 on;` line
-        # that isn't wrapped in BH-HTTP3 markers. Likely a previous manual
-        # edit. Injecting now would create duplicate listen-quic directives.
-        if grep -qE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic[[:space:]]*;|http3[[:space:]]+on[[:space:]]*;)' "$F"; then
+        # Detection: file contains `listen ... quic;`, `http3 on;`, or
+        # `add_header Alt-Svc ... h3=`. Likely a prior manual edit;
+        # injecting now would duplicate directives.
+        if grep -qE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic[[:space:]]*;|http3[[:space:]]+on[[:space:]]*;|add_header[[:space:]]+Alt-Svc[[:space:]]+.*h3=)' "$F"; then
           echo "⚠ $TPL has manual H3 directives but no BH-HTTP3-INJECT tags — skipping."
           echo "   Detected lines:"
-          grep -nE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic|http3[[:space:]]+on)' "$F" | sed 's/^/     /'
-          echo "   To let the script manage H3 here, EITHER:"
-          echo "   (a) Remove those lines manually, then re-run perf-bootstrap.sh, OR"
-          echo "   (b) Wrap them with markers:"
-          echo "       # BH-HTTP3-INJECT"
-          echo "       <your lines>"
-          echo "       # END BH-HTTP3-INJECT"
+          grep -nE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic|http3[[:space:]]+on|add_header[[:space:]]+Alt-Svc[[:space:]]+.*h3=)' "$F" | sed 's/^/     /'
+          echo "   Either remove those lines and re-run, or wrap them with BH-HTTP3-INJECT markers."
           continue
         fi
 
-        # State A — clean CWP template → inject. Anchor matches any first
-        # listen line with 'ssl' on it (literal http2, %http2% placeholder,
-        # or bare ssl).
+        # State A — clean CWP template → 3 modifications in MAIN server block only:
+        #   1) Inject listen quic + http3 on after the FIRST listen-ssl line
+        #   2) Append TLSv1.3 to `ssl_protocols TLSv1.2;` (QUIC needs TLSv1.3)
+        #   3) Inject Alt-Svc add_header inside location / before proxy_pass
+        #      (CRITICAL — nginx's add_header inheritance is all-or-nothing;
+        #       server-level Alt-Svc gets clobbered by location-level
+        #       add_headers in the CWP template's `location /` block)
         cp "$F" "$H3_BACKUP_DIR/$TPL"
         awk '
-          BEGIN { done = 0 }
-          /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && done == 0 {
+          BEGIN { block_count = 0; injected_listen = 0; injected_altsvc_loc = 0 }
+          /^server[[:space:]]*\{/ { block_count++ }
+          # (2) ssl_protocols TLSv1.2;  → ssl_protocols TLSv1.2 TLSv1.3;  (main block only)
+          block_count == 1 && /^[[:space:]]*ssl_protocols[[:space:]]+TLSv1\.2[[:space:]]*;/ {
+            sub(/TLSv1\.2[[:space:]]*;/, "TLSv1.2 TLSv1.3;")
+          }
+          # (1) listen ssl ... → also listen quic + http3 on
+          /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && injected_listen == 0 {
             print
             print "    # BH-HTTP3-INJECT"
             print "    listen %ip%:%nginx_port% quic;"
             print "    http3 on;"
             print "    # END BH-HTTP3-INJECT"
-            done = 1
+            injected_listen = 1
             next
+          }
+          # (3) Alt-Svc inside MAIN block`s first proxy_pass-bearing location
+          block_count == 1 && /^[[:space:]]*proxy_pass[[:space:]]/ && injected_altsvc_loc == 0 {
+            print "        # BH-HTTP3-ALTSVC-LOC"
+            print "        add_header Alt-Svc \047h3=\":443\"; ma=86400\047 always;"
+            print "        # END BH-HTTP3-ALTSVC-LOC"
+            injected_altsvc_loc = 1
           }
           { print }
         ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-        if grep -q 'BH-HTTP3-INJECT' "$F"; then
-          echo "  ✓ patched $TPL (backup: $H3_BACKUP_DIR/$TPL)"
+
+        # Verify all 3 modifications landed
+        MOD_LISTEN=$(grep -c 'BH-HTTP3-INJECT' "$F" 2>/dev/null || echo 0)
+        MOD_TLS=$(grep -cE 'ssl_protocols.*TLSv1\.3' "$F" 2>/dev/null || echo 0)
+        MOD_ALTSVC=$(grep -c 'BH-HTTP3-ALTSVC-LOC' "$F" 2>/dev/null || echo 0)
+        if [ "$MOD_LISTEN" -ge 1 ] && [ "$MOD_TLS" -ge 1 ] && [ "$MOD_ALTSVC" -ge 1 ]; then
+          echo "  ✓ patched $TPL (listen quic + TLSv1.3 + Alt-Svc, backup: $H3_BACKUP_DIR/$TPL)"
         else
           cp "$H3_BACKUP_DIR/$TPL" "$F"
-          echo "  ✗ $TPL: awk anchor didn't match — restored from backup"
-          echo "     first 'listen' line in this file is:"
+          echo "  ✗ $TPL: incomplete patch (listen=$MOD_LISTEN tls=$MOD_TLS altsvc=$MOD_ALTSVC) — restored from backup"
+          echo "     first 'listen' line:"
           grep -nE '^[[:space:]]*listen' "$F" | head -1 | sed 's/^/       /'
-          echo "     report this so the anchor regex can be extended."
         fi
       done
 
@@ -983,34 +999,42 @@ HEALED=0
 for TPL in default.stpl http3.stpl; do
   F="$TPL_DIR/$TPL"
   [ -f "$F" ] || continue
-  # Already managed → no-op
   grep -q 'BH-HTTP3-INJECT' "$F" && continue
-  # Manual H3 without BH tags → leave alone, don't duplicate directives
-  if grep -qE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic[[:space:]]*;|http3[[:space:]]+on[[:space:]]*;)' "$F"; then
+  if grep -qE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic[[:space:]]*;|http3[[:space:]]+on[[:space:]]*;|add_header[[:space:]]+Alt-Svc[[:space:]]+.*h3=)' "$F"; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP $TPL: manual H3 directives present without BH-HTTP3-INJECT tags" >> /var/log/bh-http3-heal.log
     continue
   fi
   cp "$F" "$F.bh-pre-heal"
   awk '
-    BEGIN { done = 0 }
-    /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && done == 0 {
+    BEGIN { block_count = 0; injected_listen = 0; injected_altsvc_loc = 0 }
+    /^server[[:space:]]*\{/ { block_count++ }
+    block_count == 1 && /^[[:space:]]*ssl_protocols[[:space:]]+TLSv1\.2[[:space:]]*;/ {
+      sub(/TLSv1\.2[[:space:]]*;/, "TLSv1.2 TLSv1.3;")
+    }
+    /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && injected_listen == 0 {
       print
       print "    # BH-HTTP3-INJECT"
       print "    listen %ip%:%nginx_port% quic;"
       print "    http3 on;"
       print "    # END BH-HTTP3-INJECT"
-      done = 1
+      injected_listen = 1
       next
+    }
+    block_count == 1 && /^[[:space:]]*proxy_pass[[:space:]]/ && injected_altsvc_loc == 0 {
+      print "        # BH-HTTP3-ALTSVC-LOC"
+      print "        add_header Alt-Svc \047h3=\":443\"; ma=86400\047 always;"
+      print "        # END BH-HTTP3-ALTSVC-LOC"
+      injected_altsvc_loc = 1
     }
     { print }
   ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-  if grep -q 'BH-HTTP3-INJECT' "$F"; then
+  if grep -q 'BH-HTTP3-INJECT' "$F" && grep -qE 'ssl_protocols.*TLSv1\.3' "$F" && grep -q 'BH-HTTP3-ALTSVC-LOC' "$F"; then
     HEALED=$((HEALED+1))
     rm -f "$F.bh-pre-heal"
   else
     cp "$F.bh-pre-heal" "$F"
     rm -f "$F.bh-pre-heal"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') WARN $TPL: anchor regex didn't match — left untouched" >> /var/log/bh-http3-heal.log
+    echo "$(date '+%Y-%m-%d %H:%M:%S') WARN $TPL: incomplete patch — left untouched" >> /var/log/bh-http3-heal.log
   fi
 done
 # Recreate http3.{stpl,tpl} from default.{stpl,tpl} if missing
