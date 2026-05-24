@@ -908,9 +908,14 @@ QUICCONF
       echo "⊘ $CWP_NGINX_TPL_DIR not found — skipping template patch"
     fi
 
-    # ─ I. Open UDP 443 in whichever firewall is active ─
-    #     CSF first — its daemon is `lfd`, not `csf`. CWP boxes typically run CSF.
-    if command -v csf >/dev/null 2>&1 && [ -f /etc/csf/csf.conf ]; then
+    # ─ I. Open UDP 443 in whichever host firewall is active ─
+    #     Most cloud/datacenter networks already allow UDP 443 at the edge —
+    #     host firewall only matters if it's actively filtering. CSF and
+    #     firewalld are the ones we know how to talk to. cpGuard doesn't
+    #     manage L4 ports directly (it's a WAF/malware layer, port filtering
+    #     is delegated to firewalld/iptables underneath). Anything else →
+    #     silent skip; trust the network already permits UDP 443.
+    if command -v csf >/dev/null 2>&1 && [ -f /etc/csf/csf.conf ] && systemctl is-active --quiet lfd 2>/dev/null; then
       if grep -E '^UDP_IN' /etc/csf/csf.conf | grep -qE '(^|,)443(,|"|$)'; then
         echo "✓ csf: UDP 443 already open"
       else
@@ -920,15 +925,15 @@ QUICCONF
         echo "  ✓ csf: opened UDP 443"
       fi
     elif systemctl is-active --quiet firewalld 2>/dev/null; then
-      if ! firewall-cmd --list-ports 2>/dev/null | grep -q '443/udp'; then
+      if firewall-cmd --list-ports 2>/dev/null | grep -q '443/udp'; then
+        echo "✓ firewalld: UDP 443 already open"
+      else
         firewall-cmd --permanent --add-port=443/udp >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
         echo "  ✓ firewalld: opened UDP 443"
-      else
-        echo "✓ firewalld: UDP 443 already open"
       fi
     else
-      echo "  ⚠ no active firewall detected — open UDP 443 manually if needed"
+      echo "ℹ csf/firewalld not actively managing ports — assuming UDP 443 open at network level"
     fi
 
     # ─ J. Install heal cron — re-injects template tag if CWP updates wipe it ─
