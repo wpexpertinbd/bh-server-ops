@@ -779,11 +779,24 @@ for USER in $DETECTED; do
   done
 done
 
-if [ $HEALED -gt 0 ]; then
+# Sweep pass: pm.process_idle_timeout is ondemand-only. Strip it from any
+# pool currently in dynamic mode — regardless of whether it was in the
+# heavy-detected list this run. Catches edge case where a pool's pm was
+# flipped to dynamic by earlier heal/script run but process_idle_timeout
+# was never removed.
+STRIPPED=0
+for F in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf; do
+  if grep -qE '^pm[[:space:]]*=[[:space:]]*dynamic' "$F" && grep -qE '^pm\.process_idle_timeout' "$F"; then
+    sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$F"
+    STRIPPED=$((STRIPPED+1))
+  fi
+done
+
+if [ $HEALED -gt 0 ] || [ $STRIPPED -gt 0 ]; then
   for SVC in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php-fpm[0-9]+\.service$'); do
     systemctl reload "$SVC" >/dev/null 2>&1
   done
-  echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED heavy pool(s) [full heavy config restored]" >> /var/log/bh-fpm-heal.log
+  echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED heavy pool(s); stripped $STRIPPED stale process_idle_timeout" >> /var/log/bh-fpm-heal.log
 fi
 HEALSCRIPT
   chmod +x /usr/local/sbin/bh-fpm-pool-heal.sh
