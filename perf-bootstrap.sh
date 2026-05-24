@@ -870,10 +870,33 @@ QUICCONF
       for TPL in default.stpl http3.stpl; do
         F="$CWP_NGINX_TPL_DIR/$TPL"
         [ -f "$F" ] || continue
+
+        # State B — already script-managed → skip
         if grep -q 'BH-HTTP3-INJECT' "$F"; then
-          echo "✓ $TPL already patched — skipping"
+          echo "✓ $TPL already patched (BH-HTTP3-INJECT tag present) — skipping"
           continue
         fi
+
+        # State C — manually H3'd without BH tags → skip with warning.
+        # Detection: file contains a `listen ... quic;` or `http3 on;` line
+        # that isn't wrapped in BH-HTTP3 markers. Likely a previous manual
+        # edit. Injecting now would create duplicate listen-quic directives.
+        if grep -qE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic[[:space:]]*;|http3[[:space:]]+on[[:space:]]*;)' "$F"; then
+          echo "⚠ $TPL has manual H3 directives but no BH-HTTP3-INJECT tags — skipping."
+          echo "   Detected lines:"
+          grep -nE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic|http3[[:space:]]+on)' "$F" | sed 's/^/     /'
+          echo "   To let the script manage H3 here, EITHER:"
+          echo "   (a) Remove those lines manually, then re-run perf-bootstrap.sh, OR"
+          echo "   (b) Wrap them with markers:"
+          echo "       # BH-HTTP3-INJECT"
+          echo "       <your lines>"
+          echo "       # END BH-HTTP3-INJECT"
+          continue
+        fi
+
+        # State A — clean CWP template → inject. Anchor matches any first
+        # listen line with 'ssl' on it (literal http2, %http2% placeholder,
+        # or bare ssl).
         cp "$F" "$H3_BACKUP_DIR/$TPL"
         awk '
           BEGIN { done = 0 }
@@ -888,10 +911,6 @@ QUICCONF
           }
           { print }
         ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-        # Verify the injection actually happened (anchor matched). If not,
-        # restore the backup and report so we don't silently ship a broken
-        # patch like before (CWP %http2% placeholder bug, fleet of 319 vhosts
-        # silently un-H3'd).
         if grep -q 'BH-HTTP3-INJECT' "$F"; then
           echo "  ✓ patched $TPL (backup: $H3_BACKUP_DIR/$TPL)"
         else
@@ -964,29 +983,34 @@ HEALED=0
 for TPL in default.stpl http3.stpl; do
   F="$TPL_DIR/$TPL"
   [ -f "$F" ] || continue
-  if ! grep -q 'BH-HTTP3-INJECT' "$F"; then
-    cp "$F" "$F.bh-pre-heal"
-    awk '
-      BEGIN { done = 0 }
-      /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && done == 0 {
-        print
-        print "    # BH-HTTP3-INJECT"
-        print "    listen %ip%:%nginx_port% quic;"
-        print "    http3 on;"
-        print "    # END BH-HTTP3-INJECT"
-        done = 1
-        next
-      }
-      { print }
-    ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-    if grep -q 'BH-HTTP3-INJECT' "$F"; then
-      HEALED=$((HEALED+1))
-      rm -f "$F.bh-pre-heal"
-    else
-      cp "$F.bh-pre-heal" "$F"
-      rm -f "$F.bh-pre-heal"
-      echo "$(date '+%Y-%m-%d %H:%M:%S') WARN $TPL: anchor regex didn't match — left untouched" >> /var/log/bh-http3-heal.log
-    fi
+  # Already managed → no-op
+  grep -q 'BH-HTTP3-INJECT' "$F" && continue
+  # Manual H3 without BH tags → leave alone, don't duplicate directives
+  if grep -qE '^[[:space:]]*(listen[[:space:]]+.*[[:space:]]quic[[:space:]]*;|http3[[:space:]]+on[[:space:]]*;)' "$F"; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP $TPL: manual H3 directives present without BH-HTTP3-INJECT tags" >> /var/log/bh-http3-heal.log
+    continue
+  fi
+  cp "$F" "$F.bh-pre-heal"
+  awk '
+    BEGIN { done = 0 }
+    /^[[:space:]]*listen[[:space:]].*[[:space:]]ssl([[:space:]]|;)/ && done == 0 {
+      print
+      print "    # BH-HTTP3-INJECT"
+      print "    listen %ip%:%nginx_port% quic;"
+      print "    http3 on;"
+      print "    # END BH-HTTP3-INJECT"
+      done = 1
+      next
+    }
+    { print }
+  ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+  if grep -q 'BH-HTTP3-INJECT' "$F"; then
+    HEALED=$((HEALED+1))
+    rm -f "$F.bh-pre-heal"
+  else
+    cp "$F.bh-pre-heal" "$F"
+    rm -f "$F.bh-pre-heal"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') WARN $TPL: anchor regex didn't match — left untouched" >> /var/log/bh-http3-heal.log
   fi
 done
 # Recreate http3.{stpl,tpl} from default.{stpl,tpl} if missing
