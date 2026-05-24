@@ -740,38 +740,79 @@ CODEITREPO
       echo "  ✓ added codeit stable repo"
     fi
 
-    # ─ D. Remove stock brotli (codeit's libbrotli ships same file paths) ─
-    if rpm -q brotli >/dev/null 2>&1; then
-      DEPS=$(rpm -q --whatrequires brotli libbrotlidec libbrotlienc libbrotlicommon 2>&1 | grep -v 'no package requires' | grep -v '^$' || true)
-      if [ -n "$DEPS" ]; then
-        echo "  ⚠ brotli has dependents — aborting HTTP/3 swap to avoid breakage:"
-        echo "$DEPS" | sed 's/^/    /'
-        ENABLE_HTTP3=0
+    # ─ D. Discover latest codeit package URLs ─
+    CODEIT_BASE="https://repo.codeit.guru/packages/centos/8/x86_64"
+    LATEST_NGINX=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'nginx-[0-9.]+-[0-9]+\.module_codeit_mainline\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
+    LATEST_BROTLI=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'libbrotli-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
+    LATEST_OSSL=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'openssl-quic-libs-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
+    if [ -z "$LATEST_NGINX" ] || [ -z "$LATEST_BROTLI" ] || [ -z "$LATEST_OSSL" ]; then
+      echo "  ✗ couldn't discover codeit package URLs (network/repo issue) — skipping HTTP/3"
+      ENABLE_HTTP3=0
+    fi
+
+    # ─ E. Atomic brotli swap — CRITICAL ORDER ─
+    #     yum/dnf has a runtime dlopen on libbrotlidec.so.1 (NOT a declared
+    #     RPM dep, so --whatrequires can't see it). If we remove brotli
+    #     without immediately providing libbrotlidec.so.1, yum dies and we
+    #     can't recover via yum. So: pre-download codeit's libbrotli, then
+    #     rpm-erase brotli + rpm-install libbrotli back-to-back. Tight window.
+    if [ "$ENABLE_HTTP3" = "1" ]; then
+      if rpm -q libbrotli >/dev/null 2>&1 && ! rpm -q brotli >/dev/null 2>&1; then
+        echo "✓ codeit libbrotli already installed — skipping brotli swap"
+      elif rpm -q brotli >/dev/null 2>&1; then
+        DEPS=$(rpm -q --whatrequires brotli libbrotlidec libbrotlienc libbrotlicommon 2>&1 | grep -v 'no package requires' | grep -v '^$' || true)
+        if [ -n "$DEPS" ]; then
+          echo "  ⚠ brotli has declared dependents — aborting HTTP/3 swap:"
+          echo "$DEPS" | sed 's/^/    /'
+          ENABLE_HTTP3=0
+        else
+          echo "  pre-downloading codeit libbrotli (yum has hidden runtime dep on libbrotlidec.so.1)..."
+          if ! curl -fsSL -o /tmp/bh-codeit-libbrotli.rpm "$CODEIT_BASE/$LATEST_BROTLI"; then
+            echo "  ✗ couldn't download codeit libbrotli — aborting (yum still works)"
+            ENABLE_HTTP3=0
+          elif [ ! -s /tmp/bh-codeit-libbrotli.rpm ]; then
+            echo "  ✗ codeit libbrotli download was empty — aborting"
+            ENABLE_HTTP3=0
+          else
+            # Tight swap — yum is unusable between these two rpm commands
+            rpm -e --nodeps brotli 2>/dev/null
+            if rpm -ivh /tmp/bh-codeit-libbrotli.rpm >/dev/null 2>&1; then
+              echo "  ✓ swapped brotli → codeit libbrotli atomically"
+            else
+              echo "  ✗ FATAL: codeit libbrotli install failed — yum is now BROKEN"
+              echo "    Recovery: rpm -ivh /tmp/bh-codeit-libbrotli.rpm"
+              ENABLE_HTTP3=0
+            fi
+            rm -f /tmp/bh-codeit-libbrotli.rpm
+          fi
+        fi
       else
-        rpm -e --nodeps brotli && echo "  ✓ removed stock brotli (no dependents)"
+        # No brotli AND no libbrotli — install codeit's via rpm directly
+        echo "  no brotli/libbrotli present — installing codeit libbrotli"
+        if curl -fsSL -o /tmp/bh-codeit-libbrotli.rpm "$CODEIT_BASE/$LATEST_BROTLI" \
+           && rpm -ivh /tmp/bh-codeit-libbrotli.rpm >/dev/null 2>&1; then
+          echo "  ✓ codeit libbrotli installed"
+        else
+          echo "  ✗ codeit libbrotli install failed"
+          ENABLE_HTTP3=0
+        fi
+        rm -f /tmp/bh-codeit-libbrotli.rpm
       fi
     fi
 
-    # ─ E. Install codeit nginx + libbrotli + openssl-quic-libs (direct URLs bypass DNF modular filter) ─
+    # ─ F. Install codeit nginx + openssl-quic-libs via yum (yum works now) ─
     if [ "$ENABLE_HTTP3" = "1" ]; then
-      CODEIT_BASE="https://repo.codeit.guru/packages/centos/8/x86_64"
-      LATEST_NGINX=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'nginx-[0-9.]+-[0-9]+\.module_codeit_mainline\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
-      LATEST_BROTLI=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'libbrotli-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
-      LATEST_OSSL=$(curl -s "$CODEIT_BASE/" 2>/dev/null | grep -oE 'openssl-quic-libs-[0-9.]+-[0-9]+\.codeit\.el8\.x86_64\.rpm' | sort -V | tail -1)
-      if [ -z "$LATEST_NGINX" ] || [ -z "$LATEST_BROTLI" ] || [ -z "$LATEST_OSSL" ]; then
-        echo "  ✗ couldn't discover codeit package URLs (network/repo issue) — skipping HTTP/3"
-        ENABLE_HTTP3=0
+      echo "  installing nginx + openssl-quic-libs..."
+      if yum install -y "$CODEIT_BASE/$LATEST_OSSL" "$CODEIT_BASE/$LATEST_NGINX" > /tmp/bh-http3-install.log 2>&1; then
+        echo "  ✓ codeit nginx stack installed"
+        [ -f /etc/nginx/nginx.conf.rpmnew ] && mv /etc/nginx/nginx.conf.rpmnew /etc/nginx/nginx.conf.rpmnew.ignored
+        NEW_OSSL=$(nginx -V 2>&1 | grep -oE 'OpenSSL [0-9.]+' | head -1)
+        echo "  ✓ now built with: $NEW_OSSL (was OpenSSL 1.1.1k)"
+        rm -f /tmp/bh-http3-install.log
       else
-        echo "  installing: $LATEST_NGINX + $LATEST_BROTLI + $LATEST_OSSL"
-        if yum install -y "$CODEIT_BASE/$LATEST_BROTLI" "$CODEIT_BASE/$LATEST_OSSL" "$CODEIT_BASE/$LATEST_NGINX" >/dev/null 2>&1; then
-          echo "  ✓ codeit nginx stack installed"
-          [ -f /etc/nginx/nginx.conf.rpmnew ] && mv /etc/nginx/nginx.conf.rpmnew /etc/nginx/nginx.conf.rpmnew.ignored
-          NEW_OSSL=$(nginx -V 2>&1 | grep -oE 'OpenSSL [0-9.]+' | head -1)
-          echo "  ✓ now built with: $NEW_OSSL (was OpenSSL 1.1.1k)"
-        else
-          echo "  ✗ codeit nginx install failed — skipping rest of HTTP/3 setup"
-          ENABLE_HTTP3=0
-        fi
+        echo "  ✗ codeit nginx install failed — last 10 lines of /tmp/bh-http3-install.log:"
+        tail -10 /tmp/bh-http3-install.log 2>/dev/null | sed 's/^/    /'
+        ENABLE_HTTP3=0
       fi
     fi
   fi
