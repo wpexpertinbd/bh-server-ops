@@ -779,11 +779,52 @@ for USER in $DETECTED; do
   done
 done
 
+# Demote pass — bidirectional heal. Users with heavy leftovers (pm=dynamic
+# OR heavy spare-servers OR max_children at HEAVY_CHILDREN) who are NOT in
+# the current heavy-detected list get demoted back to light config. Catches
+# dead sites + apps that were uninstalled after initial heavy classification.
+# Leaves CWP-default pools (low max_children, no heavy markers) untouched.
+DEMOTED=0
+for DIR in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users; do
+  for POOL in "$DIR"/*.conf; do
+    [ -f "$POOL" ] || continue
+    USER=$(basename "$POOL" .conf)
+    case " $SKIP_USERS " in *" $USER "*) continue ;; esac
+    case " $DETECTED " in *" $USER "*) continue ;; esac  # currently heavy
+
+    CUR_PM=$(grep -oE '^pm[[:space:]]*=[[:space:]]*[a-z]+' "$POOL" | head -1 | awk '{print $3}')
+    CUR_CHILDREN=$(grep -oE '^pm\.max_children[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
+    HAS_HEAVY_SPARES=$(grep -cE '^pm\.(start_servers|min_spare_servers|max_spare_servers)' "$POOL")
+
+    # Has heavy leftovers if: dynamic mode, heavy spares present, or
+    # max_children matches HEAVY_CHILDREN
+    NEEDS_DEMOTE=0
+    [ "$CUR_PM" = "dynamic" ] && NEEDS_DEMOTE=1
+    [ "$HAS_HEAVY_SPARES" -gt 0 ] && NEEDS_DEMOTE=1
+    [ "$CUR_CHILDREN" = "$HEAVY_CHILDREN" ] && NEEDS_DEMOTE=1
+    [ "$NEEDS_DEMOTE" = "0" ] && continue
+
+    # Already at correct light state? Skip
+    if [ "$CUR_PM" = "ondemand" ] && [ "$CUR_CHILDREN" = "$LIGHT_CHILDREN" ] && [ "$HAS_HEAVY_SPARES" = "0" ]; then
+      continue
+    fi
+
+    # Apply light config
+    sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
+    sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$POOL"
+    ensure_kv "$POOL" "pm" "ondemand"
+    ensure_kv "$POOL" "pm.max_children" "$LIGHT_CHILDREN"
+    ensure_kv "$POOL" "pm.max_requests" "500"
+    ensure_kv "$POOL" "pm.process_idle_timeout" "30s"
+    ensure_kv "$POOL" "request_terminate_timeout" "30s"
+    DEMOTED=$((DEMOTED+1))
+  done
+done
+
 # Sweep pass: pm.process_idle_timeout is ondemand-only. Strip it from any
-# pool currently in dynamic mode — regardless of whether it was in the
-# heavy-detected list this run. Catches edge case where a pool's pm was
-# flipped to dynamic by earlier heal/script run but process_idle_timeout
-# was never removed.
+# pool currently in dynamic mode — regardless of detection. Catches edge
+# case where a pool's pm was flipped to dynamic by earlier heal/script run
+# but the ondemand-leftover was never removed.
 STRIPPED=0
 for F in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf; do
   if grep -qE '^pm[[:space:]]*=[[:space:]]*dynamic' "$F" && grep -qE '^pm\.process_idle_timeout' "$F"; then
@@ -792,11 +833,11 @@ for F in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf; do
   fi
 done
 
-if [ $HEALED -gt 0 ] || [ $STRIPPED -gt 0 ]; then
+if [ $HEALED -gt 0 ] || [ $DEMOTED -gt 0 ] || [ $STRIPPED -gt 0 ]; then
   for SVC in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php-fpm[0-9]+\.service$'); do
     systemctl reload "$SVC" >/dev/null 2>&1
   done
-  echo "$(date '+%Y-%m-%d %H:%M:%S') healed $HEALED heavy pool(s); stripped $STRIPPED stale process_idle_timeout" >> /var/log/bh-fpm-heal.log
+  echo "$(date '+%Y-%m-%d %H:%M:%S') healed=$HEALED demoted=$DEMOTED stripped=$STRIPPED" >> /var/log/bh-fpm-heal.log
 fi
 HEALSCRIPT
   chmod +x /usr/local/sbin/bh-fpm-pool-heal.sh
