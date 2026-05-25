@@ -70,6 +70,17 @@ IS_SLAVE_SERVER=1 bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd
 bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/perf-bootstrap.sh) -y
 ```
 
+### Trigger the FPM pool heal cron immediately (don't wait 5 min)
+
+The bootstrap installs `/usr/local/sbin/bh-fpm-pool-heal.sh` (runs every 5 min via cron) which keeps heavy users at full heavy config and demotes stale-heavy users back to light. To trigger it manually right after a bootstrap run — or any time you want to force a re-sync:
+
+```bash
+/usr/local/sbin/bh-fpm-pool-heal.sh
+tail -5 /var/log/bh-fpm-heal.log
+```
+
+Output format in the log: `healed=N demoted=N stripped=N` — `healed` = heavy users restored to full heavy config, `demoted` = stale-heavy users brought back to light, `stripped` = stale `pm.process_idle_timeout` removed from dynamic pools.
+
 ### What slave mode skips
 
 `IS_SLAVE_SERVER=1` skips three things that block legitimate server-to-server API auth:
