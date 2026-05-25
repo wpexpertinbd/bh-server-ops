@@ -1,6 +1,15 @@
 #!/bin/bash
 # ================================================================
-#  Universal Web Server Performance Bootstrap (v3.4)
+#  Universal Web Server Performance Bootstrap (v3.5)
+#
+#  v3.5 (2026-05-25) — CRITICAL FIX
+#    - Cron jobs now written to /etc/cron.d/bh-perf-monitors instead of
+#      root's user-spool crontab. The old approach used `crontab -l |
+#      grep -v ... | crontab -` which silently wiped the ENTIRE root
+#      crontab if `crontab -l` failed (SELinux denial, transient FS
+#      error, etc.). Re-run this script to migrate — it will move the
+#      monitor entries to /etc/cron.d/ and clean up the user-spool.
+#
 #  Works on: CWP, cPanel/EA4, RHEL/AlmaLinux/Rocky, Debian/Ubuntu
 #  Scales: 1-2 GB tiny VPS up to 64+ GB dedicated. All settings
 #          (Apache MPM, FPM children, OPcache, Redis) auto-tier
@@ -395,12 +404,22 @@ if [ "$MODE" = "rollback" ]; then
   rm -f /usr/local/sbin/tenant-cap /usr/local/sbin/saturation-monitor /usr/local/sbin/auto-recovery
   echo "✓ Removed /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}"
 
-  # Remove cron
-  CRON_TMP=$(mktemp)
-  crontab -l 2>/dev/null | grep -v 'saturation-monitor' | grep -v 'auto-recovery' > "$CRON_TMP" || true
-  crontab "$CRON_TMP"
-  rm -f "$CRON_TMP"
-  echo "✓ Removed monitor + auto-recovery cron entries"
+  # Remove cron — drop the /etc/cron.d/ file (current location, safe)
+  rm -f /etc/cron.d/bh-perf-monitors
+  echo "✓ Removed /etc/cron.d/bh-perf-monitors"
+
+  # Also clean up any LEGACY entries from root's user-spool crontab.
+  # Older versions of this script (pre-v3.5) wrote to user-spool which was
+  # fragile — only rewrite the spool if `crontab -l` succeeded AND produced
+  # non-empty output. Otherwise leave the spool alone to avoid the wipe bug
+  # that nuked entire crontabs when `crontab -l` failed silently.
+  if EXISTING_CRON=$(crontab -l 2>/dev/null) && [ -n "$EXISTING_CRON" ]; then
+    FILTERED_CRON=$(printf '%s\n' "$EXISTING_CRON" | grep -v 'saturation-monitor' | grep -v 'auto-recovery' || true)
+    if [ "$FILTERED_CRON" != "$EXISTING_CRON" ]; then
+      printf '%s\n' "$FILTERED_CRON" | crontab -
+      echo "✓ Cleaned legacy monitor/auto-recovery lines from root user-spool crontab"
+    fi
+  fi
 
   # Reload services
   for S in "${PHP_FPM_SERVICES[@]}"; do
@@ -2371,23 +2390,47 @@ RECOVERY
   echo "✓ /usr/local/sbin/auto-recovery installed"
 
   # ── Setup cron jobs ─────────────────────────────────────────
-  CRON_TMP=$(mktemp)
-  crontab -l 2>/dev/null | grep -v 'saturation-monitor' | grep -v 'auto-recovery' > "$CRON_TMP" || true
+  # Write to /etc/cron.d/ — survives `crontab -r`, panel resyncs, and
+  # cannot wipe other root jobs (unlike the old user-spool approach which
+  # nuked entire crontabs when `crontab -l` failed silently). See v3.5
+  # changelog. Also removes any LEGACY entries from root's user-spool
+  # leftover from older versions, but ONLY if `crontab -l` succeeds.
+  CRON_FILE="/etc/cron.d/bh-perf-monitors"
+  {
+    echo "# BH-PERF-MONITORS — managed by perf-bootstrap.sh. Do not edit."
+    echo "# To remove: re-run script with --uninstall, or just delete this file."
+    echo "SHELL=/bin/bash"
+    echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    echo "MAILTO=\"\""
+  } > "$CRON_FILE"
 
   if [ "$ENABLE_MONITOR_CRON" = "1" ]; then
-    echo "*/5 * * * * /usr/local/sbin/saturation-monitor >/dev/null 2>&1" >> "$CRON_TMP"
-    echo "✓ cron added: saturation-monitor every 5 min"
+    echo "*/5 * * * * root /usr/local/sbin/saturation-monitor >/dev/null 2>&1" >> "$CRON_FILE"
+    echo "✓ cron added: saturation-monitor every 5 min (in $CRON_FILE)"
   fi
 
   if [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
-    echo "*/3 * * * * /usr/local/sbin/auto-recovery >/dev/null 2>&1" >> "$CRON_TMP"
-    echo "✓ cron added: auto-recovery every 3 min"
+    echo "*/3 * * * * root /usr/local/sbin/auto-recovery >/dev/null 2>&1" >> "$CRON_FILE"
+    echo "✓ cron added: auto-recovery every 3 min (in $CRON_FILE)"
   else
     echo "⊘ auto-recovery cron disabled (set ENABLE_AUTO_RECOVERY_CRON=1 to enable)"
   fi
 
-  crontab "$CRON_TMP"
-  rm -f "$CRON_TMP"
+  echo "# END BH-PERF-MONITORS" >> "$CRON_FILE"
+  chmod 644 "$CRON_FILE"
+  chown root:root "$CRON_FILE"
+
+  # Clean up LEGACY user-spool entries from older script versions (pre-v3.5).
+  # Guarded: only rewrite the spool if `crontab -l` succeeded AND produced
+  # non-empty output AND filtering actually removed our lines. This prevents
+  # the v3.4 bug where a failed `crontab -l` would wipe the entire crontab.
+  if EXISTING_CRON=$(crontab -l 2>/dev/null) && [ -n "$EXISTING_CRON" ]; then
+    FILTERED_CRON=$(printf '%s\n' "$EXISTING_CRON" | grep -v 'saturation-monitor' | grep -v 'auto-recovery' || true)
+    if [ "$FILTERED_CRON" != "$EXISTING_CRON" ]; then
+      printf '%s\n' "$FILTERED_CRON" | crontab -
+      echo "✓ Migrated legacy monitor/auto-recovery lines out of user-spool crontab"
+    fi
+  fi
 
   # Touch log files so they exist with right perms
   touch /var/log/saturation.log /var/log/auto-recovery.log
