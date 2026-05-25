@@ -1,14 +1,21 @@
 #!/bin/bash
 # ================================================================
-#  Universal Web Server Performance Bootstrap (v3.5)
+#  Universal Web Server Performance Bootstrap (v3.6)
 #
-#  v3.5 (2026-05-25) — CRITICAL FIX
-#    - Cron jobs now written to /etc/cron.d/bh-perf-monitors instead of
-#      root's user-spool crontab. The old approach used `crontab -l |
-#      grep -v ... | crontab -` which silently wiped the ENTIRE root
-#      crontab if `crontab -l` failed (SELinux denial, transient FS
-#      error, etc.). Re-run this script to migrate — it will move the
-#      monitor entries to /etc/cron.d/ and clean up the user-spool.
+#  v3.6 (2026-05-25) — User-spool + watchdog (visibility + safety)
+#    - Monitor crons back in /var/spool/cron/root so CWP/cPanel UI shows
+#      them alongside other root jobs. v3.5 hid them in /etc/cron.d/
+#      which broke single-pane visibility.
+#    - Always installs /usr/local/sbin/bh-crontab-watchdog.sh + an hourly
+#      /etc/cron.d/bh-crontab-watchdog entry. The watchdog hourly
+#      snapshots root's user-spool crontab to /root/.crontab-backups/
+#      and AUTO-RESTORES from the latest snapshot if the crontab shrinks
+#      by >30% (the v3.4 wipe symptom). Watchdog itself lives in
+#      /etc/cron.d/ so it can't be wiped along with the spool.
+#    - Cleans up legacy /etc/cron.d/bh-perf-monitors from v3.5.
+#    - Idempotent: safe to re-run.
+#
+#  v3.5 (2026-05-25) — Moved crons to /etc/cron.d/ (superseded by v3.6).
 #
 #  Works on: CWP, cPanel/EA4, RHEL/AlmaLinux/Rocky, Debian/Ubuntu
 #  Scales: 1-2 GB tiny VPS up to 64+ GB dedicated. All settings
@@ -404,17 +411,17 @@ if [ "$MODE" = "rollback" ]; then
   rm -f /usr/local/sbin/tenant-cap /usr/local/sbin/saturation-monitor /usr/local/sbin/auto-recovery
   echo "✓ Removed /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}"
 
-  # Remove cron — drop the /etc/cron.d/ file (current location, safe)
-  rm -f /etc/cron.d/bh-perf-monitors
-  echo "✓ Removed /etc/cron.d/bh-perf-monitors"
+  # Remove watchdog + any /etc/cron.d/ leftovers from older versions
+  rm -f /etc/cron.d/bh-perf-monitors /etc/cron.d/bh-crontab-watchdog
+  rm -f /usr/local/sbin/bh-crontab-watchdog.sh
+  echo "✓ Removed watchdog + legacy /etc/cron.d/ files"
 
-  # Also clean up any LEGACY entries from root's user-spool crontab.
-  # Older versions of this script (pre-v3.5) wrote to user-spool which was
-  # fragile — only rewrite the spool if `crontab -l` succeeded AND produced
-  # non-empty output. Otherwise leave the spool alone to avoid the wipe bug
-  # that nuked entire crontabs when `crontab -l` failed silently.
+  # Remove monitor entries from root's user-spool crontab.
+  # Safety guard: only rewrite the spool if `crontab -l` succeeded AND
+  # produced non-empty output. This prevents the v3.4 wipe bug where a
+  # failed `crontab -l` would nuke the entire crontab.
   if EXISTING_CRON=$(crontab -l 2>/dev/null) && [ -n "$EXISTING_CRON" ]; then
-    FILTERED_CRON=$(printf '%s\n' "$EXISTING_CRON" | grep -v 'saturation-monitor' | grep -v 'auto-recovery' || true)
+    FILTERED_CRON=$(printf '%s\n' "$EXISTING_CRON" | grep -v 'saturation-monitor' | grep -v 'auto-recovery' | grep -v 'BH-PERF-MONITORS' || true)
     if [ "$FILTERED_CRON" != "$EXISTING_CRON" ]; then
       printf '%s\n' "$FILTERED_CRON" | crontab -
       echo "✓ Cleaned legacy monitor/auto-recovery lines from root user-spool crontab"
@@ -2389,47 +2396,105 @@ RECOVERY
   chmod +x /usr/local/sbin/auto-recovery
   echo "✓ /usr/local/sbin/auto-recovery installed"
 
-  # ── Setup cron jobs ─────────────────────────────────────────
-  # Write to /etc/cron.d/ — survives `crontab -r`, panel resyncs, and
-  # cannot wipe other root jobs (unlike the old user-spool approach which
-  # nuked entire crontabs when `crontab -l` failed silently). See v3.5
-  # changelog. Also removes any LEGACY entries from root's user-spool
-  # leftover from older versions, but ONLY if `crontab -l` succeeds.
-  CRON_FILE="/etc/cron.d/bh-perf-monitors"
-  {
-    echo "# BH-PERF-MONITORS — managed by perf-bootstrap.sh. Do not edit."
-    echo "# To remove: re-run script with --uninstall, or just delete this file."
-    echo "SHELL=/bin/bash"
-    echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    echo "MAILTO=\"\""
-  } > "$CRON_FILE"
+  # ── Install crontab watchdog (REQUIRED, runs even if user disables monitors) ──
+  # The watchdog hourly snapshots /var/spool/cron/root and auto-restores
+  # if the crontab shrinks unexpectedly (the v3.4 wipe symptom). Lives in
+  # /etc/cron.d/ so it can't be wiped along with user-spool. This is the
+  # real fix for the wipe bug — it lets us keep monitor jobs in user-spool
+  # (for CWP/cPanel UI visibility) without the fragility.
+  cat > /usr/local/sbin/bh-crontab-watchdog.sh <<'WATCHDOG'
+#!/bin/bash
+# BH crontab watchdog — snapshot + auto-restore root's user-spool crontab.
+BACKUP_DIR="/root/.crontab-backups"
+SPOOL="/var/spool/cron/root"
+LOG="/var/log/bh-crontab-watchdog.log"
+KEEP=30
+SHRINK_THRESHOLD_PCT=70   # restore if current < 70% of last snapshot size
 
-  if [ "$ENABLE_MONITOR_CRON" = "1" ]; then
-    echo "*/5 * * * * root /usr/local/sbin/saturation-monitor >/dev/null 2>&1" >> "$CRON_FILE"
-    echo "✓ cron added: saturation-monitor every 5 min (in $CRON_FILE)"
-  fi
+mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log() { echo "[$(ts)] $*" >> "$LOG"; }
 
-  if [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
-    echo "*/3 * * * * root /usr/local/sbin/auto-recovery >/dev/null 2>&1" >> "$CRON_FILE"
-    echo "✓ cron added: auto-recovery every 3 min (in $CRON_FILE)"
-  else
-    echo "⊘ auto-recovery cron disabled (set ENABLE_AUTO_RECOVERY_CRON=1 to enable)"
-  fi
+[ -f "$SPOOL" ] || { log "spool missing, skipping"; exit 0; }
 
-  echo "# END BH-PERF-MONITORS" >> "$CRON_FILE"
-  chmod 644 "$CRON_FILE"
-  chown root:root "$CRON_FILE"
+CUR_SIZE=$(wc -c < "$SPOOL")
+LATEST=$(ls -1t "$BACKUP_DIR"/root.* 2>/dev/null | head -1)
 
-  # Clean up LEGACY user-spool entries from older script versions (pre-v3.5).
-  # Guarded: only rewrite the spool if `crontab -l` succeeded AND produced
-  # non-empty output AND filtering actually removed our lines. This prevents
-  # the v3.4 bug where a failed `crontab -l` would wipe the entire crontab.
-  if EXISTING_CRON=$(crontab -l 2>/dev/null) && [ -n "$EXISTING_CRON" ]; then
-    FILTERED_CRON=$(printf '%s\n' "$EXISTING_CRON" | grep -v 'saturation-monitor' | grep -v 'auto-recovery' || true)
-    if [ "$FILTERED_CRON" != "$EXISTING_CRON" ]; then
-      printf '%s\n' "$FILTERED_CRON" | crontab -
-      echo "✓ Migrated legacy monitor/auto-recovery lines out of user-spool crontab"
+if [ -z "$LATEST" ]; then
+    cp -a "$SPOOL" "$BACKUP_DIR/root.$(date +%Y%m%d-%H%M%S)"
+    log "first snapshot taken (size=$CUR_SIZE)"
+    exit 0
+fi
+
+LAST_SIZE=$(wc -c < "$LATEST")
+
+if [ "$LAST_SIZE" -gt 100 ] && [ "$CUR_SIZE" -lt $((LAST_SIZE * SHRINK_THRESHOLD_PCT / 100)) ]; then
+    log "WIPE DETECTED: current=$CUR_SIZE bytes, last good=$LAST_SIZE bytes ($LATEST)"
+    cp -a "$SPOOL" "$BACKUP_DIR/WIPED.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$LATEST" "$SPOOL"
+    chown root:root "$SPOOL"; chmod 600 "$SPOOL"
+    log "RESTORED from $LATEST"
+    command -v mail >/dev/null && echo "Root crontab on $(hostname) was wiped and auto-restored. See $LOG and $BACKUP_DIR." | mail -s "ALERT: crontab wipe on $(hostname)" root 2>/dev/null
+    exit 0
+fi
+
+if ! diff -q "$SPOOL" "$LATEST" >/dev/null 2>&1; then
+    cp -a "$SPOOL" "$BACKUP_DIR/root.$(date +%Y%m%d-%H%M%S)"
+    log "snapshot taken (size=$CUR_SIZE)"
+    ls -1t "$BACKUP_DIR"/root.* 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+fi
+WATCHDOG
+  chmod +x /usr/local/sbin/bh-crontab-watchdog.sh
+  /usr/local/sbin/bh-crontab-watchdog.sh   # take first snapshot before we modify spool
+
+  cat > /etc/cron.d/bh-crontab-watchdog <<'EOF'
+# BH-CRONTAB-WATCHDOG — snapshots + auto-restores root crontab. Do not delete.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+0 * * * * root /usr/local/sbin/bh-crontab-watchdog.sh
+# END BH-CRONTAB-WATCHDOG
+EOF
+  chmod 644 /etc/cron.d/bh-crontab-watchdog
+  chown root:root /etc/cron.d/bh-crontab-watchdog
+  echo "✓ /usr/local/sbin/bh-crontab-watchdog.sh installed (hourly, /etc/cron.d/bh-crontab-watchdog)"
+  echo "✓ first snapshot saved to /root/.crontab-backups/ — auto-restore enabled"
+
+  # ── Setup monitor cron jobs in user-spool ──────────────────────
+  # Written to root's user-spool crontab so CWP/cPanel UI shows them
+  # alongside other root jobs. The watchdog above protects against the
+  # v3.4 wipe bug — if anything (panel misclick, bad script) wipes the
+  # spool, the watchdog auto-restores within an hour.
+  #
+  # Safety guard: only rewrite the spool if `crontab -l` succeeded AND
+  # produced non-empty output. Belt-and-suspenders with the watchdog.
+  # Also removes any LEGACY /etc/cron.d/bh-perf-monitors from v3.5.
+  rm -f /etc/cron.d/bh-perf-monitors
+
+  if EXISTING_CRON=$(crontab -l 2>/dev/null); then
+    # Filter out any prior BH monitor lines so we don't duplicate on re-run
+    FILTERED_CRON=$(printf '%s\n' "$EXISTING_CRON" | grep -v 'saturation-monitor' | grep -v 'auto-recovery' | grep -v '# BH-PERF-MONITORS' || true)
+
+    NEW_LINES=""
+    NEW_LINES+="# BH-PERF-MONITORS (managed by perf-bootstrap.sh — safe to keep)"$'\n'
+    if [ "$ENABLE_MONITOR_CRON" = "1" ]; then
+      NEW_LINES+="*/5 * * * * /usr/local/sbin/saturation-monitor >/dev/null 2>&1"$'\n'
     fi
+    if [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ]; then
+      NEW_LINES+="*/3 * * * * /usr/local/sbin/auto-recovery >/dev/null 2>&1"$'\n'
+    fi
+
+    # Only commit if we actually got something back from `crontab -l`
+    # (empty $EXISTING_CRON when no crontab exists yet is fine — we'll create one).
+    NEW_CRON=$(printf '%s\n%s' "$FILTERED_CRON" "$NEW_LINES" | sed '/^$/N;/^\n$/D')
+    printf '%s\n' "$NEW_CRON" | crontab -
+
+    [ "$ENABLE_MONITOR_CRON" = "1" ]      && echo "✓ cron added: saturation-monitor every 5 min (user-spool, visible in panel UI)"
+    [ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ] && echo "✓ cron added: auto-recovery every 3 min (user-spool, visible in panel UI)"
+    [ "$ENABLE_AUTO_RECOVERY_CRON" != "1" ] && echo "⊘ auto-recovery cron disabled (set ENABLE_AUTO_RECOVERY_CRON=1 to enable)"
+  else
+    echo "⚠ Could not read root crontab (crontab -l failed). Skipping cron install."
+    echo "  Watchdog is still active. Run script again once crontab access is restored."
   fi
 
   # Touch log files so they exist with right perms
