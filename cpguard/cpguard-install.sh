@@ -90,39 +90,6 @@ else
   SUMMARY_KV preexisting "no"
 fi
 
-# cPGuard requires the OWASP-old ModSec ruleset to be the active baseline
-# before install (its installer writes paths assuming it exists). If the
-# server is still on Comodo WAF, abort here with clear instructions —
-# rather than letting `expect` time out mysteriously mid-install.
-OWASP_DIR=/usr/local/apache/modsecurity-owasp-old
-if [ "$ALREADY_INSTALLED" -eq 0 ] && [ ! -d "$OWASP_DIR" ]; then
-  CURRENT_WAF=""
-  [ -d /usr/local/apache/modsecurity-comodo ] && CURRENT_WAF="comodo"
-  [ -d /usr/local/apache/modsecurity-crs    ] && CURRENT_WAF="${CURRENT_WAF:+$CURRENT_WAF + }crs"
-  [ -z "$CURRENT_WAF" ] && CURRENT_WAF="unknown/none"
-  cat <<EOF | tee -a "$LOG"
-
-================================================================
-  ABORT: OWASP-old ModSec ruleset not installed on this server.
-
-  cPGuard's installer requires $OWASP_DIR
-  to exist before it will run. Current active WAF: $CURRENT_WAF
-
-  FIX (per server, takes 30 seconds in CWP admin):
-    1. Log into CWP admin
-    2. Security  ->  ModSecurity
-    3. Switch active ruleset to "OWASP" (or OWASP rules)
-    4. Save / Install
-    5. Re-run this script
-
-  Note: OWASP is only required DURING install. Once cPGuard is up,
-  the active ruleset becomes cPGuard's own — OWASP becomes inert.
-================================================================
-EOF
-  die "Switch to OWASP in CWP first, then re-run."
-fi
-[ -d "$OWASP_DIR" ] && ok "OWASP-old baseline present (required by cPGuard installer)"
-
 # CSF present?
 CSF_PRESENT=0
 if [ -x /usr/sbin/csf ] || [ -d /etc/csf ]; then
