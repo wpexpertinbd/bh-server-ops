@@ -33,6 +33,21 @@ Exit code: `0` clean, `2` partial (one+ verify check failed), `1` fatal.
 
 Idempotent — safe to re-run. Logs to `/var/log/bh-cpguard-install.log`. A parsed summary lands in `/tmp/bh-cpg-summary.txt` for the dispatcher to slurp.
 
+## Prerequisite: OWASP-old ModSec ruleset must be active
+
+cPGuard's installer expects `/usr/local/apache/modsecurity-owasp-old/` to exist before it runs (it patches around that ruleset's Include line). **If the server is on Comodo WAF**, you must switch it to OWASP first:
+
+1. CWP admin → Security → ModSecurity
+2. Switch active ruleset to **OWASP** (or "OWASP rules")
+3. Save / Install
+4. Then run this script
+
+The script's preflight aborts with this instruction if it detects OWASP is missing — so you can't accidentally half-install.
+
+**This is transitional.** Once cPGuard is in, the active ruleset becomes cPGuard's own — neither Comodo nor OWASP is active anymore. The OWASP switch is just a ~5-minute prerequisite during install.
+
+**Heads-up for clients with Comodo-specific whitelists:** during the brief OWASP window (between the CWP switch and our installer finishing), sites may throw extra false-positive 403s because Comodo whitelists don't apply under OWASP. Tell the client to expect 5 minutes of possible noise per server. After cPGuard is in with our 38-rule exclusions block, false-positive rate is typically lower than Comodo was.
+
 ## Single-server use
 
 SSH to the target, then:
