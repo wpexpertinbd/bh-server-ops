@@ -1,0 +1,16 @@
+# BH cPGuard fleet — server list. Copy to servers.csv and fill in.
+# Lines starting with # are ignored. Header row is required.
+#
+# Columns:
+#   hostname  — friendly label, used as log file name
+#   ip        — server IP or DNS hostname for ssh
+#   ssh_port  — SSH port (usually 22 or 2222 on CWP)
+#   ssh_user  — SSH user (usually root)
+#   ssh_auth  — path to private key  OR  the literal word  askpass
+#               (askpass uses sshpass + env var SSHPASS_<hostname>)
+#   license_key — cPGuard license key for this server
+#
+hostname,ip,ssh_port,ssh_user,ssh_auth,license_key
+srv01,1.2.3.4,22,root,~/.ssh/id_ed25519,CPG-XXXX-XXXX-0001
+srv02,1.2.3.5,22,root,~/.ssh/id_ed25519,CPG-XXXX-XXXX-0002
+srv03,1.2.3.6,2222,root,~/.ssh/id_ed25519,CPG-XXXX-XXXX-0003
