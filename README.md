@@ -1,11 +1,6 @@
 # bh-server-ops
 
-Server ops scripts — performance bootstrap, FPM/MPM tuning, monitoring, recovery, and cPGuard fleet install for CWP/Linux web stacks.
-
-## Scripts in this repo
-
-- **`perf-bootstrap.sh`** — single-server performance bootstrap (kernel, OPcache, FPM, MPM, Redis, nginx anti-bot WAF, helpers). See section below.
-- **`cpguard/`** — unattended cPGuard installer + multi-server dispatcher. See [`cpguard/README.md`](cpguard/README.md).
+Server ops scripts — performance bootstrap, FPM/MPM tuning, monitoring, and recovery for CWP/Linux web stacks.
 
 ## What's in `perf-bootstrap.sh`
 
