@@ -1651,6 +1651,12 @@ map $http_user_agent $bh_bad_bot {
     # routinely send no UA. Blocking empty UA broke DNS slave sync on a
     # production CWP fleet — never again.
 }
+
+# bh-webmail v1 — strip leading "www." so domain.com/webmail -> webmail.domain.com
+map $host $bh_wm_host {
+    default               $host;
+    "~^www\.(?<wmd>.+)$"  $wmd;
+}
 NGXHTTP
 
   # ─ server-level: the actual enforcement, included from each vhost ─
@@ -1672,6 +1678,11 @@ location = /xmlrpc.php       { deny all; access_log off; log_not_found off; retu
 location ~* /wp-config\.php  { deny all; return 444; }
 location ~* /\.(env|git|svn|htaccess|htpasswd|DS_Store)(/|$) { deny all; return 444; }
 location ~* /(?:eval-stdin|wlwmanifest|adminer|phpunit|phpinfo)\.php$ { deny all; return 444; }
+
+# bh-webmail v1 — /webmail (and /roundcube), www or non-www, -> https://webmail.<domain>/
+# Fires at nginx BEFORE Apache/any CMS, so it works regardless of what's on the domain.
+# Survives CWP vhost rebuilds because this snippet is injected into the CWP nginx template.
+location ~* ^/(?:webmail|roundcube)(?:/|$) { return 301 https://webmail.$bh_wm_host/; }
 NGXSERVER
 
   echo "✓ wrote $NGX_BH_D/00-anti-bot.conf"
