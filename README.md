@@ -72,14 +72,14 @@ bash <(curl -sL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/mai
 
 ### Trigger the FPM pool heal cron immediately (don't wait 5 min)
 
-The bootstrap installs `/usr/local/sbin/bh-fpm-pool-heal.sh` (runs every 5 min via cron) which keeps heavy users at full heavy config and demotes stale-heavy users back to light. To trigger it manually right after a bootstrap run — or any time you want to force a re-sync:
+The bootstrap installs `/usr/local/sbin/bh-fpm-pool-heal.sh` (runs every 5 min via cron). It re-classifies every tenant by app type and reconciles each php-fpm pool to the correct **tier** (heavy / medium / light) — fully bidirectional, so it both promotes a newly-installed framework up and demotes a removed app back down. To trigger it manually right after a bootstrap run — or any time you want to force a re-sync:
 
 ```bash
 /usr/local/sbin/bh-fpm-pool-heal.sh
 tail -5 /var/log/bh-fpm-heal.log
 ```
 
-Output format in the log: `healed=N demoted=N stripped=N` — `healed` = heavy users restored to full heavy config, `demoted` = stale-heavy users brought back to light, `stripped` = stale `pm.process_idle_timeout` removed from dynamic pools.
+Output format in the log: `changed=N (heavy=H medium=M light=L)` — `changed` = pools rewritten this run; `heavy/medium/light` = how many pools are currently classified into each tier.
 
 ### What slave mode skips
 
@@ -156,7 +156,7 @@ The script runs **interactive by default** — it auto-detects the environment (
 
 - **Action:** Install / Rollback / Quit
 - **TARGET_RAM_GB** (auto-filled from `free -g`)
-- **Heavy app users** (Laravel/Symfony tenants — get 20 dynamic workers)
+- **Heavy app users** (Laravel/CodeIgniter/Symfony tenants — get the full dynamic pool)
 - **Apache MPM tuning?** (yes/no)
 - **Redis cap?** (yes/no)
 - **Install helpers?** (`tenant-cap`, `saturation-monitor`, `auto-recovery`)
@@ -168,7 +168,15 @@ A summary is shown before any change. Press Enter on each prompt to accept the d
 
 ### Non-interactive run (curl pipe, automation, etc.)
 
-When stdin isn't a TTY (e.g. `curl ... | bash`) or you pass `-y`, the script uses built-in defaults silently. Heavy users are **auto-detected** by scanning `/home/*` for Laravel/Symfony (`artisan`), WooCommerce, Magento (M1/M2), OpenCart, or MySQL DBs >1 GB owned by the user — these tenants get the heavy FPM pool automatically, no `HEAVY_USERS` env needed:
+When stdin isn't a TTY (e.g. `curl ... | bash`) or you pass `-y`, the script uses built-in defaults silently. Every tenant is **auto-classified into a tier** by scanning `/home/*` for app fingerprints (DB size is no longer a signal — tier is decided purely by app type):
+
+| Tier | Detected apps | pm mode | `pm.max_children` |
+|------|---------------|---------|-------------------|
+| **HEAVY** | Laravel (`artisan`), CodeIgniter (`spark` / `system/core/CodeIgniter.php`), Symfony (`config/bundles.php`) | `dynamic` (warm pool + spares) | `HEAVY_CHILDREN` (100%) |
+| **MEDIUM** | WordPress (`wp-load.php`/`wp-config.php`), WooCommerce, OpenCart, Magento | `ondemand` | 50% of heavy (floor 3) |
+| **LIGHT** | everything else (static HTML / basic PHP) | `ondemand` | 25% of heavy (floor 2) |
+
+This replaces the old 2-tier model where WooCommerce/OpenCart/big-DB swept almost every tenant into the heavy pool and exhausted RAM. Sizes derive from `HEAVY_CHILDREN` per RAM tier — never CWP's low built-in pool defaults. Override detection per tenant with `HEAVY_USERS="u1 u2"` / `MEDIUM_USERS="u3"` / `SKIP_USERS="u4"` env vars (no env needed for normal auto-detect):
 
 ```bash
 # Pass defaults via flag
@@ -307,16 +315,18 @@ Every memory-hungry setting (Apache MPM, FPM children, OPcache, Redis) auto-scal
 
 Thresholds are intentionally a few GB below the nominal class — `/proc/meminfo` always reports less than installed (kernel + firmware reserve ~2 GB on big boxes, ~1 GB on small VPS). 64 GB box reports ~62 GB, 128 GB reports ~125, etc.
 
-| Detected RAM | Apache MaxWorkers | FPM children (light/heavy) | OPcache | Redis cap |
+FPM children scale off `HEAVY_CHILDREN` per tier: **light = 25%** (floor 2), **medium = 50%** (floor 3), **heavy = 100%**.
+
+| Detected RAM | Apache MaxWorkers | FPM children (light/medium/heavy) | OPcache | Redis cap |
 |---|---|---|---|---|
-| **≥ 240 GB** (256 GB-class) | **5000 (100×50)** | **15 / 30** | **512 MB** | **8 GB** |
-| **≥ 120 GB** (128 GB-class) | **3200 (64×50)** | **12 / 25** | **384 MB** | **4 GB** |
-| ≥ 60 GB (64 GB-class) | 1600 (32×50) | 10 / 20 | 256 MB | 2 GB |
-| ≥ 30 GB (32 GB-class) | 800 (16×50) | 10 / 20 | 256 MB | 1 GB |
-| ≥ 14 GB (16 GB-class) | 400 (8×50) | 8 / 15 | 192 MB | 512 MB |
-| ≥ 7 GB (8 GB-class) | 200 (5×40) | 6 / 12 | 128 MB | 384 MB |
-| ≥ 3 GB (4 GB-class) | 100 (4×25) | 4 / 8 | 96 MB | 256 MB |
-| < 3 GB (1-2 GB VPS) | 50 (2×25) | 3 / 5 | 64 MB | 128 MB |
+| **≥ 240 GB** (256 GB-class) | **5000 (100×50)** | **7 / 15 / 30** | **512 MB** | **8 GB** |
+| **≥ 120 GB** (128 GB-class) | **3200 (64×50)** | **6 / 12 / 25** | **384 MB** | **4 GB** |
+| ≥ 60 GB (64 GB-class) | 1600 (32×50) | 5 / 10 / 20 | 256 MB | 2 GB |
+| ≥ 30 GB (32 GB-class) | 800 (16×50) | 5 / 10 / 20 | 256 MB | 1 GB |
+| ≥ 14 GB (16 GB-class) | 400 (8×50) | 3 / 7 / 15 | 192 MB | 512 MB |
+| ≥ 7 GB (8 GB-class) | 200 (5×40) | 3 / 6 / 12 | 128 MB | 384 MB |
+| ≥ 3 GB (4 GB-class) | 100 (4×25) | 2 / 4 / 8 | 96 MB | 256 MB |
+| < 3 GB (1-2 GB VPS) | 50 (2×25) | 2 / 3 / 5 | 64 MB | 128 MB |
 
 Total baseline (Apache workers + OPcache + Redis):
 - 256 GB box: ~160 GB used (62% of RAM) — leaves ~96 GB for DB, FPM, OS cache

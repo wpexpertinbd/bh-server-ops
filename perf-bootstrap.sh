@@ -39,7 +39,8 @@
 set -e
 
 #################### DEFAULTS (used in non-interactive mode) ####################
-HEAVY_USERS="${HEAVY_USERS:-}"               # Laravel/Symfony users — 20 workers dynamic
+HEAVY_USERS="${HEAVY_USERS:-}"               # Force HEAVY tier (Laravel/CodeIgniter/Symfony) — dynamic, full pool
+MEDIUM_USERS="${MEDIUM_USERS:-}"             # Force MEDIUM tier (WP/Woo/OpenCart/Magento) — ondemand, 50% pool
 SKIP_USERS="${SKIP_USERS:-nobody}"           # System users to skip
 APPLY_APACHE_MPM="${APPLY_APACHE_MPM:-1}"
 APPLY_REDIS="${APPLY_REDIS:-1}"
@@ -127,6 +128,22 @@ else                                       # tiny VPS (1-3 GB)
   OPCACHE_MB=64;     OPCACHE_FILES=5000;    INTERNED_MB=4
   REDIS_MAX=128mb
 fi
+
+# ────────────────────────────────────────────────
+# 3-TIER FPM SIZING — derive MEDIUM + LIGHT from HEAVY_CHILDREN
+# ────────────────────────────────────────────────
+# Tiering policy (2026-06-07): only real PHP frameworks (Laravel/CodeIgniter/
+# Symfony) get the FULL heavy pool. CMS/cart apps (WordPress/WooCommerce/
+# OpenCart/Magento) are MEDIUM = 50% of heavy. Static/basic sites are
+# LIGHT = 25% of heavy. This stops the old behaviour where Woo/OpenCart/big-DB
+# swept almost every tenant into the heavy pool and exhausted server RAM.
+#
+# These supersede any LIGHT_CHILDREN set in the RAM-tier table above — the
+# value is always derived from HEAVY_CHILDREN so the 50%/25% ratio holds on
+# every box size. Floors keep small VPS usable (never CWP's too-low defaults):
+#   MEDIUM floor 3, LIGHT floor 2.
+MEDIUM_CHILDREN=$(( HEAVY_CHILDREN / 2 )); [ "$MEDIUM_CHILDREN" -lt 3 ] && MEDIUM_CHILDREN=3
+LIGHT_CHILDREN=$(( HEAVY_CHILDREN / 4 ));  [ "$LIGHT_CHILDREN"  -lt 2 ] && LIGHT_CHILDREN=2
 
 # Detect interactive TTY
 INTERACTIVE=0
@@ -596,55 +613,54 @@ fi
 # ────────────────────────────────────────────────
 echo ""
 echo "─── [4/10] Per-user FPM pool tuning ───"
-TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0
+TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0; MEDIUM_TOUCHED=0
 
-# Auto-detect heavy users by multiple signals. Saves having to maintain
-# HEAVY_USERS by hand — works in -y / curl|bash mode too.
-# SKIP_USERS is a hard escape hatch: any user listed there is NEVER tuned,
-# even if heavy signals match (use this to protect a tenant from changes).
-# Signals: Laravel/Symfony (artisan), WooCommerce, Magento (M1/M2),
-# OpenCart, large MySQL DB (>1 GB owned by user).
+# Auto-detect app tier by filesystem fingerprint. Saves maintaining the
+# HEAVY_USERS list by hand — works in -y / curl|bash mode too.
+# SKIP_USERS is a hard escape hatch: any user listed there is NEVER tuned.
+#
+# 3-tier classification (tier decided purely by app type — DB size is NOT a
+# signal any more):
+#   HEAVY  → real PHP frameworks: Laravel(artisan), CodeIgniter(spark /
+#            system/core/CodeIgniter.php), Symfony(config/bundles.php).
+#   MEDIUM → CMS/cart apps: WordPress(wp-load/wp-config), WooCommerce,
+#            OpenCart(system/library/cart/cart.php), Magento(env.php/Mage.php).
+#   LIGHT  → everything else (static HTML / basic PHP).
+#
+# bh_classify_user <homedir> → echoes: heavy | medium | light
+# NOTE: the heal cron (heredoc below) carries an IDENTICAL copy of this logic —
+# keep the two in sync if you change a fingerprint.
+bh_classify_user() {
+  local H="$1"
+  # ── HEAVY: PHP frameworks ──
+  find "$H" -maxdepth 4 -name artisan -type f 2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  find "$H" -maxdepth 4 -name spark   -type f 2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  find "$H" -maxdepth 5 -type f -path "*/system/core/CodeIgniter.php" 2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  find "$H" -maxdepth 5 -type f -path "*/config/bundles.php"          2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  # ── MEDIUM: CMS / cart ──
+  find "$H" -maxdepth 5 -type f \( -name wp-load.php -o -name wp-config.php \) 2>/dev/null | head -1 | grep -q . && { echo medium; return; }
+  find "$H" -maxdepth 5 -type f -path "*/system/library/cart/cart.php"         2>/dev/null | head -1 | grep -q . && { echo medium; return; }
+  find "$H" -maxdepth 5 -type f \( -path "*/app/etc/env.php" -o -path "*/app/Mage.php" \) 2>/dev/null | head -1 | grep -q . && { echo medium; return; }
+  echo light
+}
+
 DETECTED_HEAVY=""
-HAVE_MYSQL=0
-command -v mysql >/dev/null 2>&1 && mysql -N -B -e "SELECT 1" >/dev/null 2>&1 && HAVE_MYSQL=1
+DETECTED_MEDIUM=""
 for HOMEDIR in /home/*; do
   [ -d "$HOMEDIR" ] || continue
   USER=$(basename "$HOMEDIR")
   case " $HEAVY_USERS $SKIP_USERS " in *" $USER "*) continue ;; esac
-  REASONS=""
-  # Laravel/Symfony — any artisan file in home (depth 4 covers most layouts)
-  if find "$HOMEDIR" -maxdepth 4 -name "artisan" -type f 2>/dev/null | head -1 | grep -q .; then
-    REASONS="${REASONS}Laravel/Symfony, "
-  fi
-  # WooCommerce — plugin folder under any wp-content
-  if find "$HOMEDIR" -maxdepth 6 -type d -name "woocommerce" -path "*/wp-content/plugins/woocommerce" 2>/dev/null | head -1 | grep -q .; then
-    REASONS="${REASONS}WooCommerce, "
-  fi
-  # Magento 2 (app/etc/env.php) or Magento 1 (app/Mage.php)
-  if find "$HOMEDIR" -maxdepth 5 -type f \( -path "*/app/etc/env.php" -o -path "*/app/Mage.php" \) 2>/dev/null | head -1 | grep -q .; then
-    REASONS="${REASONS}Magento, "
-  fi
-  # OpenCart — system/library/cart/cart.php
-  if find "$HOMEDIR" -maxdepth 5 -type f -path "*/system/library/cart/cart.php" 2>/dev/null | head -1 | grep -q .; then
-    REASONS="${REASONS}OpenCart, "
-  fi
-  # MySQL DB size — sum bytes across DBs prefixed "<user>_" or named "<user>"
-  if [ "$HAVE_MYSQL" = 1 ]; then
-    DB_BYTES=$(mysql -N -B -e "SELECT IFNULL(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema = '${USER}' OR table_schema LIKE '${USER}\\_%'" 2>/dev/null)
-    if [ -n "$DB_BYTES" ] && [ "$DB_BYTES" -gt 1073741824 ] 2>/dev/null; then
-      DB_GB=$(awk "BEGIN{printf \"%.1f\", $DB_BYTES/1073741824}")
-      REASONS="${REASONS}${DB_GB} GB DB, "
-    fi
-  fi
-  if [ -n "$REASONS" ]; then
-    REASONS="${REASONS%, }"
-    echo "  ✓ $USER: $REASONS → heavy pool"
-    DETECTED_HEAVY="$DETECTED_HEAVY $USER"
-  fi
+  TIER=$(bh_classify_user "$HOMEDIR")
+  case "$TIER" in
+    heavy)  echo "  ✓ $USER: framework → heavy pool";   DETECTED_HEAVY="$DETECTED_HEAVY $USER" ;;
+    medium) echo "  ✓ $USER: CMS/cart → medium pool";   DETECTED_MEDIUM="$DETECTED_MEDIUM $USER" ;;
+    # light: no announce (the silent majority)
+  esac
 done
 if [ -n "$DETECTED_HEAVY" ]; then
   HEAVY_USERS="$HEAVY_USERS$DETECTED_HEAVY"
 fi
+MEDIUM_USERS="${MEDIUM_USERS:-}$DETECTED_MEDIUM"
 
 ensure_kv() {
   # Set key=value in a php-fpm-style INI file. Anchors on `=` so writing
@@ -671,10 +687,12 @@ else
       [ -f "${CONF}.bak-pre-tune" ] || cp "$CONF" "${CONF}.bak-pre-tune"
 
       if echo " $HEAVY_USERS " | grep -q " $USER "; then
-        # Heavy app users — dynamic pool, scaled HEAVY_CHILDREN per RAM tier
+        # HEAVY (Laravel/CodeIgniter/Symfony) — dynamic warm pool, full HEAVY_CHILDREN
         START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
         MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
         MAX_SPARE=$(( HEAVY_CHILDREN / 2 )); [ $MAX_SPARE -lt 4 ] && MAX_SPARE=4
+        # process_idle_timeout is ondemand-only — strip any stale leftover
+        sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$CONF"
         ensure_kv "$CONF" "pm" "dynamic"
         ensure_kv "$CONF" "pm.max_children" "$HEAVY_CHILDREN"
         ensure_kv "$CONF" "pm.max_requests" "500"
@@ -683,8 +701,19 @@ else
         ensure_kv "$CONF" "pm.max_spare_servers" "$MAX_SPARE"
         ensure_kv "$CONF" "request_terminate_timeout" "30s"
         HEAVY_TOUCHED=$((HEAVY_TOUCHED+1))
+      elif echo " $MEDIUM_USERS " | grep -q " $USER "; then
+        # MEDIUM (WordPress/WooCommerce/OpenCart/Magento) — ondemand, 50% of heavy.
+        # Strip heavy-only spare-server keys in case this user was heavy before.
+        sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$CONF"
+        ensure_kv "$CONF" "pm" "ondemand"
+        ensure_kv "$CONF" "pm.max_children" "$MEDIUM_CHILDREN"
+        ensure_kv "$CONF" "pm.max_requests" "500"
+        ensure_kv "$CONF" "pm.process_idle_timeout" "30s"
+        ensure_kv "$CONF" "request_terminate_timeout" "30s"
+        MEDIUM_TOUCHED=$((MEDIUM_TOUCHED+1))
       else
-        # Light tenants (WordPress etc.) — ondemand pool, LIGHT_CHILDREN per RAM tier
+        # LIGHT (static HTML / basic PHP) — ondemand, 25% of heavy.
+        sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$CONF"
         ensure_kv "$CONF" "pm" "ondemand"
         ensure_kv "$CONF" "pm.max_children" "$LIGHT_CHILDREN"
         ensure_kv "$CONF" "pm.max_requests" "500"
@@ -694,39 +723,47 @@ else
       fi
     done
   done
-  echo "✓ Light: $TOUCHED  Heavy: $HEAVY_TOUCHED  Skipped: $SKIPPED"
+  echo "✓ Light: $TOUCHED  Medium: $MEDIUM_TOUCHED  Heavy: $HEAVY_TOUCHED  Skipped: $SKIPPED"
 
-  # ─ Persist heavy-user list + tier values for the heal cron ─
+  # ─ Persist tier values + user lists for the heal cron ─
   #   Why the heal cron exists: in production we hit a case where users
   #   correctly auto-detected as heavy still ended up with LIGHT_CHILDREN
   #   in their pool config — either a subtle script logic bug, or CWP
   #   regenerating pool configs from its template at some later trigger.
-  #   The heal cron re-detects heavy users every 5 min using the SAME
-  #   fingerprints (artisan/Woo/Magento/OpenCart/big-DB) and re-asserts
-  #   pm.max_children if it doesn't match HEAVY_CHILDREN. Self-correcting.
+  #   The heal cron re-classifies every tenant every 5 min using the SAME
+  #   fingerprints (bh_classify_user) and re-asserts the correct pool per
+  #   tier (heavy/medium/light) if it drifts. Self-correcting both ways.
   mkdir -p /var/lib/bh-server-ops
   cat > /var/lib/bh-server-ops/fpm-config <<EOF
 # Generated by perf-bootstrap.sh — values used by bh-fpm-pool-heal cron
 HEAVY_CHILDREN=$HEAVY_CHILDREN
+MEDIUM_CHILDREN=$MEDIUM_CHILDREN
 LIGHT_CHILDREN=$LIGHT_CHILDREN
 SKIP_USERS="$SKIP_USERS"
 EOF
-  echo "$HEAVY_USERS" | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/heavy-users.list
+  echo "$HEAVY_USERS"  | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/heavy-users.list
+  echo "$MEDIUM_USERS" | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/medium-users.list
 
   # ─ Install heal cron (every 5 min) ─
   cat > /usr/local/sbin/bh-fpm-pool-heal.sh <<'HEALSCRIPT'
 #!/bin/bash
-# BH-FPM-POOL-HEAL — every 5 min, re-detect heavy users + ensure their pool
-# config has the FULL heavy-mode settings (not just max_children). Defends
-# against CWP pool regen AND any script logic bug that misclassified users.
+# BH-FPM-POOL-HEAL — every 5 min, re-classify every tenant by app type and
+# reconcile its php-fpm pool to the correct TIER. Defends against CWP pool
+# regen AND any script logic bug that misclassified users. Fully bidirectional:
+# promotes AND demotes between heavy/medium/light as apps are installed/removed.
 #
-# Heavy mode = pm=dynamic + pm.max_children=HEAVY_CHILDREN + start/min/max
-# spare servers + (no pm.process_idle_timeout, which is ondemand-only).
+# Tiers (must mirror bh_classify_user in perf-bootstrap.sh):
+#   HEAVY  (Laravel/CodeIgniter/Symfony) → pm=dynamic, HEAVY_CHILDREN + spares
+#   MEDIUM (WordPress/Woo/OpenCart/Magento) → pm=ondemand, MEDIUM_CHILDREN
+#   LIGHT  (static/basic, the default) → pm=ondemand, LIGHT_CHILDREN
 
 CONF=/var/lib/bh-server-ops/fpm-config
 [ -f "$CONF" ] || exit 0
 . "$CONF"
 [ -n "$HEAVY_CHILDREN" ] || exit 0
+# Back-compat: derive medium if an old fpm-config (pre-3-tier) lacks it.
+[ -n "$MEDIUM_CHILDREN" ] || { MEDIUM_CHILDREN=$(( HEAVY_CHILDREN / 2 )); [ "$MEDIUM_CHILDREN" -lt 3 ] && MEDIUM_CHILDREN=3; }
+[ -n "$LIGHT_CHILDREN" ]  || { LIGHT_CHILDREN=$(( HEAVY_CHILDREN / 4 ));  [ "$LIGHT_CHILDREN"  -lt 2 ] && LIGHT_CHILDREN=2; }
 SKIP_USERS="${SKIP_USERS:-nobody}"
 
 START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
@@ -744,132 +781,122 @@ ensure_kv() {
   fi
 }
 
-HAVE_MYSQL=0
-command -v mysql >/dev/null 2>&1 && mysql -N -B -e "SELECT 1" >/dev/null 2>&1 && HAVE_MYSQL=1
+# bh_classify_user <homedir> → echoes: heavy | medium | light
+# IDENTICAL to the function in perf-bootstrap.sh — keep in sync.
+bh_classify_user() {
+  local H="$1"
+  find "$H" -maxdepth 4 -name artisan -type f 2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  find "$H" -maxdepth 4 -name spark   -type f 2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  find "$H" -maxdepth 5 -type f -path "*/system/core/CodeIgniter.php" 2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  find "$H" -maxdepth 5 -type f -path "*/config/bundles.php"          2>/dev/null | head -1 | grep -q . && { echo heavy; return; }
+  find "$H" -maxdepth 5 -type f \( -name wp-load.php -o -name wp-config.php \) 2>/dev/null | head -1 | grep -q . && { echo medium; return; }
+  find "$H" -maxdepth 5 -type f -path "*/system/library/cart/cart.php"         2>/dev/null | head -1 | grep -q . && { echo medium; return; }
+  find "$H" -maxdepth 5 -type f \( -path "*/app/etc/env.php" -o -path "*/app/Mage.php" \) 2>/dev/null | head -1 | grep -q . && { echo medium; return; }
+  echo light
+}
 
-DETECTED=""
+# Build the desired tier per user from a fresh filesystem scan.
+DETECTED_HEAVY=" "; DETECTED_MEDIUM=" "
 for HOMEDIR in /home/*; do
   [ -d "$HOMEDIR" ] || continue
   USER=$(basename "$HOMEDIR")
   case " $SKIP_USERS " in *" $USER "*) continue ;; esac
-  IS_HEAVY=0
-  if find "$HOMEDIR" -maxdepth 4 -name artisan -type f 2>/dev/null | head -1 | grep -q .; then IS_HEAVY=1; fi
-  if [ $IS_HEAVY -eq 0 ] && find "$HOMEDIR" -maxdepth 6 -type d -path "*/wp-content/plugins/woocommerce" 2>/dev/null | head -1 | grep -q .; then IS_HEAVY=1; fi
-  if [ $IS_HEAVY -eq 0 ] && find "$HOMEDIR" -maxdepth 5 -type f \( -path "*/app/etc/env.php" -o -path "*/app/Mage.php" \) 2>/dev/null | head -1 | grep -q .; then IS_HEAVY=1; fi
-  if [ $IS_HEAVY -eq 0 ] && find "$HOMEDIR" -maxdepth 5 -type f -path "*/system/library/cart/cart.php" 2>/dev/null | head -1 | grep -q .; then IS_HEAVY=1; fi
-  if [ $IS_HEAVY -eq 0 ] && [ "$HAVE_MYSQL" = 1 ]; then
-    DB_BYTES=$(mysql -N -B -e "SELECT IFNULL(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema = '${USER}' OR table_schema LIKE '${USER}\\_%'" 2>/dev/null)
-    [ -n "$DB_BYTES" ] && [ "$DB_BYTES" -gt 1073741824 ] 2>/dev/null && IS_HEAVY=1
-  fi
-  [ $IS_HEAVY -eq 1 ] && DETECTED="$DETECTED $USER"
+  case "$(bh_classify_user "$HOMEDIR")" in
+    heavy)  DETECTED_HEAVY="$DETECTED_HEAVY$USER " ;;
+    medium) DETECTED_MEDIUM="$DETECTED_MEDIUM$USER " ;;
+  esac
 done
 
-# Refresh the cached list
-echo "$DETECTED" | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/heavy-users.list
+# Refresh cached lists
+echo "$DETECTED_HEAVY"  | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/heavy-users.list
+echo "$DETECTED_MEDIUM" | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/medium-users.list
 
-HEALED=0
-for USER in $DETECTED; do
-  for DIR in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users; do
-    POOL="$DIR/$USER.conf"
-    [ -f "$POOL" ] || continue
+# Apply the HEAVY (dynamic) profile to a pool conf.
+apply_heavy() {
+  local POOL="$1"
+  sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
+  sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$POOL"
+  ensure_kv "$POOL" "pm" "dynamic"
+  ensure_kv "$POOL" "pm.max_children" "$HEAVY_CHILDREN"
+  ensure_kv "$POOL" "pm.max_requests" "500"
+  ensure_kv "$POOL" "pm.start_servers" "$START_SVR"
+  ensure_kv "$POOL" "pm.min_spare_servers" "$MIN_SPARE"
+  ensure_kv "$POOL" "pm.max_spare_servers" "$MAX_SPARE"
+  ensure_kv "$POOL" "request_terminate_timeout" "30s"
+}
 
-    # Check if full heavy state is already present AND clean (no duplicates)
-    CUR_PM=$(grep -oE '^pm[[:space:]]*=[[:space:]]*[a-z]+' "$POOL" | head -1 | awk '{print $3}')
-    CUR_CHILDREN=$(grep -oE '^pm\.max_children[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
-    CUR_START=$(grep -oE '^pm\.start_servers[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
-    PM_LINE_COUNT=$(grep -cE '^pm[[:space:]]*=' "$POOL")
+# Apply an ondemand profile (medium or light) to a pool conf.
+apply_ondemand() {
+  local POOL="$1" CHILDREN="$2"
+  sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
+  sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$POOL"
+  ensure_kv "$POOL" "pm" "ondemand"
+  ensure_kv "$POOL" "pm.max_children" "$CHILDREN"
+  ensure_kv "$POOL" "pm.max_requests" "500"
+  ensure_kv "$POOL" "pm.process_idle_timeout" "30s"
+  ensure_kv "$POOL" "request_terminate_timeout" "30s"
+}
 
-    # Healthy iff: dynamic mode + correct sizes + EXACTLY ONE pm= line (no duplicates).
-    # The PM_LINE_COUNT=1 check is what catches the legacy ensure_kv bug that
-    # left 4× duplicate `pm = dynamic` lines in heavy users' configs.
-    if [ "$CUR_PM" = "dynamic" ] && [ "$CUR_CHILDREN" = "$HEAVY_CHILDREN" ] \
-       && [ "$CUR_START" = "$START_SVR" ] && [ "$PM_LINE_COUNT" = "1" ]; then
-      continue
-    fi
-
-    # Strip ALL `pm = (dynamic|ondemand)` lines first — ensure_kv re-adds ONE
-    # correct line below. Handles any mix of legacy duplicates / wrong mode.
-    sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
-
-    ensure_kv "$POOL" "pm" "dynamic"
-    ensure_kv "$POOL" "pm.max_children" "$HEAVY_CHILDREN"
-    ensure_kv "$POOL" "pm.max_requests" "500"
-    ensure_kv "$POOL" "pm.start_servers" "$START_SVR"
-    ensure_kv "$POOL" "pm.min_spare_servers" "$MIN_SPARE"
-    ensure_kv "$POOL" "pm.max_spare_servers" "$MAX_SPARE"
-    ensure_kv "$POOL" "request_terminate_timeout" "30s"
-    # process_idle_timeout is ondemand-only — strip it in dynamic mode
-    sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$POOL"
-
-    HEALED=$((HEALED+1))
-  done
-done
-
-# Demote pass — bidirectional heal. Users with heavy leftovers (pm=dynamic
-# OR heavy spare-servers OR max_children at HEAVY_CHILDREN) who are NOT in
-# the current heavy-detected list get demoted back to light config. Catches
-# dead sites + apps that were uninstalled after initial heavy classification.
-# Leaves CWP-default pools (low max_children, no heavy markers) untouched.
-DEMOTED=0
+# Single reconcile loop over every pool conf: figure the user's desired tier
+# (default LIGHT), skip if already in the correct clean state, else re-apply.
+HEAVY_N=0; MEDIUM_N=0; LIGHT_N=0; CHANGED=0
 for DIR in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users; do
   for POOL in "$DIR"/*.conf; do
     [ -f "$POOL" ] || continue
     USER=$(basename "$POOL" .conf)
     case " $SKIP_USERS " in *" $USER "*) continue ;; esac
-    case " $DETECTED " in *" $USER "*) continue ;; esac  # currently heavy
+
+    # Desired tier
+    if   echo "$DETECTED_HEAVY"  | grep -q " $USER "; then TIER=heavy
+    elif echo "$DETECTED_MEDIUM" | grep -q " $USER "; then TIER=medium
+    else TIER=light; fi
 
     CUR_PM=$(grep -oE '^pm[[:space:]]*=[[:space:]]*[a-z]+' "$POOL" | head -1 | awk '{print $3}')
     CUR_CHILDREN=$(grep -oE '^pm\.max_children[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
-    HAS_HEAVY_SPARES=$(grep -cE '^pm\.(start_servers|min_spare_servers|max_spare_servers)' "$POOL")
+    CUR_START=$(grep -oE '^pm\.start_servers[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
+    PM_LINE_COUNT=$(grep -cE '^pm[[:space:]]*=' "$POOL")
+    HAS_SPARES=$(grep -cE '^pm\.(start_servers|min_spare_servers|max_spare_servers)' "$POOL")
+    HAS_IDLE=$(grep -cE '^pm\.process_idle_timeout[[:space:]]*=' "$POOL")
 
-    # Has heavy leftovers if: dynamic mode, heavy spares present, or
-    # max_children matches HEAVY_CHILDREN
-    NEEDS_DEMOTE=0
-    [ "$CUR_PM" = "dynamic" ] && NEEDS_DEMOTE=1
-    [ "$HAS_HEAVY_SPARES" -gt 0 ] && NEEDS_DEMOTE=1
-    [ "$CUR_CHILDREN" = "$HEAVY_CHILDREN" ] && NEEDS_DEMOTE=1
-    [ "$NEEDS_DEMOTE" = "0" ] && continue
-
-    # Already at correct light state? Skip
-    if [ "$CUR_PM" = "ondemand" ] && [ "$CUR_CHILDREN" = "$LIGHT_CHILDREN" ] && [ "$HAS_HEAVY_SPARES" = "0" ]; then
-      continue
-    fi
-
-    # Apply light config
-    sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
-    sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$POOL"
-    ensure_kv "$POOL" "pm" "ondemand"
-    ensure_kv "$POOL" "pm.max_children" "$LIGHT_CHILDREN"
-    ensure_kv "$POOL" "pm.max_requests" "500"
-    ensure_kv "$POOL" "pm.process_idle_timeout" "30s"
-    ensure_kv "$POOL" "request_terminate_timeout" "30s"
-    DEMOTED=$((DEMOTED+1))
+    case "$TIER" in
+      heavy)
+        HEAVY_N=$((HEAVY_N+1))
+        # Healthy: dynamic + right children + right start + EXACTLY one pm= line
+        # (PM_LINE_COUNT=1 catches the legacy duplicate-pm bug) + no idle line.
+        if [ "$CUR_PM" = "dynamic" ] && [ "$CUR_CHILDREN" = "$HEAVY_CHILDREN" ] \
+           && [ "$CUR_START" = "$START_SVR" ] && [ "$PM_LINE_COUNT" = "1" ] && [ "$HAS_IDLE" = "0" ]; then
+          continue
+        fi
+        apply_heavy "$POOL"; CHANGED=$((CHANGED+1)) ;;
+      medium)
+        MEDIUM_N=$((MEDIUM_N+1))
+        if [ "$CUR_PM" = "ondemand" ] && [ "$CUR_CHILDREN" = "$MEDIUM_CHILDREN" ] \
+           && [ "$PM_LINE_COUNT" = "1" ] && [ "$HAS_SPARES" = "0" ] && [ "$HAS_IDLE" -ge 1 ]; then
+          continue
+        fi
+        apply_ondemand "$POOL" "$MEDIUM_CHILDREN"; CHANGED=$((CHANGED+1)) ;;
+      light)
+        LIGHT_N=$((LIGHT_N+1))
+        if [ "$CUR_PM" = "ondemand" ] && [ "$CUR_CHILDREN" = "$LIGHT_CHILDREN" ] \
+           && [ "$PM_LINE_COUNT" = "1" ] && [ "$HAS_SPARES" = "0" ] && [ "$HAS_IDLE" -ge 1 ]; then
+          continue
+        fi
+        apply_ondemand "$POOL" "$LIGHT_CHILDREN"; CHANGED=$((CHANGED+1)) ;;
+    esac
   done
 done
 
-# Sweep pass: pm.process_idle_timeout is ondemand-only. Strip it from any
-# pool currently in dynamic mode — regardless of detection. Catches edge
-# case where a pool's pm was flipped to dynamic by earlier heal/script run
-# but the ondemand-leftover was never removed.
-STRIPPED=0
-for F in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf; do
-  if grep -qE '^pm[[:space:]]*=[[:space:]]*dynamic' "$F" && grep -qE '^pm\.process_idle_timeout' "$F"; then
-    sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$F"
-    STRIPPED=$((STRIPPED+1))
-  fi
-done
-
-if [ $HEALED -gt 0 ] || [ $DEMOTED -gt 0 ] || [ $STRIPPED -gt 0 ]; then
+if [ $CHANGED -gt 0 ]; then
   for SVC in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php-fpm[0-9]+\.service$'); do
     systemctl reload "$SVC" >/dev/null 2>&1
   done
-  echo "$(date '+%Y-%m-%d %H:%M:%S') healed=$HEALED demoted=$DEMOTED stripped=$STRIPPED" >> /var/log/bh-fpm-heal.log
+  echo "$(date '+%Y-%m-%d %H:%M:%S') changed=$CHANGED (heavy=$HEAVY_N medium=$MEDIUM_N light=$LIGHT_N)" >> /var/log/bh-fpm-heal.log
 fi
 HEALSCRIPT
   chmod +x /usr/local/sbin/bh-fpm-pool-heal.sh
 
   cat > /etc/cron.d/bh-fpm-pool-heal <<'HEALCRON'
-# BH-FPM-POOL-HEAL — re-assert pm.max_children for heavy users every 5 min
+# BH-FPM-POOL-HEAL — re-assert per-tier pm pools (heavy/medium/light) every 5 min
 */5 * * * * root /usr/local/sbin/bh-fpm-pool-heal.sh >/dev/null 2>&1
 HEALCRON
   touch /var/log/bh-fpm-heal.log
