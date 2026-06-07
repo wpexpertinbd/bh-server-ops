@@ -81,6 +81,37 @@ tail -5 /var/log/bh-fpm-heal.log
 
 Output format in the log: `changed=N (heavy=H medium=M light=L)` — `changed` = pools rewritten this run; `heavy/medium/light` = how many pools are currently classified into each tier.
 
+### Verify which tier each tenant landed in (and *why*)
+
+The classifier writes its results to `/var/lib/bh-server-ops/{heavy,medium}-users.list`. To audit a box — confirm every HEAVY user is a genuine framework (not a WordPress/cart site that slipped through), print exactly which fingerprint matched each heavy user (with the file path for `spark`/Symfony so false positives are obvious):
+
+```bash
+for u in $(cat /var/lib/bh-server-ops/heavy-users.list); do
+  h=/home/$u; m=""
+  find "$h" -maxdepth 4 -name artisan -type f 2>/dev/null | head -1 | grep -q . && m="$m artisan"
+  sp=$(find "$h" -maxdepth 4 -name spark -type f 2>/dev/null | head -1); [ -n "$sp" ] && m="$m SPARK[$sp]"
+  find "$h" -maxdepth 5 -type f -path "*/system/core/CodeIgniter.php" 2>/dev/null | head -1 | grep -q . && m="$m CI3"
+  sf=$(find "$h" -maxdepth 5 -type f -path "*/config/bundles.php" 2>/dev/null | head -1); [ -n "$sf" ] && m="$m SYMFONY[$sf]"
+  echo "$u =>$m"
+done
+```
+
+Healthy output shows only `artisan` (Laravel), `CI3` (CodeIgniter), or a real Symfony path. If any `SPARK[...]` points into `wp-content/` (a theme/plugin file literally named `spark`), that's a false positive — add the user to `SKIP_USERS` or force the right tier with `MEDIUM_USERS`.
+
+Full per-tier breakdown (heavy / medium / light) in one shot — heavy & medium come from the list files, light = every other tuned pool:
+
+```bash
+echo "== HEAVY ==";  cat /var/lib/bh-server-ops/heavy-users.list
+echo "== MEDIUM =="; cat /var/lib/bh-server-ops/medium-users.list
+echo "== LIGHT (everything else tuned) =="
+comm -23 \
+  <(ls /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf 2>/dev/null | xargs -n1 basename | sed 's/\.conf$//' | sort -u) \
+  <( { cat /var/lib/bh-server-ops/heavy-users.list /var/lib/bh-server-ops/medium-users.list 2>/dev/null; echo nobody; } | sort -u )
+
+# live pool-size distribution (sanity check against the tier numbers)
+grep -h pm.max_children /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf | sort | uniq -c
+```
+
 ### What slave mode skips
 
 `IS_SLAVE_SERVER=1` skips three things that block legitimate server-to-server API auth:
