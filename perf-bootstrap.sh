@@ -2162,9 +2162,10 @@ TraceEnable Off
     # SEO/scraper bots
     RewriteCond %{HTTP_USER_AGENT} (PetalBot|MJ12bot|DotBot|SemrushBot|AhrefsBot|Bytespider|YandexBot|seznambot|MegaIndex|BLEXBot|DataForSeoBot|GeedoShop|MauiBot|sogou|spbot|trendkite|garlik|webmeup|exabot|Lipperhey|psbot|360Spider) [NC,OR]
     # AI training bots
-    RewriteCond %{HTTP_USER_AGENT} (GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot) [NC,OR]
-    # Empty / dash-only User-Agent (no legitimate client sends these)
-    RewriteCond %{HTTP_USER_AGENT} ^-?$
+    RewriteCond %{HTTP_USER_AGENT} (GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot) [NC]
+    # NOTE: do NOT block empty/dash-only User-Agent — that assumption is wrong.
+    # Legitimate server-to-server APIs send no UA: Telegram webhooks, payment/gateway
+    # callbacks, uptime monitors, etc. (matches the nginx bh.d/00-anti-bot.conf stance.)
     RewriteRule .* - [F,L]
   </IfModule>
 </Directory>
