@@ -1427,6 +1427,41 @@ else
 fi
 
 # ────────────────────────────────────────────────
+# 6g. httpd stale-PID self-heal (survives unclean / attack-forced reboots)
+# ────────────────────────────────────────────────
+# After a HARD reboot, Apache can leave a 0-byte / stale logs/httpd.pid. On
+# next boot apachectl reads it, finds no valid PID, and refuses to start
+# ("AH00058: Error retrieving pid file" → httpd.service fails). Observed on
+# s3 after an attack-forced reboot (2026-06-08). A tiny systemd drop-in clears
+# any stale pid before each start so httpd always comes back up. ExecStartPre
+# runs ONLY on start (never on reload) so it can't disturb a live instance;
+# lives in /etc so CWP package updates don't wipe it; leading '-' = ignore if
+# the file is already gone.
+echo ""
+echo "─── [6g/10] httpd stale-PID self-heal ───"
+if systemctl list-unit-files 2>/dev/null | grep -q '^httpd\.service' && [ -n "$APACHE_BIN" ]; then
+  ROOT=$("$APACHE_BIN" -V 2>/dev/null | sed -n 's/.*HTTPD_ROOT="\([^"]*\)".*/\1/p')
+  PIDREL=$("$APACHE_BIN" -V 2>/dev/null | sed -n 's/.*DEFAULT_PIDFILE="\([^"]*\)".*/\1/p')
+  [ -z "$ROOT" ] && ROOT=/usr/local/apache
+  [ -z "$PIDREL" ] && PIDREL=logs/httpd.pid
+  case "$PIDREL" in /*) HTTPD_PID_PATH="$PIDREL" ;; *) HTTPD_PID_PATH="$ROOT/$PIDREL" ;; esac
+  DROPIN_DIR=/etc/systemd/system/httpd.service.d
+  DROPIN="$DROPIN_DIR/10-clear-stale-pid.conf"
+  WANT="[Service]
+ExecStartPre=-/bin/rm -f ${HTTPD_PID_PATH}"
+  mkdir -p "$DROPIN_DIR"
+  if [ "$(cat "$DROPIN" 2>/dev/null)" != "$WANT" ]; then
+    printf '%s\n' "$WANT" > "$DROPIN"
+    systemctl daemon-reload 2>/dev/null
+    echo "✓ installed httpd stale-pid self-heal ($HTTPD_PID_PATH)"
+  else
+    echo "✓ httpd stale-pid self-heal already present ($HTTPD_PID_PATH)"
+  fi
+else
+  echo "⊘ no httpd.service / Apache bin — skipping"
+fi
+
+# ────────────────────────────────────────────────
 # 5b. Apache mod_status visibility + bad-watchdog detector
 # ────────────────────────────────────────────────
 # Without /server-status reachable on the Apache backend port, future
