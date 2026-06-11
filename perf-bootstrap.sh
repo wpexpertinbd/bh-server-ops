@@ -62,6 +62,14 @@ APPLY_CLAMD_LIMITS="${APPLY_CLAMD_LIMITS:-1}"   # 1 = cap clamd CPU/RAM/IO (set 
 CLAMD_CPUQUOTA="${CLAMD_CPUQUOTA:-50%}"         # half a core hard cap
 CLAMD_MEMMAX="${CLAMD_MEMMAX:-1536M}"           # hard RAM cap (safe above DB-load peak)
 CLAMD_MEMHIGH="${CLAMD_MEMHIGH:-1024M}"         # soft throttle (cgroup v2 only; EL8 v1 ignores, harmless)
+# CWP backs up each account into /home/tmp_bak/.backup_temp<user>, tars it off,
+# then is SUPPOSED to delete the temp dir — but often doesn't, so staging piles
+# up hundreds of GB every run (seen 325G/98 dirs filling a disk to 97%). This
+# janitor cron clears STALE temp dirs while protecting any in-progress backup.
+APPLY_TMPBAK_JANITOR="${APPLY_TMPBAK_JANITOR:-1}"        # 1 = install the staging-cleanup cron
+TMPBAK_DIR="${TMPBAK_DIR:-/home/tmp_bak}"               # CWP backup staging dir
+TMPBAK_JANITOR_INTERVAL="${TMPBAK_JANITOR_INTERVAL:-30}" # cron interval (minutes)
+TMPBAK_JANITOR_MINAGE="${TMPBAK_JANITOR_MINAGE:-10}"    # only delete dirs untouched N+ min (active-backup guard)
 # Space-separated IPs that bypass nginx anti-bot rules. Use this to allowlist
 # your other fleet servers (DNS slave, monitoring, Blesta, etc.) so server-
 # to-server API calls don't get caught by the bot filter. Example:
@@ -530,6 +538,7 @@ if [ "$INTERACTIVE" = "1" ]; then
   echo "  Apache global hardening:   $([ "$APPLY_APACHE_HARDENING" = "1" ] && echo yes || echo no)"
   echo "  HTTP/3 (codeit nginx):     $([ "$ENABLE_HTTP3" = "1" ] && echo yes || echo no)"
   echo "  clamd resource cap:        $([ "$APPLY_CLAMD_LIMITS" = "1" ] && echo "yes (CPU $CLAMD_CPUQUOTA / RAM $CLAMD_MEMMAX)" || echo no)"
+  echo "  tmp_bak janitor cron:      $([ "$APPLY_TMPBAK_JANITOR" = "1" ] && echo "yes (every ${TMPBAK_JANITOR_INTERVAL}min)" || echo no)"
   echo "  Install helpers:           $([ "$INSTALL_HELPERS" = "1" ] && echo yes || echo no)"
   echo "  Saturation-monitor cron:   $([ "$ENABLE_MONITOR_CRON" = "1" ] && echo yes || echo no)"
   echo "  Auto-recovery cron:        $([ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ] && echo yes || echo no)"
@@ -2142,6 +2151,63 @@ CONF
   fi
 else
   echo "⊘ clamd resource cap skipped (set APPLY_CLAMD_LIMITS=1 to enable)"
+fi
+
+# ────────────────────────────────────────────────
+# 7c. tmp_bak janitor — clean CWP backup staging CWP fails to remove
+# ────────────────────────────────────────────────
+# Installs /usr/local/sbin/bh-tmpbak-janitor.sh + a cron. The janitor removes
+# stale /home/tmp_bak/.backup_temp<user> dirs while PROTECTING any in-progress
+# backup: active dir detected via the backup process tree's cmdline+cwd, PLUS
+# the newest dir (always the active one), PLUS a min-age guard. Worst case if a
+# race ever hit: one user's backup is incomplete that run — temp dirs are COPIES
+# so live /home data is never touched. flock-guarded; logs only when it deletes.
+echo ""
+echo "─── [7c/10] tmp_bak backup-staging janitor ───"
+if [ "$APPLY_TMPBAK_JANITOR" = "1" ] && { [ -d /usr/local/cwp ] || [ -d "$TMPBAK_DIR" ]; }; then
+  cat > /usr/local/sbin/bh-tmpbak-janitor.sh <<'JANITOR'
+#!/bin/bash
+# bh-tmpbak-janitor — remove stale CWP backup staging dirs that CWP fails to
+# clean, while PROTECTING active backups. Installed by bh-server-ops.
+set -u
+TMPBAK="${TMPBAK_DIR:-/home/tmp_bak}"
+MINAGE="${TMPBAK_JANITOR_MINAGE:-10}"
+LOG=/var/log/bh-tmpbak-janitor.log
+exec 9>/var/run/bh-tmpbak-janitor.lock 2>/dev/null || exit 0
+flock -n 9 || exit 0
+[ -d "$TMPBAK" ] || exit 0
+# robustly detect the active backup's temp dir(s) to PROTECT
+BKPIDS=$(pgrep -f 'cron_newbackup|cron_autobackup|async_backup' 2>/dev/null)
+ALL="$BKPIDS"
+for p in $BKPIDS; do ALL="$ALL $(pgrep -P "$p" 2>/dev/null)"; done
+for p in $ALL; do ALL="$ALL $(pgrep -P "$p" 2>/dev/null)"; done
+PROTECT=$( { for p in $ALL; do tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null; echo; readlink "/proc/$p/cwd" 2>/dev/null; done; } | grep -oE '\.backup_temp[a-z0-9_]+' | sort -u )
+if [ -n "$BKPIDS" ]; then
+  NEWEST=$(ls -dt "$TMPBAK"/.backup_temp* 2>/dev/null | head -1 | xargs -r basename)
+  PROTECT=$(printf '%s\n%s\n' "$PROTECT" "$NEWEST" | grep -v '^$' | sort -u)
+fi
+deleted=0
+for d in "$TMPBAK"/.backup_temp*; do
+  [ -d "$d" ] || continue
+  case "$d" in "$TMPBAK"/.backup_temp*) : ;; *) continue ;; esac   # hard path guard
+  b=$(basename "$d")
+  printf '%s\n' "$PROTECT" | grep -qx "$b" && continue              # active backup
+  [ -n "$(find "$d" -maxdepth 0 -mmin -"$MINAGE" 2>/dev/null)" ] && continue  # too recent
+  ionice -c2 -n7 rm -rf "$d" && deleted=$((deleted+1))
+done
+[ "$deleted" -gt 0 ] && echo "$(date '+%F %T') removed $deleted stale dir(s); protected=[$(printf '%s' "$PROTECT" | tr '\n' ',')]; free=$(df -h "$TMPBAK" 2>/dev/null | tail -1 | awk '{print $4}')" >> "$LOG"
+exit 0
+JANITOR
+  chmod 700 /usr/local/sbin/bh-tmpbak-janitor.sh
+  cat > /etc/cron.d/bh-tmpbak-janitor <<CRON
+# BH tmp_bak janitor — clears stale CWP backup staging (protects in-progress backups)
+*/${TMPBAK_JANITOR_INTERVAL} * * * * root TMPBAK_DIR=${TMPBAK_DIR} TMPBAK_JANITOR_MINAGE=${TMPBAK_JANITOR_MINAGE} /usr/local/sbin/bh-tmpbak-janitor.sh >/dev/null 2>&1
+CRON
+  echo "✓ tmp_bak janitor installed: /usr/local/sbin/bh-tmpbak-janitor.sh"
+  echo "  cron: every ${TMPBAK_JANITOR_INTERVAL}min | dir $TMPBAK_DIR | min-age ${TMPBAK_JANITOR_MINAGE}min | log /var/log/bh-tmpbak-janitor.log"
+  echo "  run once now (optional): TMPBAK_DIR=$TMPBAK_DIR /usr/local/sbin/bh-tmpbak-janitor.sh"
+else
+  echo "⊘ tmp_bak janitor skipped (no CWP / no $TMPBAK_DIR, or APPLY_TMPBAK_JANITOR=0)"
 fi
 
 # ────────────────────────────────────────────────
