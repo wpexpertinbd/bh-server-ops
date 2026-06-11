@@ -70,6 +70,16 @@ APPLY_TMPBAK_JANITOR="${APPLY_TMPBAK_JANITOR:-1}"        # 1 = install the stagi
 TMPBAK_DIR="${TMPBAK_DIR:-/home/tmp_bak}"               # CWP backup staging dir
 TMPBAK_JANITOR_INTERVAL="${TMPBAK_JANITOR_INTERVAL:-30}" # cron interval (minutes)
 TMPBAK_JANITOR_MINAGE="${TMPBAK_JANITOR_MINAGE:-10}"    # only delete dirs untouched N+ min (active-backup guard)
+# WordPress edge guard (nginx 6c): hard-block wp-cron.php over HTTP globally +
+# rate-limit wp-login.php per real-client-IP — kills bot floods on these
+# endpoints at the edge before they spawn PHP workers, country-independent
+# (complements CC_IGNORE without un-whitelisting BD customers). SAFE: wp-cron
+# runs via php-CLI cron (not HTTP) so blocking HTTP wp-cron doesn't touch it;
+# CF real_ip is already set on CWP so the rate-limit keys on the true visitor.
+# xmlrpc.php is already hard-blocked (return 444) in the anti-bot snippet.
+APPLY_WP_EDGE_GUARD="${APPLY_WP_EDGE_GUARD:-1}"
+WPLOGIN_RATE="${WPLOGIN_RATE:-10r/m}"   # per-IP wp-login.php rate (10/min = brute-force throttle, generous for humans)
+WPLOGIN_BURST="${WPLOGIN_BURST:-5}"     # immediate attempts allowed before throttling kicks in
 # Space-separated IPs that bypass nginx anti-bot rules. Use this to allowlist
 # your other fleet servers (DNS slave, monitoring, Blesta, etc.) so server-
 # to-server API calls don't get caught by the bot filter. Example:
@@ -539,6 +549,7 @@ if [ "$INTERACTIVE" = "1" ]; then
   echo "  HTTP/3 (codeit nginx):     $([ "$ENABLE_HTTP3" = "1" ] && echo yes || echo no)"
   echo "  clamd resource cap:        $([ "$APPLY_CLAMD_LIMITS" = "1" ] && echo "yes (CPU $CLAMD_CPUQUOTA / RAM $CLAMD_MEMMAX)" || echo no)"
   echo "  tmp_bak janitor cron:      $([ "$APPLY_TMPBAK_JANITOR" = "1" ] && echo "yes (every ${TMPBAK_JANITOR_INTERVAL}min)" || echo no)"
+  echo "  WP edge guard:             $([ "$APPLY_WP_EDGE_GUARD" = "1" ] && echo "yes (wp-cron HTTP blocked, wp-login $WPLOGIN_RATE)" || echo no)"
   echo "  Install helpers:           $([ "$INSTALL_HELPERS" = "1" ] && echo yes || echo no)"
   echo "  Saturation-monitor cron:   $([ "$ENABLE_MONITOR_CRON" = "1" ] && echo yes || echo no)"
   echo "  Auto-recovery cron:        $([ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ] && echo yes || echo no)"
@@ -1739,6 +1750,25 @@ map $host $bh_wm_host {
 }
 NGXHTTP
 
+  # ─ http-level: wp-login.php per-IP rate-limit zone ─
+  # Keyed on $binary_remote_addr (the REAL client — CWP already restores it from
+  # Cloudflare via set_real_ip_from). The map yields an EMPTY key for every URI
+  # except wp-login.php, and limit_req ignores empty keys — so ONLY wp-login is
+  # rate-limited, server-wide, with no per-location/upstream knowledge needed.
+  if [ "$APPLY_WP_EDGE_GUARD" = "1" ]; then
+    cat >> "$NGX_BH_D/00-anti-bot.conf" <<NGXWP
+
+# bh-wp-edge v1 — wp-login.php brute-force throttle (empty key elsewhere = not limited)
+map \$request_uri \$bh_wplogin_key {
+    default              "";
+    "~*/wp-login\\.php"   \$binary_remote_addr;
+}
+limit_req_zone \$bh_wplogin_key zone=bh_wplogin:10m rate=$WPLOGIN_RATE;
+limit_req_status 429;
+NGXWP
+    echo "✓ wp-login rate-limit zone added (rate=$WPLOGIN_RATE, real-IP keyed)"
+  fi
+
   # ─ server-level: the actual enforcement, included from each vhost ─
   # ONLY block-style rules — never try to "rate-limit then forward",
   # because we don't know the vhost's upstream from inside an include.
@@ -1764,6 +1794,21 @@ location ~* /(?:eval-stdin|wlwmanifest|adminer|phpunit|phpinfo)\.php$ { deny all
 # Survives CWP vhost rebuilds because this snippet is injected into the CWP nginx template.
 location ~* ^/(?:webmail|roundcube)(?:/|$) { return 301 https://webmail.$bh_wm_host/; }
 NGXSERVER
+
+  # ─ server-level: WordPress edge guard (wp-cron HTTP block + wp-login throttle) ─
+  # wp-cron.php: hard 444 over HTTP. Real wp-cron runs via php-CLI cron (not HTTP)
+  # so this only kills external bot abuse + per-visit loopback overhead — globally,
+  # no per-site config. wp-login.php: apply the rate-limit zone (empty key elsewhere
+  # → only wp-login is throttled; needs no upstream, so it's snippet-safe).
+  if [ "$APPLY_WP_EDGE_GUARD" = "1" ]; then
+    cat >> "$NGX_SNIPPETS/anti-bot-server.conf" <<NGXWPS
+
+# bh-wp-edge v1 — block wp-cron over HTTP (CLI crons unaffected) + throttle wp-login
+location = /wp-cron.php { deny all; access_log off; log_not_found off; return 444; }
+limit_req zone=bh_wplogin burst=$WPLOGIN_BURST nodelay;
+NGXWPS
+    echo "✓ wp-cron HTTP block + wp-login throttle (burst=$WPLOGIN_BURST) added to snippet"
+  fi
 
   echo "✓ wrote $NGX_BH_D/00-anti-bot.conf"
   echo "✓ wrote $NGX_SNIPPETS/anti-bot-server.conf"
