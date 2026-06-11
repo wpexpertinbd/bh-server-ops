@@ -54,6 +54,14 @@ TTFB_WARN_THRESHOLD="${TTFB_WARN_THRESHOLD:-10}"
 TTFB_RECOVER_THRESHOLD="${TTFB_RECOVER_THRESHOLD:-20}"
 APPLY_APACHE_HARDENING="${APPLY_APACHE_HARDENING:-1}"  # global hardening conf
 ENABLE_HTTP3="${ENABLE_HTTP3:-1}"            # 1 = swap nginx for codeit's QUIC-capable build + patch CWP templates
+# clamd (ClamAV daemon, used by amavis for mail AV) is a known resource hog:
+# spikes CPU (observed 167% / 1.6 cores) and leaks RAM (>1.3GB) during scans,
+# starving web/mysql. Cap it via a systemd drop-in. MemoryMax stays well above
+# the ~700MB-1GB signature-DB load peak so clamd never OOM-loops.
+APPLY_CLAMD_LIMITS="${APPLY_CLAMD_LIMITS:-1}"   # 1 = cap clamd CPU/RAM/IO (set 0 to skip)
+CLAMD_CPUQUOTA="${CLAMD_CPUQUOTA:-50%}"         # half a core hard cap
+CLAMD_MEMMAX="${CLAMD_MEMMAX:-1536M}"           # hard RAM cap (safe above DB-load peak)
+CLAMD_MEMHIGH="${CLAMD_MEMHIGH:-1024M}"         # soft throttle (cgroup v2 only; EL8 v1 ignores, harmless)
 # Space-separated IPs that bypass nginx anti-bot rules. Use this to allowlist
 # your other fleet servers (DNS slave, monitoring, Blesta, etc.) so server-
 # to-server API calls don't get caught by the bot filter. Example:
@@ -521,6 +529,7 @@ if [ "$INTERACTIVE" = "1" ]; then
   echo "  Redis cap:                 $([ "$APPLY_REDIS" = "1" ] && echo yes || echo no)"
   echo "  Apache global hardening:   $([ "$APPLY_APACHE_HARDENING" = "1" ] && echo yes || echo no)"
   echo "  HTTP/3 (codeit nginx):     $([ "$ENABLE_HTTP3" = "1" ] && echo yes || echo no)"
+  echo "  clamd resource cap:        $([ "$APPLY_CLAMD_LIMITS" = "1" ] && echo "yes (CPU $CLAMD_CPUQUOTA / RAM $CLAMD_MEMMAX)" || echo no)"
   echo "  Install helpers:           $([ "$INSTALL_HELPERS" = "1" ] && echo yes || echo no)"
   echo "  Saturation-monitor cron:   $([ "$ENABLE_MONITOR_CRON" = "1" ] && echo yes || echo no)"
   echo "  Auto-recovery cron:        $([ "$ENABLE_AUTO_RECOVERY_CRON" = "1" ] && echo yes || echo no)"
@@ -2085,6 +2094,54 @@ if [ "$APPLY_REDIS" = "1" ] && command -v redis-cli >/dev/null && systemctl is-a
   echo "✓ Redis: maxmemory $REDIS_MAX, allkeys-lru"
 else
   echo "⊘ Redis not running or skipped"
+fi
+
+# ────────────────────────────────────────────────
+# 7b. clamd resource cap (CPU/RAM/IO) — AV daemon is a known resource hog
+# ────────────────────────────────────────────────
+# clamd loads the full signature DB into RAM and spikes CPU + leaks RAM during
+# mail scans, starving web/mysql. Cap it via a systemd drop-in so it always
+# yields. Drop-in lives under /etc/systemd → survives CWP rebuilds (no re-assert
+# cron needed). Idempotent: only rewrites + restarts clamd if the cap changed.
+echo ""
+echo "─── [7b/10] clamd resource cap ───"
+if [ "$APPLY_CLAMD_LIMITS" = "1" ]; then
+  CLAMD_UNIT=$(systemctl list-units --type=service --all 2>/dev/null | grep -oiE 'clamd@?[a-z]*\.service' | head -1)
+  [ -z "$CLAMD_UNIT" ] && CLAMD_UNIT=$(systemctl list-unit-files 2>/dev/null | grep -oiE 'clamd@?[a-z]*\.service' | head -1)
+  if [ -z "$CLAMD_UNIT" ]; then
+    echo "⊘ no clamd unit on this box — skipping"
+  else
+    CLAMD_DROPDIR="/etc/systemd/system/${CLAMD_UNIT}.d"
+    CLAMD_DROPIN="$CLAMD_DROPDIR/bh-limits.conf"
+    mkdir -p "$CLAMD_DROPDIR"
+    CLAMD_NEWCONF=$(cat <<CONF
+# BH-CLAMD-LIMITS — cap clamd so it can't starve web/mysql/mail (resource hog, low value)
+[Service]
+CPUQuota=${CLAMD_CPUQUOTA}
+MemoryMax=${CLAMD_MEMMAX}
+MemoryHigh=${CLAMD_MEMHIGH}
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=20
+# END BH-CLAMD-LIMITS
+CONF
+)
+    if [ -f "$CLAMD_DROPIN" ] && [ "$(cat "$CLAMD_DROPIN")" = "$CLAMD_NEWCONF" ]; then
+      echo "✓ clamd limits already applied ($CLAMD_UNIT: CPU $CLAMD_CPUQUOTA / RAM $CLAMD_MEMMAX) — unchanged"
+    else
+      echo "$CLAMD_NEWCONF" > "$CLAMD_DROPIN"
+      systemctl daemon-reload
+      systemctl restart "$CLAMD_UNIT" 2>/dev/null
+      sleep 2
+      if systemctl is-active --quiet "$CLAMD_UNIT"; then
+        echo "✓ clamd capped ($CLAMD_UNIT): CPU $CLAMD_CPUQUOTA, MemoryMax $CLAMD_MEMMAX, idle IO, Nice 15"
+      else
+        echo "⚠ $CLAMD_UNIT didn't restart cleanly after cap — raise CLAMD_MEMMAX and re-run; check: systemctl status $CLAMD_UNIT"
+      fi
+    fi
+  fi
+else
+  echo "⊘ clamd resource cap skipped (set APPLY_CLAMD_LIMITS=1 to enable)"
 fi
 
 # ────────────────────────────────────────────────
