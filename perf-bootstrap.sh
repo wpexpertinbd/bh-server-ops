@@ -53,6 +53,12 @@ MONITOR_SITES="${MONITOR_SITES:-}"           # auto-discover if empty
 TTFB_WARN_THRESHOLD="${TTFB_WARN_THRESHOLD:-10}"
 TTFB_RECOVER_THRESHOLD="${TTFB_RECOVER_THRESHOLD:-20}"
 APPLY_APACHE_HARDENING="${APPLY_APACHE_HARDENING:-1}"  # global hardening conf
+# CWP ships an ancient Monsta FTP 1.4.5 web file-manager at htdocs/webftp_simple,
+# Alias'd to /webftp /WebFTP /webftp_simple on EVERY domain — unmaintained,
+# broken (HTTP 500), publicly exposed attack surface (Monsta's 2.x line took the
+# 9.3 RCE CVE-2025-34299). Remove the files AND deny the URLs so a CWP rebuild
+# can't silently re-expose it. Clients have CWP's own File Manager + SFTP.
+APPLY_REMOVE_WEBFTP="${APPLY_REMOVE_WEBFTP:-1}"  # 1 = remove + permanently deny CWP webftp
 ENABLE_HTTP3="${ENABLE_HTTP3:-1}"            # 1 = swap nginx for codeit's QUIC-capable build + patch CWP templates
 # clamd (ClamAV daemon, used by amavis for mail AV) is a known resource hog:
 # spikes CPU (observed 167% / 1.6 cores) and leaks RAM (>1.3GB) during scans,
@@ -546,6 +552,7 @@ if [ "$INTERACTIVE" = "1" ]; then
   echo "  Apache MPM tuning:         $([ "$APPLY_APACHE_MPM" = "1" ] && echo yes || echo no)"
   echo "  Redis cap:                 $([ "$APPLY_REDIS" = "1" ] && echo yes || echo no)"
   echo "  Apache global hardening:   $([ "$APPLY_APACHE_HARDENING" = "1" ] && echo yes || echo no)"
+  echo "  Remove exposed webftp:     $([ "$APPLY_REMOVE_WEBFTP" = "1" ] && echo yes || echo no)"
   echo "  HTTP/3 (codeit nginx):     $([ "$ENABLE_HTTP3" = "1" ] && echo yes || echo no)"
   echo "  clamd resource cap:        $([ "$APPLY_CLAMD_LIMITS" = "1" ] && echo "yes (CPU $CLAMD_CPUQUOTA / RAM $CLAMD_MEMMAX)" || echo no)"
   echo "  tmp_bak janitor cron:      $([ "$APPLY_TMPBAK_JANITOR" = "1" ] && echo "yes (every ${TMPBAK_JANITOR_INTERVAL}min)" || echo no)"
@@ -2464,6 +2471,42 @@ HTTPDEOF
   fi
 else
   echo "⊘ Apache hardening skipped"
+fi
+
+# ────────────────────────────────────────────────
+# 9b. Remove CWP's exposed legacy webftp (Monsta) + permanently deny it
+# ────────────────────────────────────────────────
+echo ""
+echo "─── [9b/10] Remove exposed CWP webftp ───"
+if [ "$APPLY_REMOVE_WEBFTP" = "1" ]; then
+  WEBFTP_DIR=/usr/local/apache/htdocs/webftp_simple
+  webftp_state="absent"
+  if [ -d "$WEBFTP_DIR" ]; then rm -rf "$WEBFTP_DIR" && webftp_state="deleted"; fi
+  # Permanent deny — fires on every vhost even if CWP recreates the files/alias.
+  if [ -d /usr/local/apache/conf.d ]; then
+    cat > /usr/local/apache/conf.d/00-bh-block-webftp.conf <<'CONF'
+# BH-BLOCK-WEBFTP — legacy CWP Monsta webftp removed; keep its URLs denied so a
+# CWP rebuild can't silently re-expose it. Returns 403 on every vhost.
+<LocationMatch "(?i)^/webftp(_simple)?(/|$)">
+    Require all denied
+</LocationMatch>
+# END BH-BLOCK-WEBFTP
+CONF
+  fi
+  # Comment the CWP Alias lines (the deny covers it regardless, but keep tidy).
+  DR=/usr/local/apache/conf.d/domain-redirects.conf
+  if [ -f "$DR" ] && grep -qE '^[[:space:]]*Alias[[:space:]]+/(webftp|WebFTP|webftp_simple)\b' "$DR"; then
+    cp -a "$DR" "$DR.bak-pre-webftp" 2>/dev/null
+    sed -i -E 's#^([[:space:]]*Alias[[:space:]]+/(webftp|WebFTP|webftp_simple)\b.*)#\# bh-removed-webftp \1#' "$DR"
+  fi
+  if [ -n "$APACHE_BIN" ] && "$APACHE_BIN" -t >/dev/null 2>&1; then
+    systemctl reload "${APACHE_SERVICE:-httpd}" 2>/dev/null
+    echo "✓ webftp $webftp_state + /webftp* denied (403) + aliases commented"
+  else
+    echo "⚠ apache config test FAILED after webftp removal — review $DR / 00-bh-block-webftp.conf"
+  fi
+else
+  echo "⊘ webftp removal skipped (set APPLY_REMOVE_WEBFTP=1 to enable)"
 fi
 
 
