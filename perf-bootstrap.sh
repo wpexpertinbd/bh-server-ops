@@ -2598,23 +2598,53 @@ THRESHOLD=$TTFB_RECOVER_THRESHOLD
 SITES="$MONITOR_SITES"
 LOG=/var/log/auto-recovery.log
 
-# ── Self-heal: anti-bot maps wiped from /etc/nginx/bh.d/? ──
-# If the vhost-included snippet references \$bh_bad_bot / \$bh_trusted_ip but
-# the map files defining them are gone, nginx will refuse to start on the next
-# restart. Restore from snapshot if missing.
-if [ -f /etc/nginx/snippets/anti-bot-server.conf ] && [ -d /var/lib/bh-server-ops ]; then
+# ── Self-heal: anti-bot maps OR the nginx.conf bh.d include wiped? ──
+# CWP "Rebuild Web Server" (admin → WebServer Settings) regenerates nginx.conf
+# from its template — silently DROPPING our 'include /etc/nginx/bh.d/*.conf;'
+# line — and can also wipe conf.d/. Either way the vhost-included snippet still
+# references \$bh_bad_bot / \$bh_trusted_ip but the defining map is no longer
+# loaded → nginx refuses to start ("unknown bh_bad_bot variable") on the next
+# reload. Restore BOTH the include line and the map files, then reload — or
+# start nginx if the rebuild already left it down.
+if [ -f /etc/nginx/snippets/anti-bot-server.conf ]; then
     HEALED=0
     mkdir -p /etc/nginx/bh.d
-    for F in 00-anti-bot.conf 00-trusted-ips.conf; do
-        if [ -f /var/lib/bh-server-ops/\$F ] && [ ! -f /etc/nginx/bh.d/\$F ]; then
-            cp /var/lib/bh-server-ops/\$F /etc/nginx/bh.d/\$F
-            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Healed missing /etc/nginx/bh.d/\$F" >> \$LOG
-            HEALED=1
+    # 1) map files — restore from snapshot if a CWP/yum action removed them
+    if [ -d /var/lib/bh-server-ops ]; then
+        for F in 00-anti-bot.conf 00-trusted-ips.conf; do
+            if [ -f /var/lib/bh-server-ops/\$F ] && [ ! -f /etc/nginx/bh.d/\$F ]; then
+                cp /var/lib/bh-server-ops/\$F /etc/nginx/bh.d/\$F
+                echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Healed missing /etc/nginx/bh.d/\$F" >> \$LOG
+                HEALED=1
+            fi
+        done
+    fi
+    # 2) the http-level include in nginx.conf (CWP rebuild strips this)
+    NGXMAIN=/etc/nginx/nginx.conf
+    [ -f /usr/local/nginx/conf/nginx.conf ] && [ ! -f \$NGXMAIN ] && NGXMAIN=/usr/local/nginx/conf/nginx.conf
+    if [ -f \$NGXMAIN ] && ! grep -qF "include /etc/nginx/bh.d/" \$NGXMAIN; then
+        cp -a \$NGXMAIN \$NGXMAIN.bak-bhguard 2>/dev/null
+        if grep -qF "include /etc/nginx/conf.d/*.conf;" \$NGXMAIN; then
+            # insert before the conf.d include so maps load before vhosts
+            awk '/include \/etc\/nginx\/conf\.d\/\*\.conf;/ && !d {print "    include /etc/nginx/bh.d/*.conf;"; d=1} {print}' \$NGXMAIN > \$NGXMAIN.bhtmp
+        else
+            # fallback: drop it right after the http{ opening brace
+            awk '/^[[:space:]]*http[[:space:]]*\{/ && !d {print; print "    include /etc/nginx/bh.d/*.conf;"; d=1; next} {print}' \$NGXMAIN > \$NGXMAIN.bhtmp
         fi
-    done
+        if grep -qF "include /etc/nginx/bh.d/" \$NGXMAIN.bhtmp; then
+            mv \$NGXMAIN.bhtmp \$NGXMAIN
+            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Healed missing bh.d include in \$NGXMAIN (CWP rebuild)" >> \$LOG
+            HEALED=1
+        else
+            rm -f \$NGXMAIN.bhtmp
+        fi
+    fi
     if [ "\$HEALED" = "1" ] && command -v nginx >/dev/null 2>&1; then
-        nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null \
-            && echo "[\$(date '+%Y-%m-%d %H:%M:%S')] nginx reloaded after self-heal" >> \$LOG
+        if nginx -t >/dev/null 2>&1; then
+            # reload if running; start/restart if the rebuild left nginx down
+            systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null
+            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] nginx reloaded/started after self-heal" >> \$LOG
+        fi
     fi
 fi
 

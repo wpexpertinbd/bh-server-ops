@@ -304,7 +304,12 @@ tail -20 /var/log/saturation.log
 Cron runs every 3 minutes. Two responsibilities:
 
 **Self-heal (always runs first, no threshold):**
-If `/etc/nginx/snippets/anti-bot-server.conf` exists but either of the http-level maps in `/etc/nginx/bh.d/` is missing, the maps are restored from the snapshot at `/var/lib/bh-server-ops/` and nginx is reloaded. Bounds the worst-case "nginx down because something wiped a conf file" outage to 3 minutes. (The snippet references `$bh_bad_bot` / `$bh_trusted_ip` — if those maps disappear, nginx refuses to start. CWP regen and `yum reinstall nginx` have both been observed wiping `/etc/nginx/conf.d/`, which is why the maps live in `bh.d/` now and are also snapshotted.)
+If `/etc/nginx/snippets/anti-bot-server.conf` exists, the cron repairs two things that a **CWP "Rebuild Web Server"** (admin → WebServer Settings) is known to break, then reloads nginx — or **starts** it if the rebuild already left it down:
+
+1. **The map files** in `/etc/nginx/bh.d/` — if either is missing, it's restored from the snapshot at `/var/lib/bh-server-ops/`.
+2. **The `include /etc/nginx/bh.d/*.conf;` line in `nginx.conf`** — a CWP rebuild regenerates `nginx.conf` from its template and silently drops this line. The map files survive (they're in `bh.d/`, outside `conf.d/`), but with the include gone they're never loaded, so the per-vhost snippet's reference to `$bh_bad_bot` / `$bh_trusted_ip` becomes an `unknown "bh_bad_bot" variable` `[emerg]` and **nginx refuses to start on the next reload**. The cron re-inserts the line (before the `conf.d` include) and brings nginx back up.
+
+Bounds the worst-case "nginx down after a CWP rebuild" outage to one cron interval. (CWP regen and `yum reinstall nginx` have both been observed wiping `/etc/nginx/conf.d/`, which is why the maps live in `bh.d/` — and the include line is now self-healed too, since the rebuild strips it from `nginx.conf` itself.)
 
 **TTFB recovery (fires on threshold breach):**
 If TTFB exceeds recovery threshold (default 20s):
@@ -438,7 +443,7 @@ crontab -l | grep -v 'saturation-monitor\|auto-recovery' | crontab -
 | `/etc/nginx/bh.d/00-trusted-ips.conf` | http-level allowlist (`$bh_trusted_ip`) | ✅ custom dir, untouched by package mgr |
 | `/etc/nginx/snippets/anti-bot-server.conf` | server-level enforcement, `include`d by every vhost | ✅ |
 | `/etc/nginx/conf.d/01-access-log.conf` | slim access log so bot floods are visible | ⚠️ in conf.d/, may be wiped by package update |
-| `/etc/nginx/nginx.conf` | gets one `include /etc/nginx/bh.d/*.conf;` line added (idempotent) | ✅ usually preserved as `.rpmsave` on reinstall |
+| `/etc/nginx/nginx.conf` | gets one `include /etc/nginx/bh.d/*.conf;` line added (idempotent) | ⚠️ **CWP "Rebuild Web Server" regenerates this file and drops the line** → self-healed by the `auto-recovery` cron |
 | `/var/lib/bh-server-ops/` | snapshot copy of the bh.d maps for `auto-recovery` self-heal | ✅ |
 | `/usr/local/apache/conf/extra/httpd-mpm.conf` | RAM-tier MPM config | ✅ frozen with `chattr +i` after edit |
 | `/etc/sysctl.d/99-bh-tune.conf` | kernel tuning | ✅ |
