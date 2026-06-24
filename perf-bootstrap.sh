@@ -1498,6 +1498,64 @@ else
 fi
 
 # ────────────────────────────────────────────────
+# 6h. ModSecurity request-body limit (large WP-admin / Elementor / Gutenberg saves)
+# ────────────────────────────────────────────────
+# Apache mod_security2 defaults SecRequestBodyNoFilesLimit to 128 KB. A
+# WordPress/Elementor/Gutenberg "save" POSTs the entire page as one JSON body;
+# once it crosses 128 KB, ModSecurity rejects the body → PHP receives a
+# truncated request → mangled FastCGI response (the classic
+# 'AH01071: Got error PHP message: ooo' + 'ModSecurity: Request body no files
+# data length is larger than the configured limit') → the editor reports a
+# save failure. Tell-tale symptom: "save works with 1-2 widgets, fails at 3"
+# (the extra element tips the JSON over 128 KB). Raise the no-files limit to
+# 64 MB and never hard-reject an over-size admin save — ProcessPartial scans
+# the bulk and lets the remainder through. Server-wide (phase-1 directive),
+# so it fixes every WP/admin site on the box at once.
+echo ""
+echo "─── [6h/10] ModSecurity request-body limit ───"
+MODSEC_NOFILES_LIMIT="${MODSEC_NOFILES_LIMIT:-67108864}"    # 64 MB  — form/JSON POSTs (was 128 KB default)
+MODSEC_BODY_LIMIT="${MODSEC_BODY_LIMIT:-134217728}"         # 128 MB — POSTs that include file uploads
+if [ "$HAS_MODSEC" = 1 ] && [ -n "$APACHE_BIN" ]; then
+  # Locate the Apache mod_security2 conf that turns the engine on.
+  MSF=""
+  for C in /usr/local/apache/conf.d/mod_security.conf \
+           /etc/httpd/conf.d/mod_security.conf \
+           /usr/local/apache/conf.d/*.conf /etc/httpd/conf.d/*.conf; do
+    [ -f "$C" ] || continue
+    if grep -qE '^[[:space:]]*(SecRequestBodyAccess|SecRuleEngine)' "$C" 2>/dev/null; then MSF="$C"; break; fi
+  done
+  if [ -z "$MSF" ]; then
+    echo "⊘ mod_security active but no editable conf with SecRuleEngine/SecRequestBodyAccess found — skipping"
+  else
+    cp -a "$MSF" "${MSF}.bh-bak.$(date +%s)" 2>/dev/null
+    # Anchor new directives just after SecRequestBodyAccess (inside <IfModule mod_security2.c>).
+    ANCHOR=$(grep -nE '^[[:space:]]*SecRequestBodyAccess' "$MSF" | head -1 | cut -d: -f1)
+    [ -z "$ANCHOR" ] && ANCHOR=$(grep -nE '^[[:space:]]*SecRuleEngine' "$MSF" | head -1 | cut -d: -f1)
+    bh_set_modsec_directive() {   # $1=directive  $2=value
+      if grep -qE "^[[:space:]]*$1([[:space:]]|\$)" "$MSF"; then
+        sed -i -E "s|^[[:space:]]*$1[[:space:]].*|    $1 $2|" "$MSF"          # update in place (no line shift)
+      elif [ -n "$ANCHOR" ]; then
+        sed -i "${ANCHOR}a\\    $1 $2" "$MSF"                                  # insert below anchor
+        ANCHOR=$((ANCHOR + 1))
+      fi
+    }
+    bh_set_modsec_directive SecRequestBodyLimit        "$MODSEC_BODY_LIMIT"
+    bh_set_modsec_directive SecRequestBodyNoFilesLimit "$MODSEC_NOFILES_LIMIT"
+    bh_set_modsec_directive SecRequestBodyLimitAction  "ProcessPartial"
+    if "$APACHE_BIN" -t >/dev/null 2>&1; then
+      echo "✓ ModSecurity body limits set in $MSF"
+      echo "    NoFiles=$MODSEC_NOFILES_LIMIT  Body=$MODSEC_BODY_LIMIT  Action=ProcessPartial (reload happens in [8/10])"
+    else
+      LAST_BAK=$(ls -t "${MSF}.bh-bak."* 2>/dev/null | head -1)
+      [ -n "$LAST_BAK" ] && cp -a "$LAST_BAK" "$MSF"
+      echo "⚠ httpd -t failed after edit — reverted $MSF, no change applied"
+    fi
+  fi
+else
+  echo "⊘ mod_security / Apache not detected — skipping"
+fi
+
+# ────────────────────────────────────────────────
 # 5b. Apache mod_status visibility + bad-watchdog detector
 # ────────────────────────────────────────────────
 # Without /server-status reachable on the Apache backend port, future
