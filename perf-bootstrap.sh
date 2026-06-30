@@ -1556,6 +1556,60 @@ else
 fi
 
 # ────────────────────────────────────────────────
+# 6i. REST API write methods (PUT/DELETE/PATCH) — WooCommerce/WP REST,
+#     courier & fulfilment integrations, mobile apps, headless, webhooks
+# ────────────────────────────────────────────────
+# Stock Apache/CWP ships conf/extra/httpd-userdir.conf with
+#   <Directory "/home/*/public_html"> Require method GET POST OPTIONS </Directory>
+# which DENIES PUT/DELETE/PATCH server-wide (authz_core "AH01630: client denied
+# by server configuration"). WordPress/WooCommerce REST API uses PUT (update) and
+# DELETE — so any integration that WRITES back (couriers like ecomdrive, Zapier,
+# mobile apps, headless front-ends, payment/webhook callbacks) gets a 403 while
+# reads (GET) work fine. Tell-tale: "connection test OK / GET works but order sync
+# or status write-back fails with 403". Safe to allow because mod_dav is disabled
+# (httpd-dav.conf stays #Include'd) — these methods simply reach PHP/WordPress;
+# Apache never treats PUT as a filesystem write. Also mirror the methods into the
+# COMODO CWAF method whitelist (rule id 210700) so the WAF policy agrees. Edits
+# are validated with httpd -t (auto-revert on failure); reload happens in [8/10].
+echo ""
+echo "─── [6i/10] REST API write methods (PUT/DELETE/PATCH) ───"
+if [ -n "$APACHE_BIN" ]; then
+  UDF=""
+  for C in /usr/local/apache/conf/extra/httpd-userdir.conf \
+           /etc/httpd/conf/extra/httpd-userdir.conf \
+           /etc/httpd/conf.d/userdir.conf \
+           /etc/apache2/mods-available/userdir.conf; do
+    [ -f "$C" ] && grep -qE '^[[:space:]]*Require method[[:space:]]' "$C" 2>/dev/null && { UDF="$C"; break; }
+  done
+  if [ -n "$UDF" ] && grep -qE '^[[:space:]]*Require method[[:space:]]+GET[[:space:]]+POST[[:space:]]+OPTIONS[[:space:]]*$' "$UDF"; then
+    cp -a "$UDF" "${UDF}.bh-bak.$(date +%s)" 2>/dev/null
+    sed -i -E 's|^([[:space:]]*Require method)[[:space:]]+GET[[:space:]]+POST[[:space:]]+OPTIONS[[:space:]]*$|\1 GET POST OPTIONS HEAD PUT DELETE PATCH|' "$UDF"
+    if "$APACHE_BIN" -t >/dev/null 2>&1; then
+      echo "✓ REST write methods enabled in $UDF (reload happens in [8/10])"
+    else
+      LAST_BAK=$(ls -t "${UDF}.bh-bak."* 2>/dev/null | head -1)
+      [ -n "$LAST_BAK" ] && cp -a "$LAST_BAK" "$UDF"
+      echo "⚠ httpd -t failed after edit — reverted $UDF, no change applied"
+    fi
+  elif [ -n "$UDF" ]; then
+    echo "✓ httpd-userdir already allows REST methods (or customized) — $UDF"
+  else
+    echo "⊘ no httpd-userdir.conf with a 'Require method' allowlist found — skipping"
+  fi
+  # Mirror into COMODO CWAF method whitelist (id 210700 references this file) so
+  # the WAF policy agrees. The file commonly ships WITHOUT a trailing newline —
+  # guard it before appending or the first method joins the last line (PROPFINDPUT).
+  WL=/usr/local/apache/modsecurity-cwaf/rules/userdata_wl_methods
+  if [ "$HAS_MODSEC" = 1 ] && [ -f "$WL" ]; then
+    [ -n "$(tail -c1 "$WL" 2>/dev/null)" ] && printf '\n' >> "$WL"   # ensure trailing newline
+    for m in PUT DELETE PATCH; do grep -qxF "$m" "$WL" || printf '%s\n' "$m" >> "$WL"; done
+    echo "✓ CWAF method whitelist includes PUT/DELETE/PATCH ($WL)"
+  fi
+else
+  echo "⊘ Apache not detected — skipping"
+fi
+
+# ────────────────────────────────────────────────
 # 5b. Apache mod_status visibility + bad-watchdog detector
 # ────────────────────────────────────────────────
 # Without /server-status reachable on the Apache backend port, future
