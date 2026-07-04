@@ -429,7 +429,7 @@ if [ "$MODE" = "rollback" ]; then
 
   # Remove our drop-in OPcache + sysctl + hardening
   for INI_DIR in "${PHP_INI_DIRS[@]}"; do
-    rm -f "$INI_DIR/99-opcache-tuned.ini"
+    rm -f "$INI_DIR/99-opcache-tuned.ini" "$INI_DIR/zz-opcache-tuned.ini"
   done
   rm -f /etc/sysctl.d/99-performance.conf
 
@@ -633,14 +633,20 @@ if [ ${#PHP_INI_DIRS[@]} -eq 0 ]; then
   echo "⊘ No PHP ini directories detected — skipping"
 else
   for INI_DIR in "${PHP_INI_DIRS[@]}"; do
-    cat > "$INI_DIR/99-opcache-tuned.ini" <<EOF
+    # ⚠ Filename MUST sort AFTER the stock alt-php "opcache.ini". PHP parses the
+    # scan dir ALPHABETICALLY and the LAST file wins. "99-*" (digit) sorts BEFORE
+    # "opcache.ini" (letter) → our tune was silently overridden by the stock
+    # 128 MB defaults on every alt-php version. "zz-*" sorts after → it applies.
+    rm -f "$INI_DIR/99-opcache-tuned.ini"   # drop the old ineffective name
+    cat > "$INI_DIR/zz-opcache-tuned.ini" <<EOF
 ; Bootstrap OPcache tune (auto-scaled to ${TARGET_RAM_GB}GB RAM)
 opcache.memory_consumption=${OPCACHE_MB}
 opcache.max_accelerated_files=${OPCACHE_FILES}
 opcache.interned_strings_buffer=${INTERNED_MB}
 opcache.revalidate_freq=60
+opcache.validate_timestamps=1
 EOF
-    echo "✓ $INI_DIR/99-opcache-tuned.ini  (${OPCACHE_MB}MB / ${OPCACHE_FILES} files)"
+    echo "✓ $INI_DIR/zz-opcache-tuned.ini  (${OPCACHE_MB}MB / ${OPCACHE_FILES} files)"
   done
 fi
 
