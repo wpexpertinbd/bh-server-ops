@@ -161,6 +161,14 @@ else                                       # tiny VPS (1-3 GB)
   REDIS_MAX=128mb
 fi
 
+# OPcache floor (boss directive 2026-07-04): every PHP version gets at least
+# 256 MB / 20000 files / 16 MB interned (busy WP/Woo sites were hitting the
+# 128 MB default full at ~31% hit rate). Higher-RAM tiers keep their bigger
+# 384/512 MB values; only sub-256 tiers (≤16 GB) are lifted to 256.
+if [ "${OPCACHE_MB:-0}" -lt 256 ]; then
+  OPCACHE_MB=256; OPCACHE_FILES=20000; INTERNED_MB=16
+fi
+
 # ────────────────────────────────────────────────
 # 3-TIER FPM SIZING — derive MEDIUM + LIGHT from HEAVY_CHILDREN
 # ────────────────────────────────────────────────
