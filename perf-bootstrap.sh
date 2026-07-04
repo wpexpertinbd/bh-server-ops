@@ -659,6 +659,33 @@ EOF
 fi
 
 # ────────────────────────────────────────────────
+# 2c. CSF: exclude php-fpm from process-tracking (VSZ false alarms)
+# ────────────────────────────────────────────────
+# CSF's PT_USERMEM alerts on a process's VIRTUAL memory (VSZ). php-fpm workers
+# legitimately carry a huge VSZ — the OPcache SHM (256 MB above) + shared libs
+# are all mmap'd in — while real RSS stays ~40-80 MB. So lfd fires endless
+# "Virtual Memory Size Exceeded" emails on perfectly healthy pools (and the
+# OPcache bump makes it worse). CWP ships php-fpm exclusions but never adds NEW
+# versions — php-fpm84/85 from cwp-custom-php were missing on the fleet → alerts.
+# Add every installed alt-php + cwp php-fpm exe to csf.pignore so php-fpm is
+# never process-tracked. Idempotent; reload lfd only (it reads csf.pignore).
+if [ "$HAS_CSF" = 1 ] && [ -f /etc/csf/csf.pignore ]; then
+  echo ""
+  echo "─── CSF: exclude php-fpm from process-tracking (VSZ false alarms) ───"
+  PIG=/etc/csf/csf.pignore; pig_added=0
+  for f in /opt/alt/php-fpm*/usr/sbin/php-fpm /usr/local/cwp/php*/sbin/php-fpm; do
+    [ -x "$f" ] || continue
+    grep -qxF "exe:$f" "$PIG" 2>/dev/null || { echo "exe:$f" >> "$PIG"; pig_added=$((pig_added+1)); }
+  done
+  if [ "$pig_added" -gt 0 ]; then
+    csf --lfd restart >/dev/null 2>&1 || csf -ra >/dev/null 2>&1   # lfd reload needed; --lfd restart avoids a firewall reload
+    echo "✓ added $pig_added php-fpm exclusion(s) to csf.pignore + reloaded lfd"
+  else
+    echo "✓ all installed php-fpm versions already excluded from PT tracking"
+  fi
+fi
+
+# ────────────────────────────────────────────────
 # 3. Per-user FPM pool tuning + request_terminate_timeout
 # ────────────────────────────────────────────────
 echo ""
