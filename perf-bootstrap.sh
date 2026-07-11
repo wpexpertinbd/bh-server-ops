@@ -172,18 +172,24 @@ fi
 # ────────────────────────────────────────────────
 # 3-TIER FPM SIZING — derive MEDIUM + LIGHT from HEAVY_CHILDREN
 # ────────────────────────────────────────────────
-# Tiering policy (2026-06-07): only real PHP frameworks (Laravel/CodeIgniter/
-# Symfony) get the FULL heavy pool. CMS/cart apps (WordPress/WooCommerce/
-# OpenCart/Magento) are MEDIUM = 50% of heavy. Static/basic sites are
-# LIGHT = 25% of heavy. This stops the old behaviour where Woo/OpenCart/big-DB
-# swept almost every tenant into the heavy pool and exhausted server RAM.
+# Tiering policy: only real PHP frameworks (Laravel/CodeIgniter/Symfony) get
+# the FULL heavy pool. CMS/cart apps (WordPress/WooCommerce/OpenCart/Magento)
+# are MEDIUM. Static/basic sites are LIGHT.
+#
+# Ratios (2026-07-11): bumped MEDIUM 50% → 75% of HEAVY after production
+# evidence that busy WooCommerce sites (136k hits/hour on s4) needed manual
+# heavy promotion just to serve real customer + admin traffic concurrently.
+# At 75%, a MEDIUM WordPress tenant naturally gets enough workers to absorb
+# admin activity during peak customer traffic without queuing. On 64GB s4
+# this means MEDIUM=15 (was 10) — enough for a busy WooCommerce store.
+# LIGHT stays at 25% (static sites don't need concurrency).
 #
 # These supersede any LIGHT_CHILDREN set in the RAM-tier table above — the
-# value is always derived from HEAVY_CHILDREN so the 50%/25% ratio holds on
-# every box size. Floors keep small VPS usable (never CWP's too-low defaults):
+# value is always derived from HEAVY_CHILDREN so ratios hold on every box.
+# Floors keep small VPS usable (never CWP's too-low defaults):
 #   MEDIUM floor 3, LIGHT floor 2.
-MEDIUM_CHILDREN=$(( HEAVY_CHILDREN / 2 )); [ "$MEDIUM_CHILDREN" -lt 3 ] && MEDIUM_CHILDREN=3
-LIGHT_CHILDREN=$(( HEAVY_CHILDREN / 4 ));  [ "$LIGHT_CHILDREN"  -lt 2 ] && LIGHT_CHILDREN=2
+MEDIUM_CHILDREN=$(( HEAVY_CHILDREN * 3 / 4 )); [ "$MEDIUM_CHILDREN" -lt 3 ] && MEDIUM_CHILDREN=3
+LIGHT_CHILDREN=$(( HEAVY_CHILDREN / 4 ));      [ "$LIGHT_CHILDREN"  -lt 2 ] && LIGHT_CHILDREN=2
 
 # Detect interactive TTY
 INTERACTIVE=0
@@ -839,8 +845,9 @@ CONF=/var/lib/bh-server-ops/fpm-config
 . "$CONF"
 [ -n "$HEAVY_CHILDREN" ] || exit 0
 # Back-compat: derive medium if an old fpm-config (pre-3-tier) lacks it.
-[ -n "$MEDIUM_CHILDREN" ] || { MEDIUM_CHILDREN=$(( HEAVY_CHILDREN / 2 )); [ "$MEDIUM_CHILDREN" -lt 3 ] && MEDIUM_CHILDREN=3; }
-[ -n "$LIGHT_CHILDREN" ]  || { LIGHT_CHILDREN=$(( HEAVY_CHILDREN / 4 ));  [ "$LIGHT_CHILDREN"  -lt 2 ] && LIGHT_CHILDREN=2; }
+# Ratio must mirror perf-bootstrap.sh: MEDIUM=75% (was 50%), LIGHT=25%.
+[ -n "$MEDIUM_CHILDREN" ] || { MEDIUM_CHILDREN=$(( HEAVY_CHILDREN * 3 / 4 )); [ "$MEDIUM_CHILDREN" -lt 3 ] && MEDIUM_CHILDREN=3; }
+[ -n "$LIGHT_CHILDREN" ]  || { LIGHT_CHILDREN=$(( HEAVY_CHILDREN / 4 ));      [ "$LIGHT_CHILDREN"  -lt 2 ] && LIGHT_CHILDREN=2; }
 SKIP_USERS="${SKIP_USERS:-nobody}"
 
 START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2

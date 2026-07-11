@@ -206,7 +206,7 @@ When stdin isn't a TTY (e.g. `curl ... | bash`) or you pass `-y`, the script use
 | Tier | Detected apps | pm mode | `pm.max_children` |
 |------|---------------|---------|-------------------|
 | **HEAVY** | Laravel (`artisan`), CodeIgniter (`spark` / `system/core/CodeIgniter.php`), Symfony (`config/bundles.php`) | `dynamic` (warm pool + spares) | `HEAVY_CHILDREN` (100%) |
-| **MEDIUM** | WordPress (`wp-load.php`/`wp-config.php`), WooCommerce, OpenCart, Magento | `ondemand` | 50% of heavy (floor 3) |
+| **MEDIUM** | WordPress (`wp-load.php`/`wp-config.php`), WooCommerce, OpenCart, Magento | `ondemand` | 75% of heavy (floor 3) |
 | **LIGHT** | everything else (static HTML / basic PHP) | `ondemand` | 25% of heavy (floor 2) |
 
 This replaces the old 2-tier model where WooCommerce/OpenCart/big-DB swept almost every tenant into the heavy pool and exhausted RAM. Sizes derive from `HEAVY_CHILDREN` per RAM tier — never CWP's low built-in pool defaults. Override detection per tenant with `HEAVY_USERS="u1 u2"` / `MEDIUM_USERS="u3"` / `SKIP_USERS="u4"` env vars (no env needed for normal auto-detect):
@@ -353,17 +353,17 @@ Every memory-hungry setting (Apache MPM, FPM children, OPcache, Redis) auto-scal
 
 Thresholds are intentionally a few GB below the nominal class — `/proc/meminfo` always reports less than installed (kernel + firmware reserve ~2 GB on big boxes, ~1 GB on small VPS). 64 GB box reports ~62 GB, 128 GB reports ~125, etc.
 
-FPM children scale off `HEAVY_CHILDREN` per tier: **light = 25%** (floor 2), **medium = 50%** (floor 3), **heavy = 100%**.
+FPM children scale off `HEAVY_CHILDREN` per tier: **light = 25%** (floor 2), **medium = 75%** (floor 3), **heavy = 100%**.
 
 | Detected RAM | Apache MaxWorkers | FPM children (light/medium/heavy) | OPcache | Redis cap |
 |---|---|---|---|---|
-| **≥ 240 GB** (256 GB-class) | **5000 (100×50)** | **7 / 15 / 30** | **512 MB** | **8 GB** |
-| **≥ 120 GB** (128 GB-class) | **3200 (64×50)** | **6 / 12 / 25** | **384 MB** | **4 GB** |
-| ≥ 60 GB (64 GB-class) | 1600 (32×50) | 5 / 10 / 20 | 256 MB | 2 GB |
-| ≥ 30 GB (32 GB-class) | 800 (16×50) | 5 / 10 / 20 | 256 MB | 1 GB |
-| ≥ 14 GB (16 GB-class) | 400 (8×50) | 3 / 7 / 15 | 192 MB | 512 MB |
-| ≥ 7 GB (8 GB-class) | 200 (5×40) | 3 / 6 / 12 | 128 MB | 384 MB |
-| ≥ 3 GB (4 GB-class) | 100 (4×25) | 2 / 4 / 8 | 96 MB | 256 MB |
+| **≥ 240 GB** (256 GB-class) | **5000 (100×50)** | **7 / 22 / 30** | **512 MB** | **8 GB** |
+| **≥ 120 GB** (128 GB-class) | **3200 (64×50)** | **6 / 18 / 25** | **384 MB** | **4 GB** |
+| ≥ 60 GB (64 GB-class) | 1600 (32×50) | 5 / 15 / 20 | 256 MB | 2 GB |
+| ≥ 30 GB (32 GB-class) | 800 (16×50) | 5 / 15 / 20 | 256 MB | 1 GB |
+| ≥ 14 GB (16 GB-class) | 400 (8×50) | 3 / 11 / 15 | 192 MB | 512 MB |
+| ≥ 7 GB (8 GB-class) | 200 (5×40) | 3 / 9 / 12 | 128 MB | 384 MB |
+| ≥ 3 GB (4 GB-class) | 100 (4×25) | 2 / 6 / 8 | 96 MB | 256 MB |
 | < 3 GB (1-2 GB VPS) | 50 (2×25) | 2 / 3 / 5 | 64 MB | 128 MB |
 
 Total baseline (Apache workers + OPcache + Redis):
