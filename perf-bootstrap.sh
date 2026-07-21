@@ -475,8 +475,8 @@ if [ "$MODE" = "rollback" ]; then
   echo "✓ Removed /usr/local/sbin/{tenant-cap,saturation-monitor,auto-recovery}"
 
   # Remove watchdog + any /etc/cron.d/ leftovers from older versions
-  rm -f /etc/cron.d/bh-perf-monitors /etc/cron.d/bh-crontab-watchdog
-  rm -f /usr/local/sbin/bh-crontab-watchdog.sh
+  rm -f /etc/cron.d/bh-perf-monitors /etc/cron.d/bh-crontab-watchdog /etc/cron.d/bh-cron-shell-heal
+  rm -f /usr/local/sbin/bh-crontab-watchdog.sh /usr/local/sbin/bh-cron-shell-heal.sh
   echo "✓ Removed watchdog + legacy /etc/cron.d/ files"
 
   # Remove monitor entries from root's user-spool crontab.
@@ -1656,6 +1656,52 @@ if [ -n "$APACHE_BIN" ]; then
 else
   echo "⊘ Apache not detected — skipping"
 fi
+
+# ────────────────────────────────────────────────
+# 6j. User-crontab SHELL heal (cPanel→CWP migration fix)
+# ────────────────────────────────────────────────
+# cPanel account migrations import user crontabs carrying
+# SHELL="/usr/local/cpanel/bin/jailshell" — a path that does NOT exist on a
+# CWP box. crond still LOGS the CMD every run, but the exec through the
+# missing shell fails silently, so the job NEVER actually executes (WHMCS /
+# Blesta / WordPress / Mautic crons look scheduled but do nothing — the #1
+# "my cron isn't firing" cause on migrated resellers). Rewrite any SHELL=
+# that points to a non-existent binary to /bin/bash, and install a 30-min
+# heal cron so future migrations self-correct.
+echo ""
+echo "─── [6j/10] User-crontab SHELL heal (cPanel→CWP migration fix) ───"
+cat > /usr/local/sbin/bh-cron-shell-heal.sh <<'HEALSCRIPT'
+#!/bin/bash
+# Auto-managed by bh-server-ops. Fix user crontabs whose SHELL= points to a
+# non-existent binary (classic cPanel->CWP leftover: jailshell). crond logs
+# the CMD but the exec via the missing shell fails silently -> job never runs.
+BACKUP_DIR=/root/bh-cron-shell-backups
+mkdir -p "$BACKUP_DIR"
+fixed=0
+for f in /var/spool/cron/*; do
+  [ -f "$f" ] || continue
+  case "$(basename "$f")" in *.bhbak.*|*.swp|*~) continue ;; esac
+  sh=$(grep -oE '^[[:space:]]*SHELL=.*' "$f" 2>/dev/null | head -1 | sed 's/.*SHELL=//; s/"//g; s/[[:space:]]*$//')
+  if [ -n "$sh" ] && [ ! -x "$sh" ]; then
+    cp -a "$f" "$BACKUP_DIR/$(basename "$f").$(date +%s)" 2>/dev/null
+    sed -i 's#^\([[:space:]]*\)SHELL=.*#\1SHELL="/bin/bash"#' "$f"
+    touch "$f"
+    logger -t bh-cron-shell-heal "fixed $(basename "$f"): SHELL was '$sh' -> /bin/bash" 2>/dev/null
+    echo "  fixed $(basename "$f") (SHELL was '$sh')"
+    fixed=$((fixed + 1))
+  fi
+done
+echo "bh-cron-shell-heal: $fixed crontab(s) fixed"
+exit 0
+HEALSCRIPT
+chmod 750 /usr/local/sbin/bh-cron-shell-heal.sh
+/usr/local/sbin/bh-cron-shell-heal.sh | sed 's/^/  /'
+cat > /etc/cron.d/bh-cron-shell-heal <<'HEALCRON'
+# BH cron SHELL heal — auto-managed by bh-server-ops (fixes migrated jailshell crontabs)
+*/30 * * * * root /usr/local/sbin/bh-cron-shell-heal.sh >/dev/null 2>&1
+HEALCRON
+chmod 644 /etc/cron.d/bh-cron-shell-heal
+echo "✓ heal cron installed: /usr/local/sbin/bh-cron-shell-heal.sh (every 30 min)"
 
 # ────────────────────────────────────────────────
 # 5b. Apache mod_status visibility + bad-watchdog detector
