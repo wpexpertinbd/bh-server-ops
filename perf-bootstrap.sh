@@ -1444,6 +1444,19 @@ if [ "$APPLY_APACHE_MPM" = "1" ] && [ -n "$APACHE_BIN" ] && [ -f "$APACHE_MPM_CO
   chattr -i "$APACHE_MPM_CONF" 2>/dev/null || true
   [ -f "${APACHE_MPM_CONF}.bak-pre-tune" ] || cp "$APACHE_MPM_CONF" "${APACHE_MPM_CONF}.bak-pre-tune"
 
+  # ── Self-heal: strip stray immutable flags from RPM-OWNED apache paths ──
+  # Older versions of this script (and manual hardening) left +i on files the
+  # cwp-httpd RPM owns (conf/extra/*.conf, htdocs/*). rpm then can't replace
+  # them → "Error unpacking rpm package" → `yum update cwp-httpd` fails and
+  # Apache is stuck on the old version. Our own drop-ins (conf.d/99-global-
+  # hardening.conf) are NOT rpm-owned and keep their +i.
+  STUCK=$(lsattr -R /usr/local/apache/conf/extra /usr/local/apache/htdocs 2>/dev/null \
+            | grep -E '^-{4}i' | awk '{print $NF}')
+  if [ -n "$STUCK" ]; then
+    printf '%s\n' "$STUCK" | while read -r f; do chattr -i "$f" 2>/dev/null || true; done
+    echo "✓ cleared immutable flag on $(printf '%s\n' "$STUCK" | wc -l) rpm-owned file(s) (unblocks yum)"
+  fi
+
   if [ "$CURRENT_MPM" = "event" ] || [ "$CURRENT_MPM" = "worker" ]; then
     MOD="mpm_${CURRENT_MPM}_module"
     python3 <<PYEOF
@@ -1496,8 +1509,15 @@ PYEOF
   fi
 
   if $APACHE_BIN -t 2>&1 | grep -q "Syntax OK"; then
-    chattr +i "$APACHE_MPM_CONF" 2>/dev/null || true
-    echo "✓ MPM config valid + frozen"
+    # ⚠ Do NOT chattr +i this file — it is OWNED BY THE cwp-httpd RPM.
+    # An immutable rpm-owned file makes rpm fail to unpack
+    # ("cpio: rename failed - Directory not empty") and the WHOLE
+    # `yum update cwp-httpd` transaction aborts, leaving Apache on the old
+    # version + a half-broken rpm state. Seen live 2026-07-28 fleet-wide.
+    # The 5-min FPM/MPM heal cron re-asserts our values after a CWP rebuild,
+    # so freezing the file buys nothing and breaks updates.
+    chattr -i "$APACHE_MPM_CONF" 2>/dev/null || true
+    echo "✓ MPM config valid"
     # MPM directives (ThreadsPerChild, ServerLimit) only re-read on a full
     # RESTART, never on a reload. Without this, the new MaxRequestWorkers
     # tier never takes effect and you stay capped at the old worker count.
@@ -1702,6 +1722,36 @@ cat > /etc/cron.d/bh-cron-shell-heal <<'HEALCRON'
 HEALCRON
 chmod 644 /etc/cron.d/bh-cron-shell-heal
 echo "✓ heal cron installed: /usr/local/sbin/bh-cron-shell-heal.sh (every 30 min)"
+
+# ────────────────────────────────────────────────
+# 6k. CWP panel hostname-cert heal (panel dead after a CWP update)
+# ────────────────────────────────────────────────
+# A CWP panel update can leave /etc/pki/tls/certs/hostname.crt missing while
+# only hostname.cert exists. cwpsrv.conf references the .crt, so its
+# ExecStartPre config test fails ("cannot load certificate ... hostname.crt")
+# and the PANEL NEVER STARTS — ports 2082/2083/2086/2087 all refuse to
+# connect while httpd/nginx keep serving sites fine. Hit the whole fleet
+# 2026-07-28. Recreate the .crt from .cert and restart cwpsrv.
+# ⚠ NEVER openssl-generate a fresh cert/key here — that overwrites the real
+# hostname.key and yields "key values mismatch". Copy only.
+echo ""
+echo "─── [6k/10] CWP panel hostname-cert heal ───"
+if [ -f /usr/local/cwpsrv/bin/cwpsrv ]; then
+  if [ ! -f /etc/pki/tls/certs/hostname.crt ] && [ -f /etc/pki/tls/certs/hostname.cert ]; then
+    cp -f /etc/pki/tls/certs/hostname.cert /etc/pki/tls/certs/hostname.crt
+    chmod 644 /etc/pki/tls/certs/hostname.crt
+    echo "✓ recreated missing /etc/pki/tls/certs/hostname.crt from hostname.cert"
+  fi
+  if /usr/local/cwpsrv/bin/cwpsrv -t >/dev/null 2>&1; then
+    systemctl is-active --quiet cwpsrv || { systemctl restart cwpsrv 2>/dev/null; sleep 2; }
+    echo "✓ cwpsrv config OK (service: $(systemctl is-active cwpsrv 2>/dev/null))"
+  else
+    echo "⚠ cwpsrv config test FAILS — panel will not start. Details:"
+    /usr/local/cwpsrv/bin/cwpsrv -t 2>&1 | tail -3 | sed 's/^/    /'
+  fi
+else
+  echo "⊘ cwpsrv not present — skipping"
+fi
 
 # ────────────────────────────────────────────────
 # 5b. Apache mod_status visibility + bad-watchdog detector
