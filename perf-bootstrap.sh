@@ -167,6 +167,11 @@ fi
 # 256 MB / 20000 files / 16 MB interned (busy WP/Woo sites were hitting the
 # 128 MB default full at ~31% hit rate). Higher-RAM tiers keep their bigger
 # 384/512 MB values; only sub-256 tiers (≤16 GB) are lifted to 256.
+# ⚠ DEPRECATED as of 2026-08-09: OPCACHE_MB / OPCACHE_FILES / INTERNED_MB are no
+# longer used for OPcache. Step [3/10] now sizes each PHP version from its REAL
+# site+file count instead of from server RAM — scaling off RAM gave the busiest
+# version the same slice as versions serving zero sites. Kept only so any external
+# override that still sets them does not error.
 if [ "${OPCACHE_MB:-0}" -lt 256 ]; then
   OPCACHE_MB=256; OPCACHE_FILES=20000; INTERNED_MB=16
 fi
@@ -644,27 +649,153 @@ fi
 # 3. OPcache bump for every PHP-FPM ini.d found
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [3/10] OPcache tuning ───"
+echo "─── [3/10] OPcache tuning (per-version, scaled to REAL workload) ───"
+# ⚠ THE BUG THIS REPLACES (found 2026-08-09): this step used to write ONE
+# RAM-derived size (e.g. 256M/20000) to EVERY PHP version. That ignores how many
+# sites each version actually serves. On s4 the busiest version (php83: 23 sites,
+# 201,918 .php files) got the SAME 256M as eight versions serving ZERO sites —
+# 10.2 MB/site, with slots for only ~10% of the code. OPcache has NO LRU
+# eviction: once full it simply stops caching and everything else recompiles on
+# EVERY request, which is both slow and CPU-expensive (it looked like a CPU
+# shortage). s2's php85 had already logged 2 out-of-memory restarts.
+#
+# Sizing basis (measured live, not guessed): a cached WooCommerce script averages
+# ~29.4 KB of opcode, and a warm cache holds roughly half a site's files, so the
+# budget is files*15KB. Slots = files+30% (they're cheap; memory fills first —
+# the busiest pool measured used only 7.3% of its slots). Versions with no sites
+# drop to 64M, which reclaims enough to fund the busy ones. Total is capped at
+# OPCACHE_RAM_PCT of system RAM (default 25%) so this can never eat the box.
+OPCACHE_RAM_PCT="${OPCACHE_RAM_PCT:-25}"
 if [ ${#PHP_INI_DIRS[@]} -eq 0 ]; then
   echo "⊘ No PHP ini directories detected — skipping"
 else
+  _oc_vhosts=/usr/local/apache/conf.d/vhosts
+  _oc_ram=$(free -m | awk '/^Mem:/{print $2}')
+  _oc_budget=$(( _oc_ram * OPCACHE_RAM_PCT / 100 ))
+  _oc_plan=""; _oc_total=0
+
   for INI_DIR in "${PHP_INI_DIRS[@]}"; do
+    _v=$(echo "$INI_DIR" | grep -oE 'php-fpm[0-9]+' | grep -oE '[0-9]+$')
+    _sites=0; _files=0
+    if [ -n "$_v" ] && [ -d "$_oc_vhosts" ]; then
+      for _f in $(grep -lE "php-fpm$_v/usr/var/sockets" "$_oc_vhosts"/*.ssl.conf 2>/dev/null); do
+        _d=$(grep -hoE 'DocumentRoot [^ ]+' "$_f" 2>/dev/null | head -1 | awk '{print $2}')
+        [ -d "$_d" ] || continue
+        _sites=$(( _sites + 1 ))
+        _files=$(( _files + $(find "$_d" -name '*.php' -type f 2>/dev/null | wc -l) ))
+      done
+    fi
+    if [ "$_sites" -eq 0 ]; then
+      _mb=64; _slots=10000; _int=8
+    else
+      _slots=$(( ((_files * 13 / 10) / 10000 + 1) * 10000 )); [ "$_slots" -lt 20000 ] && _slots=20000
+      _mb=$(( _files * 15 / 1024 )); _mb=$(( (_mb / 128 + 1) * 128 )); [ "$_mb" -lt 256 ] && _mb=256
+      if   [ "$_sites" -ge 20 ]; then _int=64
+      elif [ "$_sites" -ge 10 ]; then _int=48
+      elif [ "$_sites" -ge 5 ];  then _int=32
+      else _int=16; fi
+    fi
+    _oc_total=$(( _oc_total + _mb ))
+    _oc_plan="${_oc_plan}${INI_DIR}|${_v}|${_sites}|${_files}|${_mb}|${_slots}|${_int}
+"
+  done
+
+  # Scale active versions back proportionally if the plan exceeds the RAM budget.
+  if [ "$_oc_total" -gt "$_oc_budget" ] && [ "$_oc_budget" -gt 0 ]; then
+    echo "⚠ plan ${_oc_total}M exceeds ${OPCACHE_RAM_PCT}% RAM budget (${_oc_budget}M) — scaling back"
+    _new=""; _tot2=0
+    while IFS='|' read -r _dir _v _s _fl _mb _sl _in; do
+      [ -z "$_dir" ] && continue
+      if [ "$_s" -gt 0 ]; then
+        _mb=$(( _mb * _oc_budget / _oc_total )); _mb=$(( (_mb / 128 + 1) * 128 ))
+        [ "$_mb" -lt 256 ] && _mb=256
+      fi
+      _tot2=$(( _tot2 + _mb )); _new="${_new}${_dir}|${_v}|${_s}|${_fl}|${_mb}|${_sl}|${_in}
+"
+    done <<< "$_oc_plan"
+    _oc_plan="$_new"; _oc_total=$_tot2
+  fi
+
+  while IFS='|' read -r _dir _v _s _fl _mb _sl _in; do
+    [ -z "$_dir" ] && continue
     # ⚠ Filename MUST sort AFTER the stock alt-php "opcache.ini". PHP parses the
     # scan dir ALPHABETICALLY and the LAST file wins. "99-*" (digit) sorts BEFORE
     # "opcache.ini" (letter) → our tune was silently overridden by the stock
     # 128 MB defaults on every alt-php version. "zz-*" sorts after → it applies.
-    rm -f "$INI_DIR/99-opcache-tuned.ini"   # drop the old ineffective name
-    cat > "$INI_DIR/zz-opcache-tuned.ini" <<EOF
-; Bootstrap OPcache tune (auto-scaled to ${TARGET_RAM_GB}GB RAM)
-opcache.memory_consumption=${OPCACHE_MB}
-opcache.max_accelerated_files=${OPCACHE_FILES}
-opcache.interned_strings_buffer=${INTERNED_MB}
+    rm -f "$_dir/99-opcache-tuned.ini"   # drop the old ineffective name
+    cat > "$_dir/zz-opcache-tuned.ini" <<EOF
+; BH OPcache — sized to this version's ACTUAL workload, not to server RAM.
+; sites=${_s}  php_files=${_fl}  (measured on this server at bootstrap time)
+opcache.memory_consumption=${_mb}
+opcache.max_accelerated_files=${_sl}
+opcache.interned_strings_buffer=${_in}
 opcache.revalidate_freq=60
 opcache.validate_timestamps=1
+opcache.max_wasted_percentage=10
 EOF
-    echo "✓ $INI_DIR/zz-opcache-tuned.ini  (${OPCACHE_MB}MB / ${OPCACHE_FILES} files)"
-  done
+    printf "✓ php%-3s sites=%-3s files=%-7s → %sM / %s slots\n" "${_v:-?}" "$_s" "$_fl" "$_mb" "$_sl"
+  done <<< "$_oc_plan"
+  echo "  total ${_oc_total}M of ${_oc_budget}M budget (${OPCACHE_RAM_PCT}% of ${_oc_ram}M RAM)"
+  echo "  ⚠ new sizes need a php-fpm restart to take effect (opcache shm is allocated at startup)"
 fi
+
+# ── OPcache health monitor: read-only, once daily, zero per-request cost ──
+# opcache lives in each php-fpm MASTER's shared memory, so a CLI opcache_get_status
+# reads a DIFFERENT cache (and the 8.1/8.2/8.3 CLI binaries segfault on CWP boxes).
+# The only honest read is from inside an FPM worker, so this drops a tiny status
+# file into one docroot per version, fetches it once, and deletes it.
+cat > /usr/local/sbin/bh-opcache-monitor.sh <<'BHOCMON'
+#!/bin/bash
+set -uo pipefail
+QUIET=0; [ "${1:-}" = "--quiet" ] && QUIET=1
+VHOSTS=/usr/local/apache/conf.d/vhosts
+ALERTLOG=/var/log/bh-opcache-monitor.log
+SRVIP=$(hostname -I 2>/dev/null | cut -d' ' -f1)
+STAMP=$(date '+%F %H:%M:%S'); HOST=$(hostname -s); PROBE=""
+trap '[ -n "$PROBE" ] && rm -f "$PROBE" 2>/dev/null' EXIT
+emit(){ [ "$QUIET" = 0 ] && echo "$*"; }
+alert(){ echo "$STAMP $HOST $*" | tee -a "$ALERTLOG" >&2; }
+emit "=== opcache health on $HOST ($STAMP) ==="
+[ "$QUIET" = 0 ] && printf "  %-5s %-6s %-9s %-9s %-7s %-8s %-6s %s\n" VER FULL USED FREE WASTED SCRIPTS HIT% STATE
+for V in $(ls -d /opt/alt/php-fpm* 2>/dev/null | grep -oE '[0-9]+$' | sort -n); do
+  vh=$(grep -lE "php-fpm$V/usr/var/sockets" "$VHOSTS"/*.ssl.conf 2>/dev/null | head -1)
+  [ -n "$vh" ] || continue
+  D=$(grep -hoE 'DocumentRoot [^ ]+' "$vh" | head -1 | awk '{print $2}')
+  DOM=$(grep -hoE 'ServerName [^ ]+' "$vh" | head -1 | awk '{print $2}')
+  U=$(grep -hoE 'suPHP_UserGroup [a-z0-9_]+' "$vh" | head -1 | awk '{print $2}')
+  [ -d "$D" ] && [ -n "$DOM" ] || continue
+  PROBE="$D/bh-ocp-$$-${RANDOM}.php"
+  cat > "$PROBE" <<'PHPPROBE'
+<?php $s=@opcache_get_status(false); if(!$s){echo '{"err":1}';exit;}
+$m=$s['memory_usage'];$t=$s['opcache_statistics'];$tot=$m['used_memory']+$m['free_memory']+$m['wasted_memory'];
+echo json_encode(['full'=>$s['cache_full']?1:0,'oom'=>$t['oom_restarts'],
+'used'=>round($m['used_memory']/1048576),'free'=>round($m['free_memory']/1048576),
+'freepct'=>round(100*$m['free_memory']/max(1,$tot),1),'wasted'=>round($m['current_wasted_percentage'],1),
+'scripts'=>$t['num_cached_scripts'],
+'hit'=>round(100*$t['hits']/max(1,$t['hits']+$t['misses']),1)]);
+PHPPROBE
+  [ -n "$U" ] && chown "$U":"$U" "$PROBE" 2>/dev/null
+  out=$(curl -sk --max-time 20 --resolve "$DOM:443:${SRVIP:-127.0.0.1}" "https://$DOM/$(basename "$PROBE")?x=$RANDOM" 2>/dev/null)
+  rm -f "$PROBE"; PROBE=""
+  g(){ echo "$out" | grep -oE "\"$1\":[0-9.]+" | grep -oE '[0-9.]+$'; }
+  full=$(g full); oom=$(g oom); used=$(g used); free=$(g free); fpct=$(g freepct); wst=$(g wasted); scr=$(g scripts); hit=$(g hit)
+  [ -z "$full" ] && { emit "  php$V  (no reading from $DOM)"; continue; }
+  state="ok"
+  [ "${full:-0}" = "1" ] && state="FULL"
+  [ "${oom:-0}" -gt 0 ] 2>/dev/null && state="OOM($oom)"
+  awk "BEGIN{exit !(${fpct:-100}<10)}" && [ "$state" = "ok" ] && state="LOW(${fpct}%)"
+  [ "$QUIET" = 0 ] && printf "  php%-2s %-6s %-9s %-9s %-7s %-8s %-6s %s\n" "$V" "${full:-?}" "${used}M" "${free}M" "$wst" "$scr" "$hit" "$state"
+  [ "$state" != "ok" ] && alert "php$V $state used=${used}M free=${free}M(${fpct}%) scripts=$scr hit=${hit}% oom=$oom"
+done
+BHOCMON
+chmod +x /usr/local/sbin/bh-opcache-monitor.sh
+cat > /etc/cron.d/bh-opcache-monitor <<'EOF'
+# BH opcache health check — read-only, once daily (~0.4s), no per-request cost.
+# Alerts land in /var/log/bh-opcache-monitor.log. Delete this file to disable.
+17 6 * * * root /bin/bash /usr/local/sbin/bh-opcache-monitor.sh --quiet
+EOF
+chmod 644 /etc/cron.d/bh-opcache-monitor
+echo "✓ /usr/local/sbin/bh-opcache-monitor.sh + daily cron 06:17 (alerts on FULL / OOM / <10% free)"
 
 # ────────────────────────────────────────────────
 # 2c. CSF: exclude php-fpm from process-tracking (VSZ false alarms)
