@@ -64,6 +64,20 @@ ENABLE_HTTP3="${ENABLE_HTTP3:-1}"            # 1 = swap nginx for codeit's QUIC-
 # spikes CPU (observed 167% / 1.6 cores) and leaks RAM (>1.3GB) during scans,
 # starving web/mysql. Cap it via a systemd drop-in. MemoryMax stays well above
 # the ~700MB-1GB signature-DB load peak so clamd never OOM-loops.
+# MariaDB InnoDB buffer pool, sized from the REAL data size — NOT from server RAM.
+# Both directions are wrong in practice and both were found live on 2026-08-10:
+#   OVERSIZED (s1 48G/s4 24G for ~9G of data) → the reservation adds memory
+#     pressure and mariadbd gets SWAPPED (s1 had 10.5G in swap). A buffer-pool
+#     page living in swap is WORSE than no cache: a "hit" that faults from disk.
+#   UNDERSIZED (s3 had NO setting at all → MariaDB's 128M default for 7.76G of
+#     data) → 1.02 TB read from disk, hit ratio 96.2% vs 99.99% elsewhere.
+# So: size = data x MARIADB_POOL_FACTOR, floored, and capped at a % of RAM.
+# NOTE a MISSING directive is invisible to a "value looks wrong" check — this
+# step appends the line when absent rather than only sed-replacing it.
+APPLY_MARIADB_TUNING="${APPLY_MARIADB_TUNING:-1}"  # 1 = size the InnoDB buffer pool (set 0 to skip)
+MARIADB_POOL_FACTOR="${MARIADB_POOL_FACTOR:-13}"   # tenths: 13 = data x 1.3 (30% growth headroom)
+MARIADB_POOL_MIN_GB="${MARIADB_POOL_MIN_GB:-2}"    # never go below this
+MARIADB_POOL_RAM_PCT="${MARIADB_POOL_RAM_PCT:-35}" # hard ceiling as % of total RAM
 APPLY_CLAMD_LIMITS="${APPLY_CLAMD_LIMITS:-1}"   # 1 = cap clamd CPU/RAM/IO (set 0 to skip)
 CLAMD_CPUQUOTA="${CLAMD_CPUQUOTA:-50%}"         # half a core hard cap
 CLAMD_MEMMAX="${CLAMD_MEMMAX:-1536M}"           # hard RAM cap (safe above DB-load peak)
@@ -168,7 +182,7 @@ fi
 # 128 MB default full at ~31% hit rate). Higher-RAM tiers keep their bigger
 # 384/512 MB values; only sub-256 tiers (≤16 GB) are lifted to 256.
 # ⚠ DEPRECATED as of 2026-08-09: OPCACHE_MB / OPCACHE_FILES / INTERNED_MB are no
-# longer used for OPcache. Step [3/10] now sizes each PHP version from its REAL
+# longer used for OPcache. Step [3/11] now sizes each PHP version from its REAL
 # site+file count instead of from server RAM — scaling off RAM gave the busiest
 # version the same slice as versions serving zero sites. Kept only so any external
 # override that still sets them does not error.
@@ -600,7 +614,7 @@ fi
 # ────────────────────────────────────────────────
 # 1. Kernel tunables
 # ────────────────────────────────────────────────
-echo "─── [1/10] Kernel tunables ───"
+echo "─── [1/11] Kernel tunables ───"
 cat > /etc/sysctl.d/99-performance.conf <<'EOF'
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
@@ -616,7 +630,7 @@ echo "✓ /etc/sysctl.d/99-performance.conf applied"
 # 2. Create swap if none exists (small VPS often ship without)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [2/10] Swap setup ───"
+echo "─── [2/11] Swap setup ───"
 EXISTING_SWAP_KB=$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "${EXISTING_SWAP_KB:-0}" -gt 0 ]; then
   echo "⊘ Swap already present ($((EXISTING_SWAP_KB / 1024)) MB) — skipping"
@@ -649,7 +663,7 @@ fi
 # 3. OPcache bump for every PHP-FPM ini.d found
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [3/10] OPcache tuning (per-version, scaled to REAL workload) ───"
+echo "─── [3/11] OPcache tuning (per-version, scaled to REAL workload) ───"
 # ⚠ THE BUG THIS REPLACES (found 2026-08-09): this step used to write ONE
 # RAM-derived size (e.g. 256M/20000) to EVERY PHP version. That ignores how many
 # sites each version actually serves. On s4 the busiest version (php83: 23 sites,
@@ -828,7 +842,7 @@ fi
 # 3. Per-user FPM pool tuning + request_terminate_timeout
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [4/10] Per-user FPM pool tuning ───"
+echo "─── [4/11] Per-user FPM pool tuning ───"
 TOUCHED=0; SKIPPED=0; HEAVY_TOUCHED=0; MEDIUM_TOUCHED=0
 
 # Auto-detect app tier by filesystem fingerprint. Saves maintaining the
@@ -1124,7 +1138,7 @@ fi
 # 4. CWP template patch (only if CWP detected)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [5/10] CWP template patch ───"
+echo "─── [5/11] CWP template patch ───"
 if [ -n "$CWP_TPL_DIR" ] && [ -d "$CWP_TPL_DIR" ]; then
   for T in "$CWP_TPL_DIR"/default.tpl "$CWP_TPL_DIR"/processes-40.tpl "$CWP_TPL_DIR"/processes-45.tpl; do
     [ -f "$T" ] || continue
@@ -1148,7 +1162,7 @@ fi
 #     perf configs end up applied against the wrong binary)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [5b/10] HTTP/3 (codeit nginx + QUIC templates) ───"
+echo "─── [5b/11] HTTP/3 (codeit nginx + QUIC templates) ───"
 
 if [ "$ENABLE_HTTP3" != "1" ]; then
   echo "⊘ HTTP/3 enablement skipped (set ENABLE_HTTP3=1 to enable)"
@@ -1513,7 +1527,7 @@ HEALCRON
     echo "  ✓ heal cron installed (every 5 min)"
 
     # ─ K. Quick nginx -t — if broken, restore template backups.
-    #    Full nginx reload happens in section [8/10] after anti-bot/perf work.
+    #    Full nginx reload happens in section [9/11] after anti-bot/perf work.
     if ! nginx -t >/dev/null 2>&1; then
       echo "  ✗ nginx -t failed after H3 setup — restoring template backups"
       for TPL in default.stpl http3.stpl; do
@@ -1522,7 +1536,7 @@ HEALCRON
       rm -f "$NGX_BH_D/global_quic.conf"
       echo "  ⚠ HTTP/3 rolled back — inspect: nginx -t"
     else
-      echo "  ✓ nginx -t passes (final reload happens in section [8/10])"
+      echo "  ✓ nginx -t passes (final reload happens in section [9/11])"
     fi
   fi
 fi
@@ -1531,7 +1545,7 @@ fi
 # 5. Apache MPM bump (auto-detect MPM type)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [6/10] Apache MPM tuning ───"
+echo "─── [6/11] Apache MPM tuning ───"
 if [ "$APPLY_APACHE_MPM" = "1" ] && [ -n "$APACHE_BIN" ] && [ -f "$APACHE_MPM_CONF" ]; then
   CURRENT_MPM=$($APACHE_BIN -V 2>&1 | grep "Server MPM" | awk '{print $3}' | tr 'A-Z' 'a-z')
   echo "Current MPM: $CURRENT_MPM"
@@ -1675,7 +1689,7 @@ fi
 # lives in /etc so CWP package updates don't wipe it; leading '-' = ignore if
 # the file is already gone.
 echo ""
-echo "─── [6g/10] httpd stale-PID self-heal ───"
+echo "─── [6g/11] httpd stale-PID self-heal ───"
 if systemctl list-unit-files 2>/dev/null | grep -q '^httpd\.service' && [ -n "$APACHE_BIN" ]; then
   ROOT=$("$APACHE_BIN" -V 2>/dev/null | sed -n 's/.*HTTPD_ROOT="\([^"]*\)".*/\1/p')
   PIDREL=$("$APACHE_BIN" -V 2>/dev/null | sed -n 's/.*DEFAULT_PIDFILE="\([^"]*\)".*/\1/p')
@@ -1713,7 +1727,7 @@ fi
 # the bulk and lets the remainder through. Server-wide (phase-1 directive),
 # so it fixes every WP/admin site on the box at once.
 echo ""
-echo "─── [6h/10] ModSecurity request-body limit ───"
+echo "─── [6h/11] ModSecurity request-body limit ───"
 MODSEC_NOFILES_LIMIT="${MODSEC_NOFILES_LIMIT:-67108864}"    # 64 MB  — form/JSON POSTs (was 128 KB default)
 MODSEC_BODY_LIMIT="${MODSEC_BODY_LIMIT:-134217728}"         # 128 MB — POSTs that include file uploads
 if [ "$HAS_MODSEC" = 1 ] && [ -n "$APACHE_BIN" ]; then
@@ -1745,7 +1759,7 @@ if [ "$HAS_MODSEC" = 1 ] && [ -n "$APACHE_BIN" ]; then
     bh_set_modsec_directive SecRequestBodyLimitAction  "ProcessPartial"
     if "$APACHE_BIN" -t >/dev/null 2>&1; then
       echo "✓ ModSecurity body limits set in $MSF"
-      echo "    NoFiles=$MODSEC_NOFILES_LIMIT  Body=$MODSEC_BODY_LIMIT  Action=ProcessPartial (reload happens in [8/10])"
+      echo "    NoFiles=$MODSEC_NOFILES_LIMIT  Body=$MODSEC_BODY_LIMIT  Action=ProcessPartial (reload happens in [9/11])"
     else
       LAST_BAK=$(ls -t "${MSF}.bh-bak."* 2>/dev/null | head -1)
       [ -n "$LAST_BAK" ] && cp -a "$LAST_BAK" "$MSF"
@@ -1771,9 +1785,9 @@ fi
 # (httpd-dav.conf stays #Include'd) — these methods simply reach PHP/WordPress;
 # Apache never treats PUT as a filesystem write. Also mirror the methods into the
 # COMODO CWAF method whitelist (rule id 210700) so the WAF policy agrees. Edits
-# are validated with httpd -t (auto-revert on failure); reload happens in [8/10].
+# are validated with httpd -t (auto-revert on failure); reload happens in [9/11].
 echo ""
-echo "─── [6i/10] REST API write methods (PUT/DELETE/PATCH) ───"
+echo "─── [6i/11] REST API write methods (PUT/DELETE/PATCH) ───"
 if [ -n "$APACHE_BIN" ]; then
   UDF=""
   for C in /usr/local/apache/conf/extra/httpd-userdir.conf \
@@ -1786,7 +1800,7 @@ if [ -n "$APACHE_BIN" ]; then
     cp -a "$UDF" "${UDF}.bh-bak.$(date +%s)" 2>/dev/null
     sed -i -E 's|^([[:space:]]*Require method)[[:space:]]+GET[[:space:]]+POST[[:space:]]+OPTIONS[[:space:]]*$|\1 GET POST OPTIONS HEAD PUT DELETE PATCH|' "$UDF"
     if "$APACHE_BIN" -t >/dev/null 2>&1; then
-      echo "✓ REST write methods enabled in $UDF (reload happens in [8/10])"
+      echo "✓ REST write methods enabled in $UDF (reload happens in [9/11])"
     else
       LAST_BAK=$(ls -t "${UDF}.bh-bak."* 2>/dev/null | head -1)
       [ -n "$LAST_BAK" ] && cp -a "$LAST_BAK" "$UDF"
@@ -1822,7 +1836,7 @@ fi
 # that points to a non-existent binary to /bin/bash, and install a 30-min
 # heal cron so future migrations self-correct.
 echo ""
-echo "─── [6j/10] User-crontab SHELL heal (cPanel→CWP migration fix) ───"
+echo "─── [6j/11] User-crontab SHELL heal (cPanel→CWP migration fix) ───"
 cat > /usr/local/sbin/bh-cron-shell-heal.sh <<'HEALSCRIPT'
 #!/bin/bash
 # Auto-managed by bh-server-ops. Fix user crontabs whose SHELL= points to a
@@ -1868,7 +1882,7 @@ echo "✓ heal cron installed: /usr/local/sbin/bh-cron-shell-heal.sh (every 30 m
 # ⚠ NEVER openssl-generate a fresh cert/key here — that overwrites the real
 # hostname.key and yields "key values mismatch". Copy only.
 echo ""
-echo "─── [6k/10] CWP panel hostname-cert heal ───"
+echo "─── [6k/11] CWP panel hostname-cert heal ───"
 if [ -f /usr/local/cwpsrv/bin/cwpsrv ]; then
   if [ ! -f /etc/pki/tls/certs/hostname.crt ] && [ -f /etc/pki/tls/certs/hostname.cert ]; then
     cp -f /etc/pki/tls/certs/hostname.cert /etc/pki/tls/certs/hostname.crt
@@ -1896,7 +1910,7 @@ fi
 # fight the tuning and cause the exact graceful-shutdown thrash we just
 # fixed (lots of "G" in scoreboard, multi-second response times, 0% CPU).
 echo ""
-echo "─── [6b/10] Apache visibility + bad-watchdog check ───"
+echo "─── [6b/11] Apache visibility + bad-watchdog check ───"
 if [ -d /usr/local/apache/conf.d ] && [ -n "$APACHE_BIN" ]; then
   STATUS_CONF=/usr/local/apache/conf.d/server-status.conf
   PUB_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -1942,7 +1956,7 @@ fi
 #      to `include` the snippet (idempotent via marker)
 #   4. Try to patch the CWP template so newly-created vhosts also get it
 echo ""
-echo "─── [6c/10] Nginx anti-bot + rate limit ───"
+echo "─── [6c/11] Nginx anti-bot + rate limit ───"
 
 NGINX_BIN=$(command -v nginx 2>/dev/null || echo "")
 if [ "$IS_SLAVE_SERVER" = "1" ]; then
@@ -2315,7 +2329,7 @@ fi
 #   - wp-login:     any IP with 5+ POST /wp-login.php in 5 min
 #                   = brute-force attempt, ban 1h
 echo ""
-echo "─── [6e/10] fail2ban (nginx + WP brute-force) ───"
+echo "─── [6e/11] fail2ban (nginx + WP brute-force) ───"
 if [ "$IS_SLAVE_SERVER" = "1" ]; then
   echo "⊘ slave/API mode — skipping fail2ban nginx jails (could ban legit API clients)"
   echo "  fail2ban can still be installed manually for SSH protection"
@@ -2444,7 +2458,7 @@ fi   # close: if [ "$IS_SLAVE_SERVER" = "1" ]; then ... else ...
 # open_file_cache, gzip, sendfile, keepalive — these don't touch
 # location matching and are safe everywhere.
 echo ""
-echo "─── [6f/10] Nginx http-level perf tuning ───"
+echo "─── [6f/11] Nginx http-level perf tuning ───"
 if [ -n "$NGINX_BIN" ] && systemctl is-active --quiet nginx 2>/dev/null; then
   # Roll back any prior buggy static-edge injection from older script versions
   rm -f "$NGX_SNIPPETS/static-edge.conf"
@@ -2521,7 +2535,7 @@ fi
 # switch (CWP-specific operation, depends on user's PHP version), but
 # warn so the admin can fix in CWP UI.
 echo ""
-echo "─── [6d/10] PHP handler audit ───"
+echo "─── [6d/11] PHP handler audit ───"
 CGI_USERS=$(ps -eo user,cmd 2>/dev/null | awk '/php-cgi/ && !/grep/ {print $1}' | sort -u | grep -vE '^(root|nobody|apache)$' || true)
 if [ -n "$CGI_USERS" ]; then
   echo "⚠ Users running PHP via php-cgi (slow — should be PHP-FPM):"
@@ -2536,7 +2550,7 @@ fi
 # 6. Redis cap
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [7/10] Redis cap ───"
+echo "─── [7/11] Redis cap ───"
 if [ "$APPLY_REDIS" = "1" ] && command -v redis-cli >/dev/null && systemctl is-active --quiet redis 2>/dev/null; then
   redis-cli CONFIG SET maxmemory "$REDIS_MAX" > /dev/null
   redis-cli CONFIG SET maxmemory-policy allkeys-lru > /dev/null
@@ -2554,7 +2568,7 @@ fi
 # yields. Drop-in lives under /etc/systemd → survives CWP rebuilds (no re-assert
 # cron needed). Idempotent: only rewrites + restarts clamd if the cap changed.
 echo ""
-echo "─── [7b/10] clamd resource cap ───"
+echo "─── [7b/11] clamd resource cap ───"
 if [ "$APPLY_CLAMD_LIMITS" = "1" ]; then
   CLAMD_UNIT=$(systemctl list-units --type=service --all 2>/dev/null | grep -oiE 'clamd@?[a-z]*\.service' | head -1)
   [ -z "$CLAMD_UNIT" ] && CLAMD_UNIT=$(systemctl list-unit-files 2>/dev/null | grep -oiE 'clamd@?[a-z]*\.service' | head -1)
@@ -2604,7 +2618,7 @@ fi
 # race ever hit: one user's backup is incomplete that run — temp dirs are COPIES
 # so live /home data is never touched. flock-guarded; logs only when it deletes.
 echo ""
-echo "─── [7c/10] tmp_bak backup-staging janitor ───"
+echo "─── [7c/11] tmp_bak backup-staging janitor ───"
 if [ "$APPLY_TMPBAK_JANITOR" = "1" ] && { [ -d /usr/local/cwp ] || [ -d "$TMPBAK_DIR" ]; }; then
   cat > /usr/local/sbin/bh-tmpbak-janitor.sh <<'JANITOR'
 #!/bin/bash
@@ -2652,10 +2666,101 @@ else
 fi
 
 # ────────────────────────────────────────────────
+# 7b. MariaDB InnoDB buffer pool (sized to REAL data, online, no restart)
+# ────────────────────────────────────────────────
+echo ""
+echo "─── [8/11] MariaDB buffer pool (sized to REAL data) ───"
+if [ "${APPLY_MARIADB_TUNING:-1}" != "1" ]; then
+  echo "⊘ skipped (APPLY_MARIADB_TUNING=0)"
+elif ! MYCLI=$(command -v mariadb || command -v mysql) || [ -z "$MYCLI" ]; then
+  echo "⊘ no mariadb/mysql client — skipping"
+elif ! "$MYCLI" -N -e "SELECT 1" >/dev/null 2>&1; then
+  echo "⊘ cannot connect to the DB as root (socket auth unavailable) — skipping"
+else
+  MY_CNF=/etc/my.cnf
+  [ -f "$MY_CNF" ] || MY_CNF=/etc/my.cnf.d/server.cnf
+  _q(){ "$MYCLI" -N -e "$1" 2>/dev/null; }
+
+  _ram_mb=$(free -m | awk '/^Mem:/{print $2}')
+  _cur_b=$(_q "SELECT @@innodb_buffer_pool_size;")
+  # real on-disk footprint of every user schema
+  _data_mb=$(_q "SELECT IFNULL(ROUND(SUM(data_length+index_length)/1048576),0) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys');")
+  # pages are 16KB; what the pool is ACTUALLY holding right now
+  _hold_mb=$(_q "SELECT IFNULL(ROUND(VARIABLE_VALUE*16384/1048576),0) FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='Innodb_buffer_pool_pages_data';")
+  : "${_cur_b:=0}"; : "${_data_mb:=0}"; : "${_hold_mb:=0}"
+
+  if [ "${_data_mb:-0}" -le 0 ]; then
+    echo "⊘ could not read data size (permissions?) — skipping, nothing changed"
+  else
+    _cur_mb=$(( _cur_b / 1048576 ))
+    _want_mb=$(( _data_mb * MARIADB_POOL_FACTOR / 10 ))
+    _floor_mb=$(( MARIADB_POOL_MIN_GB * 1024 ))
+    _ceil_mb=$(( _ram_mb * MARIADB_POOL_RAM_PCT / 100 ))
+    [ "$_want_mb" -lt "$_floor_mb" ] && _want_mb=$_floor_mb
+    [ "$_want_mb" -gt "$_ceil_mb" ] && { _want_mb=$_ceil_mb; echo "  (capped at ${MARIADB_POOL_RAM_PCT}% of RAM)"; }
+    # round up to a whole GB so the my.cnf value stays human-readable
+    _want_gb=$(( (_want_mb + 1023) / 1024 )); _want_mb=$(( _want_gb * 1024 ))
+
+    echo "  RAM=${_ram_mb}M  real data=${_data_mb}M  currently holding=${_hold_mb}M"
+    echo "  pool now=${_cur_mb}M  ->  target=${_want_mb}M (${_want_gb}G)"
+
+    # SAFETY: never shrink below what the pool is actively holding, or we force
+    # a mass eviction and every evicted page has to be re-read from disk.
+    if [ "$_want_mb" -lt "$_hold_mb" ]; then
+      echo "  ⚠ target ${_want_mb}M is BELOW live data ${_hold_mb}M → would force eviction; raising to fit"
+      _want_gb=$(( (_hold_mb + 1023) / 1024 + 1 )); _want_mb=$(( _want_gb * 1024 ))
+      echo "    adjusted target=${_want_mb}M (${_want_gb}G)"
+    fi
+
+    _delta=$(( _cur_mb - _want_mb )); [ "$_delta" -lt 0 ] && _delta=$(( -_delta ))
+    if [ "$_delta" -le 512 ]; then
+      echo "✓ already within 512M of target — nothing to do"
+    else
+      _bak="/root/my.cnf.bak-$(date +%F-%H%M%S)"
+      cp -a "$MY_CNF" "$_bak" 2>/dev/null && echo "  backup: $_bak"
+      # 1) live resize — dynamic since MariaDB 10.2, no restart, seconds when the
+      #    new size stays above live data (only free pages are released)
+      if "$MYCLI" -e "SET GLOBAL innodb_buffer_pool_size = $(( _want_mb * 1048576 ));" >/dev/null 2>&1; then
+        echo "  ✓ online resize applied (no restart)"
+      else
+        echo "  ⚠ online resize refused — writing config only (applies on next restart)"
+      fi
+      # 2) persist. A MISSING directive must be APPENDED — sed-replace silently
+      #    does nothing, which is exactly how s3 sat on the 128M default.
+      if grep -qE '^[[:space:]]*innodb_buffer_pool_size' "$MY_CNF" 2>/dev/null; then
+        sed -i "s|^[[:space:]]*innodb_buffer_pool_size[[:space:]]*=.*|innodb_buffer_pool_size = ${_want_gb}G|" "$MY_CNF"
+      elif grep -qE '^\[mysqld\]' "$MY_CNF" 2>/dev/null; then
+        sed -i "/^\[mysqld\]/a innodb_buffer_pool_size = ${_want_gb}G" "$MY_CNF"
+      else
+        printf '\n[mysqld]\ninnodb_buffer_pool_size = %sG\n' "$_want_gb" >> "$MY_CNF"
+      fi
+      # 3) validate the config PARSES before we ever leave it in place
+      if mariadbd --help --verbose >/dev/null 2>&1 || mysqld --help --verbose >/dev/null 2>&1; then
+        echo "  ✓ config parses clean → $MY_CNF (innodb_buffer_pool_size = ${_want_gb}G)"
+      else
+        cp -a "$_bak" "$MY_CNF"
+        echo "  ⚠ config FAILED to parse — restored $_bak (live value still applied)"
+      fi
+      _new_mb=$(( $(_q "SELECT @@innodb_buffer_pool_size;") / 1048576 ))
+      echo "  now live: ${_new_mb}M   service: $(systemctl is-active mariadb 2>/dev/null || systemctl is-active mysqld 2>/dev/null)"
+    fi
+
+    # long_query_time=0 logs EVERY query the moment anyone enables the slow log,
+    # which fills the disk. Found live on biswashost. Only fix the landmine —
+    # deliberately do NOT enable the slow log here (it eats disk on a busy box).
+    _lqt=$(_q "SELECT @@long_query_time;")
+    if [ -n "$_lqt" ] && awk -v v="$_lqt" 'BEGIN{exit !(v < 1)}'; then
+      "$MYCLI" -e "SET GLOBAL long_query_time=2;" >/dev/null 2>&1 && \
+        echo "  ✓ long_query_time was $_lqt (would log EVERY query) → set to 2"
+    fi
+  fi
+fi
+
+# ────────────────────────────────────────────────
 # 7. Reload services (graceful)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [8/10] Reload services ───"
+echo "─── [9/11] Reload services ───"
 for S in "${PHP_FPM_SERVICES[@]}"; do
   systemctl is-active --quiet "$S" 2>/dev/null && systemctl reload "$S" && echo "✓ reloaded $S"
 done
@@ -2697,7 +2802,7 @@ fi
 # / fail2ban which handle dynamic threats (login brute-force, WAF rules).
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [9/10] Apache global security hardening ───"
+echo "─── [10/11] Apache global security hardening ───"
 if [ "$APPLY_APACHE_HARDENING" = "1" ] && [ -n "$APACHE_BIN" ]; then
   # Pick the right drop-in path per distro
   HARDENING_CONF=""
@@ -2866,7 +2971,7 @@ fi
 # 9b. Remove CWP's exposed legacy webftp (Monsta) + permanently deny it
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [9b/10] Remove exposed CWP webftp ───"
+echo "─── [10b/11] Remove exposed CWP webftp ───"
 if [ "$APPLY_REMOVE_WEBFTP" = "1" ]; then
   WEBFTP_DIR=/usr/local/apache/htdocs/webftp_simple
   webftp_state="absent"
@@ -2903,7 +3008,7 @@ fi
 # 10. Install helper scripts (tenant-cap, monitor, auto-recovery)
 # ────────────────────────────────────────────────
 echo ""
-echo "─── [10/10] Install helper scripts ───"
+echo "─── [11/11] Install helper scripts ───"
 if [ "$INSTALL_HELPERS" = "1" ]; then
   mkdir -p /usr/local/sbin
 
