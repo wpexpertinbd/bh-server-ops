@@ -59,6 +59,11 @@ APPLY_APACHE_HARDENING="${APPLY_APACHE_HARDENING:-1}"  # global hardening conf
 # 9.3 RCE CVE-2025-34299). Remove the files AND deny the URLs so a CWP rebuild
 # can't silently re-expose it. Clients have CWP's own File Manager + SFTP.
 APPLY_REMOVE_WEBFTP="${APPLY_REMOVE_WEBFTP:-1}"  # 1 = remove + permanently deny CWP webftp
+# ⚠ DEFAULT 0 ON PURPOSE: enabling this with the wrong IP list locks the panel owner out.
+# BiswasHost fleet (biswashost + s1-s4) runs it as:  APPLY_CWP_ADMIN_IPLOCK=1 bash perf-bootstrap.sh -y
+# On a CLIENT-owned server, set CWP_ADMIN_TRUSTED_IPS to THEIR IPs or leave this at 0.
+APPLY_CWP_ADMIN_IPLOCK="${APPLY_CWP_ADMIN_IPLOCK:-0}"   # 1 = restrict CWP ADMIN panel (/login,/admin,/api) to trusted IPs
+CWP_ADMIN_TRUSTED_IPS="${CWP_ADMIN_TRUSTED_IPS:-103.173.106.4 103.173.106.3 54.38.92.25 127.0.0.1}"
 ENABLE_HTTP3="${ENABLE_HTTP3:-1}"            # 1 = swap nginx for codeit's QUIC-capable build + patch CWP templates
 # clamd (ClamAV daemon, used by amavis for mail AV) is a known resource hog:
 # spikes CPU (observed 167% / 1.6 cores) and leaks RAM (>1.3GB) during scans,
@@ -3001,6 +3006,57 @@ CONF
   fi
 else
   echo "⊘ webftp removal skipped (set APPLY_REMOVE_WEBFTP=1 to enable)"
+fi
+
+
+echo ""
+echo "─── [10c/11] CWP admin panel IP lock ───"
+# WHY: /pma (phpMyAdmin) and /roundcube are served ONLY from the CWP ADMIN server
+# blocks (2030/2086 and 2031/2087) — the user blocks on 2082/2083 do NOT include
+# them, and the user panel 302-redirects to :2087 with the port HARDCODED in
+# ionCube-encoded PHP. So 2087 MUST stay open to customers, which also exposes the
+# admin login + API. Fix it by PATH instead of by port: cwpsrv is nginx, so lock
+# /login, /admin and /api to trusted IPs and leave /pma + /roundcube open.
+# Only cwp_panels.conf is touched — it is NOT regenerated on cwpsrv restart
+# (unlike cwp_services.conf / cwpsrv.conf), so customer services can't be broken here.
+if [ "$APPLY_CWP_ADMIN_IPLOCK" = "1" ]; then
+  CWPP=/usr/local/cwpsrv/conf/cwp_panels.conf
+  CWPBIN=/usr/local/cwpsrv/bin/cwpsrv
+  if [ ! -f "$CWPP" ] || [ ! -x "$CWPBIN" ]; then
+    echo "⊘ cwp_panels.conf or cwpsrv binary not found — skipped"
+  else
+    BLK="    # BH-ADMIN-IPLOCK
+"
+    for _ip in $CWP_ADMIN_TRUSTED_IPS; do BLK="${BLK}    allow ${_ip};
+"; done
+    BLK="${BLK}    deny all;
+    # END BH-ADMIN-IPLOCK
+"
+
+    cp -a "$CWPP" "$CWPP.bak-pre-iplock" 2>/dev/null
+    # Strip any previous block first, so re-running also refreshes the IP list.
+    sed -i '/# BH-ADMIN-IPLOCK/,/# END BH-ADMIN-IPLOCK/d' "$CWPP"
+    awk -v blk="$BLK" '
+      /^location \/(login|admin|api) \{$/ { print; printf "%s", blk; next }
+      { print }
+    ' "$CWPP" > "$CWPP.bhnew" && mv -f "$CWPP.bhnew" "$CWPP"
+
+    _n=$(grep -c '# BH-ADMIN-IPLOCK' "$CWPP" 2>/dev/null || echo 0)
+    if [ "$_n" -ne 3 ]; then
+      cp -a "$CWPP.bak-pre-iplock" "$CWPP"
+      echo "⚠ expected 3 locked locations, got $_n — reverted, no change"
+    elif "$CWPBIN" -t >/dev/null 2>&1; then
+      systemctl reload cwpsrv 2>/dev/null
+      echo "✓ CWP admin (/login,/admin,/api) locked to: $CWP_ADMIN_TRUSTED_IPS"
+      echo "  /pma + /roundcube left OPEN for customers (verify: 403 from outside, 200 from a trusted IP)"
+    else
+      cp -a "$CWPP.bak-pre-iplock" "$CWPP"
+      "$CWPBIN" -t 2>&1 | sed 's/^/    /'
+      echo "⚠ cwpsrv config test FAILED — reverted from $CWPP.bak-pre-iplock"
+    fi
+  fi
+else
+  echo "⊘ CWP admin IP lock skipped (set APPLY_CWP_ADMIN_IPLOCK=1 to enable)"
 fi
 
 
