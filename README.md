@@ -20,6 +20,20 @@ A single auto-detecting script that:
 7. Caps Redis memory + sets LRU eviction policy
 8. Reloads services gracefully (no downtime)
 9. **Drops in nginx anti-bot WAF** — http-level UA map + trusted-IP allowlist + per-vhost server snippet that blocks SEO/AI scrapers and constant attack paths (xmlrpc, /.env, /.git, etc.). Files live in `/etc/nginx/bh.d/` (outside `conf.d/` so CWP regen / `yum reinstall nginx` can't wipe them) and are auto-included via a one-line `include /etc/nginx/bh.d/*.conf;` added to `nginx.conf`. Snapshotted to `/var/lib/bh-server-ops/` so the `auto-recovery` cron can restore them within 3 minutes if anything ever does delete them.
+   - **Crawler throttle (`bh-crawler-throttle v1`)** — `facebookexternalhit` / `meta-externalagent` are
+     deliberately **not blocked** (they power link-share previews), but they are **rate-limited**.
+     ⭐ The zone is keyed on a **constant string, not the client IP**, so every crawler IP draws from
+     **one shared budget** — Facebook crawls from hundreds of IPs, so a per-IP limit caps nothing.
+     An empty key is not limited by nginx at all, so **real visitors are never throttled**.
+     Defaults `CRAWLER_RATE=60r/m` (1 req/sec total) + `CRAWLER_BURST=20`; over-limit gets `429`,
+     which crawlers honour and retry — far better than the `503`s a saturated FPM pool hands real users.
+     Added after `izzaclothing.com` was taken offline by `facebookexternalhit` from **434 Facebook IPs**:
+     every worker in the tenant pool stuck 20–29 min, **3,892 × 499** (crawler gave up, PHP kept running
+     the abandoned request), `/robots.txt` taking 60 s then 503.
+     ⚠️ `limit_req_status` is emitted only when `APPLY_WP_EDGE_GUARD` has not already set it — a second
+     one at http level is a **fatal** `nginx: [emerg] "limit_req_status" directive is duplicate`.
+     ⚠️ Verify a rate limit with **parallel** requests; sequential curls stay inside the burst and
+     "pass" misleadingly.
 10. Installs three helper commands:
     - `tenant-cap` — instantly cap a noisy tenant's PHP workers
     - `saturation-monitor` — cron logs slow sites to `/var/log/saturation.log`
