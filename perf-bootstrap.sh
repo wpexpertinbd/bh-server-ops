@@ -105,6 +105,9 @@ TMPBAK_JANITOR_MINAGE="${TMPBAK_JANITOR_MINAGE:-10}"    # only delete dirs untou
 APPLY_WP_EDGE_GUARD="${APPLY_WP_EDGE_GUARD:-1}"
 WPLOGIN_RATE="${WPLOGIN_RATE:-10r/m}"   # per-IP wp-login.php rate (10/min = brute-force throttle, generous for humans)
 WPLOGIN_BURST="${WPLOGIN_BURST:-5}"     # immediate attempts allowed before throttling kicks in
+APPLY_CRAWLER_THROTTLE="${APPLY_CRAWLER_THROTTLE:-1}"  # 1 = cap aggressive-but-legitimate crawlers (facebookexternalhit etc)
+CRAWLER_RATE="${CRAWLER_RATE:-60r/m}"   # SHARED across ALL crawler IPs (they crawl from hundreds) = 1 req/sec total
+CRAWLER_BURST="${CRAWLER_BURST:-20}"    # spare capacity for genuine share-preview bursts
 # Space-separated IPs that bypass nginx anti-bot rules. Use this to allowlist
 # your other fleet servers (DNS slave, monitoring, Blesta, etc.) so server-
 # to-server API calls don't get caught by the bot filter. Example:
@@ -2184,6 +2187,34 @@ NGXWP
     echo "✓ wp-login rate-limit zone added (rate=$WPLOGIN_RATE, real-IP keyed)"
   fi
 
+  # ─ http-level: throttle aggressive but LEGITIMATE crawlers ─
+  # facebookexternalhit must NOT be blocked (it powers link-share previews), but
+  # left unlimited it can take a site down: izzaclothing.com (2026-08-26) was DDoSed
+  # into 503 by facebookexternalhit from 434 distinct Facebook IPs — every FPM worker
+  # stuck 20-29 min, 3,892 x 499 (crawler gave up, PHP kept running).
+  # The zone key is a CONSTANT string, so ALL crawler IPs share ONE budget; a per-IP
+  # limit would be useless against a 434-IP crawler. Empty key => not limited, so
+  # real visitors are never affected.
+  if [ "$APPLY_CRAWLER_THROTTLE" = "1" ]; then
+    cat >> "$NGX_BH_D/00-anti-bot.conf" <<NGXCRAWL
+
+# bh-crawler-throttle v1 — shared budget for aggressive-but-legitimate crawlers
+map \$http_user_agent \$bh_slow_crawler {
+    default                    "";
+    "~*facebookexternalhit"    "fbcrawl";
+    "~*meta-externalagent"     "fbcrawl";
+}
+limit_req_zone \$bh_slow_crawler zone=bh_crawler:10m rate=$CRAWLER_RATE;
+NGXCRAWL
+    # limit_req_status is emitted ONCE, by whichever guard runs. nginx treats a
+    # SECOND limit_req_status at http level as a FATAL "directive is duplicate"
+    # (verified on s3: nginx -t [emerg]) — so only set it if wp-edge did not.
+    if [ "$APPLY_WP_EDGE_GUARD" != "1" ]; then
+      echo "limit_req_status 429;" >> "$NGX_BH_D/00-anti-bot.conf"
+    fi
+    echo "✓ crawler throttle zone added (rate=$CRAWLER_RATE, shared across all crawler IPs)"
+  fi
+
   # ─ server-level: the actual enforcement, included from each vhost ─
   # ONLY block-style rules — never try to "rate-limit then forward",
   # because we don't know the vhost's upstream from inside an include.
@@ -2223,6 +2254,18 @@ location = /wp-cron.php { deny all; access_log off; log_not_found off; return 44
 limit_req zone=bh_wplogin burst=$WPLOGIN_BURST nodelay;
 NGXWPS
     echo "✓ wp-cron HTTP block + wp-login throttle (burst=$WPLOGIN_BURST) added to snippet"
+  fi
+
+  # ─ server-level: apply the crawler cap ─
+  # Over-limit crawlers get 429, which they honour and retry later — far better than
+  # the 503s a saturated FPM pool returns to REAL visitors.
+  if [ "$APPLY_CRAWLER_THROTTLE" = "1" ]; then
+    cat >> "$NGX_SNIPPETS/anti-bot-server.conf" <<NGXCRAWLS
+
+# bh-crawler-throttle v1 — stop one crawler exhausting a tenant's PHP-FPM pool
+limit_req zone=bh_crawler burst=$CRAWLER_BURST nodelay;
+NGXCRAWLS
+    echo "✓ crawler throttle applied to snippet (burst=$CRAWLER_BURST)"
   fi
 
   echo "✓ wrote $NGX_BH_D/00-anti-bot.conf"
