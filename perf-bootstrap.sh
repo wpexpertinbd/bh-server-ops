@@ -95,6 +95,9 @@ APPLY_TMPBAK_JANITOR="${APPLY_TMPBAK_JANITOR:-1}"        # 1 = install the stagi
 TMPBAK_DIR="${TMPBAK_DIR:-/home/tmp_bak}"               # CWP backup staging dir
 TMPBAK_JANITOR_INTERVAL="${TMPBAK_JANITOR_INTERVAL:-30}" # cron interval (minutes)
 TMPBAK_JANITOR_MINAGE="${TMPBAK_JANITOR_MINAGE:-10}"    # only delete dirs untouched N+ min (active-backup guard)
+APPLY_DOMLOGS_ROTATE="${APPLY_DOMLOGS_ROTATE:-1}"        # 1 = rotate CWP per-domain Apache logs (they are NOT rotated by anything)
+DOMLOGS_ROTATE_KEEP="${DOMLOGS_ROTATE_KEEP:-7}"          # days of per-domain logs to keep
+DOMLOGS_ROTATE_MAXSIZE="${DOMLOGS_ROTATE_MAXSIZE:-100M}" # rotate early if one domain floods
 # WordPress edge guard (nginx 6c): hard-block wp-cron.php over HTTP globally +
 # rate-limit wp-login.php per real-client-IP — kills bot floods on these
 # endpoints at the edge before they spawn PHP workers, country-independent
@@ -2666,6 +2669,57 @@ fi
 # race ever hit: one user's backup is incomplete that run — temp dirs are COPIES
 # so live /home data is never touched. flock-guarded; logs only when it deletes.
 echo ""
+echo ""
+echo "─── [7d/11] CWP domlogs rotation ───"
+# CWP per-domain Apache logs (/usr/local/apache/domlogs) are rotated by NOTHING —
+# no logrotate config ships for them. Measured 2026-08-27: s1 held 30 GB with a single
+# domain log at 2,984 MB. Left alone they grow until the disk fills.
+#
+# ⚠️⚠️ Match *.log ONLY. That directory also holds <domain>.bytes files which are
+#      BANDWIDTH COUNTERS, not logs — rotating/truncating them corrupts traffic
+#      accounting. *.log covers <domain>.log AND <domain>.error.log; .bytes is excluded.
+#      The install is gated on a logrotate dry-run proving 0 .bytes files in scope.
+# ⚠️ copytruncate is required: Apache (as nobody) holds these open, so a plain rotate
+#      leaves it writing to a deleted inode and the space is not freed until a restart.
+#      Verified copytruncate preserves the inode, so no Apache reload is needed.
+if [ "$APPLY_DOMLOGS_ROTATE" = "1" ] && [ -d /usr/local/apache/domlogs ]; then
+  DL_CONF=/etc/logrotate.d/cwp-domlogs
+  cat > "$DL_CONF" <<DLROT
+# bh-domlogs-rotate v1 — CWP per-domain Apache logs, otherwise unrotated.
+# *.log ONLY: <domain>.bytes are bandwidth counters, NOT logs — never rotate them.
+/usr/local/apache/domlogs/*.log {
+    daily
+    rotate $DOMLOGS_ROTATE_KEEP
+    maxsize $DOMLOGS_ROTATE_MAXSIZE
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+DLROT
+  chmod 644 "$DL_CONF"; chown root:root "$DL_CONF"
+
+  DL_BYTES=$(logrotate -d "$DL_CONF" 2>&1 | grep -c '\.bytes')
+  if [ "${DL_BYTES:-1}" -ne 0 ]; then
+    rm -f "$DL_CONF"
+    echo "⚠ config would touch $DL_BYTES .bytes counter file(s) — removed, no change"
+  else
+    DL_BIG=$(find /usr/local/apache/domlogs -maxdepth 1 -type f -name '*.log' -size +${DOMLOGS_ROTATE_MAXSIZE%M}M 2>/dev/null | wc -l)
+    if [ "$DL_BIG" -gt 0 ]; then
+      DL_G=$(find /usr/local/apache/domlogs -maxdepth 1 -type f -name '*.log' -size +${DOMLOGS_ROTATE_MAXSIZE%M}M -printf '%s
+' 2>/dev/null | awk '{s+=$1} END {printf "%.1f", s/1073741824}')
+      find /usr/local/apache/domlogs -maxdepth 1 -type f -name '*.log' -size +${DOMLOGS_ROTATE_MAXSIZE%M}M -exec truncate -s 0 {} \; 2>/dev/null
+      echo "✓ domlogs rotation installed + truncated $DL_BIG oversized log(s), reclaimed ~${DL_G}G"
+    else
+      echo "✓ domlogs rotation installed (keep=$DOMLOGS_ROTATE_KEEP, maxsize=$DOMLOGS_ROTATE_MAXSIZE; nothing oversized)"
+    fi
+  fi
+else
+  echo "⊘ domlogs rotation skipped (set APPLY_DOMLOGS_ROTATE=1 / no domlogs dir)"
+fi
+
 echo "─── [7c/11] tmp_bak backup-staging janitor ───"
 if [ "$APPLY_TMPBAK_JANITOR" = "1" ] && { [ -d /usr/local/cwp ] || [ -d "$TMPBAK_DIR" ]; }; then
   cat > /usr/local/sbin/bh-tmpbak-janitor.sh <<'JANITOR'
