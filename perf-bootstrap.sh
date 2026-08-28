@@ -2274,7 +2274,11 @@ NGXWL
     if [ "$(printf '%s' "$CF4" | grep -c .)" -lt 10 ]; then
       echo "⊘ could not fetch Cloudflare IP ranges — origin lock SKIPPED (locking without the real list would block the site)"
     else
-      CF_RE=$(echo $CF_LOCKED_HOSTS | tr ' ' '|' | sed 's/\./\\\\./g')
+      # [.] not \. — see the VC_GUARD note in [7e]: a backslash survives shell +
+      # heredoc expansion differently per host and produced a DOUBLE backslash on
+      # s4, which in VCL regex means "a backslash followed by any char" — the
+      # guard then matches NOTHING and the rule silently never fires.
+      CF_RE=$(echo $CF_LOCKED_HOSTS | tr ' ' '|' | sed 's/[.]/[.]/g')
       {
         echo ""
         echo "# bh-cf-origin-lock v1 — drop direct-to-origin traffic for proxied hosts."
@@ -2967,7 +2971,14 @@ else
       ' "${vcf}.bak-vcache-$VC_STAMP" > "$vcf"
     done
     VC_ALL=$(printf '%s\n%s\n' "$VC_ALREADY" "$(echo $VC_NEW | tr ' ' '\n')" | grep . | sort -u)
-    VC_GUARD=$(echo $VC_ALL | tr ' ' '|' | sed 's/\./\\\\./g')
+    # ⚠️ Escape dots as [.] — NOT \. — because a backslash survives shell +
+    # unquoted-heredoc expansion differently on different hosts. On s4 this
+    # emitted a DOUBLE backslash (agnikseeds\\.com), which in VCL regex means
+    # "a backslash followed by any char", so the guard matched NOTHING and the
+    # whole backend_response silently never fired. Nothing looked broken —
+    # some sites still cached via the stock path — the feature just did nothing.
+    # [.] is a bracket expression: a literal dot, with no escaping to mangle.
+    VC_GUARD=$(echo $VC_ALL | tr ' ' '|' | sed 's/[.]/[.]/g')
     [ -f "$VCACHE_GLOBAL" ] && cp -a "$VCACHE_GLOBAL" "${VCACHE_GLOBAL}.bak-vcache-$VC_STAMP"
     cat > "$VCACHE_GLOBAL" <<VCEOF
 # bh-varnish-wp-cache — the sub CWP's templates are missing, HOST-GUARDED.
