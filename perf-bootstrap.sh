@@ -3019,7 +3019,10 @@ else
 sub vcl_backend_response {
 	if (bereq.http.host ~ "(?i)^(www\\.)?($VC_GUARD)\$"
 	 && bereq.http.X-BH-Anon == "1"
-	 && beresp.status == 200) {
+	 # 301 too: a bare->www permanent redirect is ideal cache material, and on
+	 # s4 ~8 vhosts redirect that way, so every bare-domain visit was costing a
+	 # full backend round-trip for a 200-byte response.
+	 && (beresp.status == 200 || beresp.status == 301)) {
 		unset beresp.http.Set-Cookie;
 		unset beresp.http.Pragma;
 		set beresp.http.Cache-Control = "public, max-age=60";
