@@ -110,6 +110,26 @@ WPLOGIN_RATE="${WPLOGIN_RATE:-10r/m}"   # per-IP wp-login.php rate (10/min = bru
 WPLOGIN_BURST="${WPLOGIN_BURST:-5}"     # immediate attempts allowed before throttling kicks in
 APPLY_CRAWLER_THROTTLE="${APPLY_CRAWLER_THROTTLE:-1}"  # 1 = cap aggressive-but-legitimate crawlers (facebookexternalhit etc)
 CRAWLER_RATE="${CRAWLER_RATE:-60r/m}"   # SHARED across ALL crawler IPs (they crawl from hundreds) = 1 req/sec total
+
+# Wishlist/add-to-cart flood cap. ausbacare.com (2026-08-27) was hit by ~5,000
+# distinct IPs on /?add_to_wishlist=<id>&_wpnonce=<unique> — a DB WRITE, made
+# uncacheable by the per-request nonce, 93% ending in 499 (attacker hangs up,
+# PHP keeps working). One site ate 6.6 of 12 cores and took the whole box down.
+# Per-IP limiting is useless at ~1 req/IP, so the key is the HOST: one shared
+# budget per site. Empty key => not limited, so ordinary traffic is untouched.
+APPLY_WISHLIST_THROTTLE="${APPLY_WISHLIST_THROTTLE:-1}"
+WISHLIST_RATE="${WISHLIST_RATE:-10r/m}"   # a real store sees 1-2 wishlist adds/min
+WISHLIST_BURST="${WISHLIST_BURST:-5}"
+
+# Cloudflare origin lock: drop traffic that reaches the origin IP directly,
+# bypassing Cloudflare with a spoofed Host header. OFF by default because it
+# needs an explicit host list — locking a host that ISN'T proxied kills it.
+# ⚠️ The geo MUST key on $realip_remote_addr, not $remote_addr: CWP ships
+# /etc/nginx/cloudflare.inc with `real_ip_header CF-Connecting-IP`, so
+# $remote_addr is already rewritten to the VISITOR's IP and a geo on it would
+# classify genuine Cloudflare traffic as non-CF and block the entire site.
+APPLY_CF_ORIGIN_LOCK="${APPLY_CF_ORIGIN_LOCK:-0}"
+CF_LOCKED_HOSTS="${CF_LOCKED_HOSTS:-}"    # space-separated, e.g. "ausbacare.com"
 CRAWLER_BURST="${CRAWLER_BURST:-20}"    # spare capacity for genuine share-preview bursts
 # Space-separated IPs that bypass nginx anti-bot rules. Use this to allowlist
 # your other fleet servers (DNS slave, monitoring, Blesta, etc.) so server-
@@ -2225,6 +2245,51 @@ NGXCRAWL
     echo "✓ crawler throttle zone added (rate=$CRAWLER_RATE, shared across all crawler IPs)"
   fi
 
+  # ─ http-level: wishlist / add-to-cart flood cap (shared budget PER SITE) ─
+  if [ "$APPLY_WISHLIST_THROTTLE" = "1" ]; then
+    cat >> "$NGX_BH_D/00-anti-bot.conf" <<NGXWL
+
+# bh-wishlist-throttle v1 — one shared budget per SITE for state-changing
+# wishlist/add-to-cart GETs. Keyed on \$host (not the client IP) because the
+# attack came from ~5,000 distinct IPs at ~1 request each.
+map \$query_string \$bh_wishlist {
+    default                "";
+    "~*add_to_wishlist="   \$host;
+}
+limit_req_zone \$bh_wishlist zone=bh_wishlist:10m rate=$WISHLIST_RATE;
+NGXWL
+    if [ "$APPLY_WP_EDGE_GUARD" != "1" ] && [ "$APPLY_CRAWLER_THROTTLE" != "1" ]; then
+      echo "limit_req_status 429;" >> "$NGX_BH_D/00-anti-bot.conf"
+    fi
+    echo "✓ wishlist flood zone added (rate=$WISHLIST_RATE, shared per site)"
+  fi
+
+  # ─ http-level: Cloudflare origin lock (opt-in, explicit host list) ─
+  if [ "$APPLY_CF_ORIGIN_LOCK" = "1" ] && [ -n "$CF_LOCKED_HOSTS" ]; then
+    CF4=$(curl -fsSL --max-time 20 https://www.cloudflare.com/ips-v4 2>/dev/null)
+    CF6=$(curl -fsSL --max-time 20 https://www.cloudflare.com/ips-v6 2>/dev/null)
+    if [ "$(printf '%s' "$CF4" | grep -c .)" -lt 10 ]; then
+      echo "⊘ could not fetch Cloudflare IP ranges — origin lock SKIPPED (locking without the real list would block the site)"
+    else
+      CF_RE=$(echo $CF_LOCKED_HOSTS | tr ' ' '|' | sed 's/\./\\\\./g')
+      {
+        echo ""
+        echo "# bh-cf-origin-lock v1 — drop direct-to-origin traffic for proxied hosts."
+        echo "# geo keys on \$realip_remote_addr (the pre-realip address). Using"
+        echo "# \$remote_addr here would see the VISITOR's IP and block all of CF."
+        echo "geo \$realip_remote_addr \$bh_from_cf {"
+        echo "    default 0;"
+        printf '%s\n%s\n' "$CF4" "$CF6" | grep . | sed 's#^#    #; s#$# 1;#'
+        echo "}"
+        echo "map \"\$host|\$bh_from_cf\" \$bh_origin_block {"
+        echo "    default 0;"
+        echo "    \"~*^(www\\\\.)?($CF_RE)\\\\|0\$\" 1;"
+        echo "}"
+      } >> "$NGX_BH_D/00-anti-bot.conf"
+      echo "✓ Cloudflare origin lock armed for: $CF_LOCKED_HOSTS"
+    fi
+  fi
+
   # ─ server-level: the actual enforcement, included from each vhost ─
   # ONLY block-style rules — never try to "rate-limit then forward",
   # because we don't know the vhost's upstream from inside an include.
@@ -2281,6 +2346,30 @@ NGXWPS
 limit_req zone=bh_crawler burst=$CRAWLER_BURST nodelay;
 NGXCRAWLS
     echo "✓ crawler throttle applied to snippet (burst=$CRAWLER_BURST)"
+  fi
+
+  # ─ server-level: wishlist flood cap ─
+  if [ "$APPLY_WISHLIST_THROTTLE" = "1" ]; then
+    cat >> "$NGX_SNIPPETS/anti-bot-server.conf" <<NGXWLS
+
+# bh-wishlist-throttle v1 — cap state-changing wishlist/add-to-cart GETs.
+# Over-limit gets a cheap 429 instead of burning a PHP worker for 30s on a
+# request the attacker already hung up on.
+limit_req zone=bh_wishlist burst=$WISHLIST_BURST nodelay;
+NGXWLS
+    echo "✓ wishlist flood cap applied to snippet (burst=$WISHLIST_BURST)"
+  fi
+
+  # ─ server-level: Cloudflare origin lock enforcement ─
+  if [ "$APPLY_CF_ORIGIN_LOCK" = "1" ] && [ -n "$CF_LOCKED_HOSTS" ] \
+     && grep -q "bh_origin_block" "$NGX_BH_D/00-anti-bot.conf" 2>/dev/null; then
+    cat >> "$NGX_SNIPPETS/anti-bot-server.conf" <<'NGXCFL'
+
+# bh-cf-origin-lock v1 — a request that reached the origin IP directly (not via
+# Cloudflare) for a proxied host is an attempt to bypass the CDN. Drop it.
+if ($bh_origin_block = 1) { return 444; }
+NGXCFL
+    echo "✓ Cloudflare origin lock enforcement applied to snippet"
   fi
 
   echo "✓ wrote $NGX_BH_D/00-anti-bot.conf"
