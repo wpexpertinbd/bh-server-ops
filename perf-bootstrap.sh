@@ -2927,19 +2927,35 @@ else
                | xargs -r -n1 basename 2>/dev/null | sed 's/\.conf$//' | sort)
   VC_N=0; VC_NEW=""
   echo "  already cached: $(echo "$VC_ALREADY" | grep -c .) host(s)"
+  # ⚠️ Order candidates by TRAFFIC, not alphabetically. A first pass cached 17
+  # low-traffic vhosts and left every busy one uncached, so the server-wide hit
+  # rate could not move no matter what the TTL was — the busiest site on the box
+  # was never even reached before the batch limit. Domlog size is a cheap proxy
+  # for "busy since the last rotation".
+  VC_CAND=""
   for vcf in "$VCACHE_VD"/*.conf; do
     vcd=$(basename "$vcf" .conf)
     echo "$VC_ALREADY" | grep -qx "$vcd" && continue
     case "$vcd" in webmail*|mail.*|cpanel*) continue;; esac
     [ "$(grep -c 'return (hash);' "$vcf" 2>/dev/null)" -eq 1 ] || continue
-    VC_H=$(curl -sS -o /dev/null -D - --max-time 12 -H "User-Agent: $VC_UA" "https://$vcd/" 2>/dev/null)
+    VC_SZ=$(stat -c %s "/usr/local/apache/domlogs/${vcd}.log" 2>/dev/null) || VC_SZ=0
+    VC_CAND="$VC_CAND${VC_SZ:-0} $vcd
+"
+  done
+  VC_CAND=$(printf '%s' "$VC_CAND" | grep . | sort -rn | awk '{print $2}')
+  for vcd in $VC_CAND; do
+    # Follow redirects: a site answering 301 (e.g. bare -> www) is perfectly
+    # cacheable, but an exact-200-only check silently skipped every one of them.
+    VC_H=$(curl -sSL --max-redirs 3 -o /dev/null -D - --max-time 12 -H "User-Agent: $VC_UA" "https://$vcd/" 2>/dev/null)
     VC_CODE=$(printf '%s' "$VC_H" | awk 'tolower($1) ~ /^http/ {c=$2} END{print c+0}')
+    # cart cookies on ANY hop disqualify it
     VC_STATE=$(printf '%s' "$VC_H" | grep -i '^set-cookie:' \
       | grep -ciE 'woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|wcf_active_checkout|cartflows_session|edd_items_in_cart') || VC_STATE=0
     if [ "${VC_STATE:-1}" -gt 0 ]; then
       echo "  ⊘ $vcd — mutates cart/session on a plain GET, never cached"
     elif [ "$VC_CODE" = "200" ]; then
-      VC_NEW="$VC_NEW $vcd"; VC_N=$((VC_N+1)); echo "  + $vcd"
+      VC_NEW="$VC_NEW $vcd"; VC_N=$((VC_N+1))
+      echo "  + $vcd  ($(( $(stat -c %s "/usr/local/apache/domlogs/${vcd}.log" 2>/dev/null || echo 0) / 1024 )) KB of log)"
     fi
     [ "$VC_N" -ge "${VARNISH_CACHE_BATCH:-8}" ] && break
     sleep 0.3
