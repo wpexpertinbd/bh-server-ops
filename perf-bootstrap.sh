@@ -2969,6 +2969,17 @@ else
       awk '
         /^[[:space:]]*return \(hash\);/ && !x {
           print "\t\t# ---------- BH-VARNISH-WP-CACHE ----------"
+          print "\t\t# Static assets are byte-identical for every visitor, so cache them"
+          print "\t\t# REGARDLESS of cookies. Without this the logged-in/cart bypass below"
+          print "\t\t# also skips .js/.css for anyone holding a Woo session - and static"
+          print "\t\t# files are the overwhelming majority of requests (measured: 98% of"
+          print "\t\t# the busiest vhost on s4). CWP'\''s own template only strips cookies for"
+          print "\t\t# a simple ?abc query, so WordPress'\''s ?ver=6.4.2 assets never matched."
+          print "\t\tif (req.url ~ \"(?i)[.](css|js|png|gif|jpe?g|webp|svg|ico|woff2?|ttf|otf|eot|mp4|webm|ogg|pdf|zip)([?].*)?$\") {"
+          print "\t\t\tunset req.http.Cookie;"
+          print "\t\t\tset req.http.X-BH-Anon = \"1\";"
+          print "\t\t\treturn (hash);"
+          print "\t\t}"
           print "\t\tif (req.url ~ \"(?i)^/(step|cartflows_step)/\") { return (pass); }"
           print "\t\tif (req.url ~ \"(?i)^/(wp-admin|wp-login|wp-cron|xmlrpc[.]php|cart|checkout|my-account|wc-api)\""
           print "\t\t || req.url ~ \"(?i)(add-to-cart=|add_to_wishlist=|wc-ajax=|removed_item=|preview=true)\") { return (pass); }"
