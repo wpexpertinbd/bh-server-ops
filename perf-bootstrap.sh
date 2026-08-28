@@ -2805,11 +2805,13 @@ if [ "$APPLY_DOMLOGS_ROTATE" = "1" ] && [ -d /usr/local/apache/domlogs ]; then
 DLROT
   chmod 644 "$DL_CONF"; chown root:root "$DL_CONF"
 
-  # ⚠️ `|| echo 0` is REQUIRED: grep -c exits 1 when it finds ZERO matches, and
-  # zero is the SUCCESS case here. Under `set -e` (line 39) the bare form kills
-  # the whole script silently right after the step header — it aborted every run
-  # at [7d/11] before this guard was added.
-  DL_BYTES=$(logrotate -d "$DL_CONF" 2>&1 | grep -c '\.bytes' || echo 0)
+  # ⚠️ grep -c exits 1 when it finds ZERO matches, and zero is the SUCCESS case
+  # here. Under `set -e` (line 39) the unguarded form kills the script silently
+  # right after the step header — it aborted every run at [7d/11].
+  # Guard on the ASSIGNMENT, not inside the substitution: `|| echo 0` would
+  # append a second "0" to grep's own "0", giving "0\n0" and an
+  # "integer expression expected" error at the comparison below.
+  DL_BYTES=$(logrotate -d "$DL_CONF" 2>&1 | grep -c '\.bytes') || DL_BYTES=0
   if [ "${DL_BYTES:-1}" -ne 0 ]; then
     rm -f "$DL_CONF"
     echo "⚠ config would touch $DL_BYTES .bytes counter file(s) — removed, no change"
