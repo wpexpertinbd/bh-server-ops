@@ -2290,7 +2290,12 @@ NGXWL
         echo "}"
         echo "map \"\$host|\$bh_from_cf\" \$bh_origin_block {"
         echo "    default 0;"
-        echo "    \"~*^(www\\\\.)?($CF_RE)\\\\|0\$\" 1;"
+        # Bracket expressions only — [.] for a literal dot, [|] for the literal
+        # separator. Backslashes here survive shell + echo + heredoc expansion
+        # inconsistently and emitted "\\." on s4, which in nginx regex means
+        # "a backslash then any char" — the map matched NOTHING and the origin
+        # lock was silently dead while looking perfectly configured.
+        echo "    \"~*^(www[.])?($CF_RE)[|]0\$\" 1;"
         echo "}"
       } >> "$NGX_BH_D/00-anti-bot.conf"
       echo "✓ Cloudflare origin lock armed for: $CF_LOCKED_HOSTS"
