@@ -2878,6 +2878,142 @@ else
 fi
 
 # ────────────────────────────────────────────────
+# 7e. Varnish anonymous page cache for WordPress/WooCommerce
+# ────────────────────────────────────────────────
+# CWP's varnish templates contain NO vcl_backend_response, so WordPress's
+# "Set-Cookie: PHPSESSID" + no-store makes Varnish's BUILT-IN backend_response
+# mark every object uncacheable. Measured on s4: 115,039 hits / 1,781,200
+# requests = 6.5% — Varnish was decorative while PHP ran for every visitor.
+#
+# 🔴 TWO LANDMINES this step exists to avoid:
+#  1. CWP's per-vhost VCL ends in `return (hash)` with NO logged-in bypass.
+#     Stripping Set-Cookie without adding that bypass serves one shopper's cart
+#     or logged-in page to another. Both halves land together below.
+#  2. One-page-checkout funnels (CartFlows/WooFunnels) ADD THE PRODUCT TO THE
+#     CART SERVER-SIDE ON A PLAIN GET. Caching those gives visitors an EMPTY
+#     checkout — a silent conversion killer. Every candidate is probed with a
+#     cookie-less GET and excluded if the response creates cart/session state.
+#     That probe caught serabijghar.com (5 cart cookies) on s4.
+#
+# ⚠️ The backend_response sub is HOST-GUARDED on purpose. An UNGUARDED version
+#    coincided with a fleet-wide 502 on s4 (2026-08-27, mechanism never found);
+#    the guarded form has run clean. Do not remove the guard.
+#
+# Opt-in, and rolls out in batches — never all vhosts at once.
+echo ""
+echo "─── [7e/11] Varnish WP/Woo page cache ───"
+VCACHE_VD=/etc/varnish/conf.d/vhosts
+VCACHE_GLOBAL=/etc/varnish/conf.d/zz-bh-backend-response.vcl
+VCACHE_DEF=/etc/varnish/default.vcl
+VCACHE_TAG="BH-VARNISH-WP-CACHE"
+if [ "${APPLY_VARNISH_WP_CACHE:-0}" != "1" ]; then
+  echo "⊘ skipped (APPLY_VARNISH_WP_CACHE=0 — opt-in)"
+  echo "  enable per batch:  APPLY_VARNISH_WP_CACHE=1 VARNISH_CACHE_BATCH=8 bash perf-bootstrap.sh -y"
+elif [ ! -d "$VCACHE_VD" ] || ! command -v varnishd >/dev/null 2>&1; then
+  echo "⊘ no varnish vhost dir / varnish not installed — skipping"
+else
+  VC_STAMP=$(date +%Y%m%d-%H%M%S)
+  VC_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120"
+  VC_ALREADY=$(grep -rl "$VCACHE_TAG" "$VCACHE_VD"/*.conf 2>/dev/null \
+               | xargs -r -n1 basename 2>/dev/null | sed 's/\.conf$//' | sort)
+  VC_N=0; VC_NEW=""
+  echo "  already cached: $(echo "$VC_ALREADY" | grep -c .) host(s)"
+  for vcf in "$VCACHE_VD"/*.conf; do
+    vcd=$(basename "$vcf" .conf)
+    echo "$VC_ALREADY" | grep -qx "$vcd" && continue
+    case "$vcd" in webmail*|mail.*|cpanel*) continue;; esac
+    [ "$(grep -c 'return (hash);' "$vcf" 2>/dev/null)" -eq 1 ] || continue
+    VC_H=$(curl -sS -o /dev/null -D - --max-time 12 -H "User-Agent: $VC_UA" "https://$vcd/" 2>/dev/null)
+    VC_CODE=$(printf '%s' "$VC_H" | awk 'tolower($1) ~ /^http/ {c=$2} END{print c+0}')
+    VC_STATE=$(printf '%s' "$VC_H" | grep -i '^set-cookie:' \
+      | grep -ciE 'woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|wcf_active_checkout|cartflows_session|edd_items_in_cart') || VC_STATE=0
+    if [ "${VC_STATE:-1}" -gt 0 ]; then
+      echo "  ⊘ $vcd — mutates cart/session on a plain GET, never cached"
+    elif [ "$VC_CODE" = "200" ]; then
+      VC_NEW="$VC_NEW $vcd"; VC_N=$((VC_N+1)); echo "  + $vcd"
+    fi
+    [ "$VC_N" -ge "${VARNISH_CACHE_BATCH:-8}" ] && break
+    sleep 0.3
+  done
+  VC_NEW=$(echo $VC_NEW)
+  if [ -z "$VC_NEW" ]; then
+    echo "✓ no new cache-safe vhosts — nothing to do"
+  else
+    for vcd in $VC_NEW; do
+      vcf="$VCACHE_VD/$vcd.conf"; cp -a "$vcf" "${vcf}.bak-vcache-$VC_STAMP"
+      awk '
+        /^[[:space:]]*return \(hash\);/ && !x {
+          print "\t\t# ---------- BH-VARNISH-WP-CACHE ----------"
+          print "\t\tif (req.url ~ \"(?i)^/(step|cartflows_step)/\") { return (pass); }"
+          print "\t\tif (req.url ~ \"(?i)^/(wp-admin|wp-login|wp-cron|xmlrpc[.]php|cart|checkout|my-account|wc-api)\""
+          print "\t\t || req.url ~ \"(?i)(add-to-cart=|add_to_wishlist=|wc-ajax=|removed_item=|preview=true)\") { return (pass); }"
+          print "\t\tif (req.http.Cookie ~ \"(wordpress_logged_in|wp-postpass|comment_author|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session)\") { return (pass); }"
+          print "\t\tif (req.http.Cookie) {"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"PHPSESSID=[^;]+(; )?\", \"\");"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"wp-settings-[^=]*=[^;]+(; )?\", \"\");"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"wordpress_test_cookie=[^;]+(; )?\", \"\");"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"pys[^=]*=[^;]+(; )?\", \"\");"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"_fb[pc]=[^;]+(; )?\", \"\");"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"_ga[^=]*=[^;]+(; )?\", \"\");"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"_gid=[^;]+(; )?\", \"\");"
+          print "\t\t\tset req.http.Cookie = regsuball(req.http.Cookie, \"^[ ;]+|[ ;]+$\", \"\");"
+          print "\t\t\tif (req.http.Cookie == \"\") { unset req.http.Cookie; }"
+          print "\t\t}"
+          print "\t\tif (!req.http.Cookie) { set req.http.X-BH-Anon = \"1\"; }"
+          print "\t\t# ---------- END BH-VARNISH-WP-CACHE ----------"
+          x=1
+        }
+        { print }
+      ' "${vcf}.bak-vcache-$VC_STAMP" > "$vcf"
+    done
+    VC_ALL=$(printf '%s\n%s\n' "$VC_ALREADY" "$(echo $VC_NEW | tr ' ' '\n')" | grep . | sort -u)
+    VC_GUARD=$(echo $VC_ALL | tr ' ' '|' | sed 's/\./\\\\./g')
+    [ -f "$VCACHE_GLOBAL" ] && cp -a "$VCACHE_GLOBAL" "${VCACHE_GLOBAL}.bak-vcache-$VC_STAMP"
+    cat > "$VCACHE_GLOBAL" <<VCEOF
+# bh-varnish-wp-cache — the sub CWP's templates are missing, HOST-GUARDED.
+# An unguarded version of this coincided with a fleet-wide 502; keep the guard
+# and extend the host list per batch.
+sub vcl_backend_response {
+	if (bereq.http.host ~ "(?i)^(www\\.)?($VC_GUARD)\$"
+	 && bereq.http.X-BH-Anon == "1"
+	 && beresp.status == 200) {
+		unset beresp.http.Set-Cookie;
+		unset beresp.http.Pragma;
+		set beresp.http.Cache-Control = "public, max-age=60";
+		set beresp.ttl   = 300s;
+		set beresp.grace = 1h;
+		set beresp.http.X-BH-Cache = "anon-cached";
+		return (deliver);
+	}
+}
+VCEOF
+    grep -q zz-bh-backend-response "$VCACHE_DEF" || echo "include \"$VCACHE_GLOBAL\";" >> "$VCACHE_DEF"
+    if ! varnishd -C -f "$VCACHE_DEF" >/dev/null 2>/tmp/bhvc.err; then
+      echo "✗ VCL compile FAILED — reverting"; head -6 /tmp/bhvc.err | sed 's/^/    /'
+      for vcd in $VC_NEW; do cp -a "$VCACHE_VD/$vcd.conf.bak-vcache-$VC_STAMP" "$VCACHE_VD/$vcd.conf"; done
+      [ -f "${VCACHE_GLOBAL}.bak-vcache-$VC_STAMP" ] && cp -a "${VCACHE_GLOBAL}.bak-vcache-$VC_STAMP" "$VCACHE_GLOBAL" || rm -f "$VCACHE_GLOBAL"
+    else
+      varnishreload >/dev/null 2>&1 || systemctl reload varnish >/dev/null 2>&1
+      sleep 2
+      VC_FAIL=0
+      for vcd in $VC_NEW; do
+        VC_LI=$(curl -sS -o /dev/null -D - --max-time 15 -H "User-Agent: $VC_UA" -H "Cookie: wordpress_logged_in_x=a|b|c" "https://$vcd/" 2>/dev/null | grep -ci x-bh-cache) || VC_LI=0
+        [ "${VC_LI:-0}" -ne 0 ] && { echo "✗ $vcd served a CACHED page to a logged-in cookie"; VC_FAIL=1; }
+      done
+      if [ "$VC_FAIL" -ne 0 ]; then
+        echo "✗ SAFETY CHECK FAILED — reverting"
+        for vcd in $VC_NEW; do cp -a "$VCACHE_VD/$vcd.conf.bak-vcache-$VC_STAMP" "$VCACHE_VD/$vcd.conf"; done
+        [ -f "${VCACHE_GLOBAL}.bak-vcache-$VC_STAMP" ] && cp -a "${VCACHE_GLOBAL}.bak-vcache-$VC_STAMP" "$VCACHE_GLOBAL"
+        varnishreload >/dev/null 2>&1 || systemctl reload varnish >/dev/null 2>&1
+      else
+        echo "✓ page cache enabled on $VC_N new vhost(s); guard now covers $(echo "$VC_ALL" | grep -c .)"
+        echo "  logged-in / cart / checkout / wc-ajax all bypass; funnel sites auto-excluded"
+      fi
+    fi
+  fi
+fi
+
+# ────────────────────────────────────────────────
 # 7b. MariaDB InnoDB buffer pool (sized to REAL data, online, no restart)
 # ────────────────────────────────────────────────
 echo ""
