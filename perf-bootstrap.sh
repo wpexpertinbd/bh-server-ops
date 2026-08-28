@@ -1116,9 +1116,12 @@ for DIR in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users; do
     CUR_PM=$(grep -oE '^pm[[:space:]]*=[[:space:]]*[a-z]+' "$POOL" | head -1 | awk '{print $3}')
     CUR_CHILDREN=$(grep -oE '^pm\.max_children[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
     CUR_START=$(grep -oE '^pm\.start_servers[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
-    PM_LINE_COUNT=$(grep -cE '^pm[[:space:]]*=' "$POOL")
-    HAS_SPARES=$(grep -cE '^pm\.(start_servers|min_spare_servers|max_spare_servers)' "$POOL")
-    HAS_IDLE=$(grep -cE '^pm\.process_idle_timeout[[:space:]]*=' "$POOL")
+    # `|| echo 0` on every one: grep -c exits 1 on zero matches, which under
+    # `set -e` would abort the whole run — and zero is a legitimate result for a
+    # pool file that simply lacks the directive.
+    PM_LINE_COUNT=$(grep -cE '^pm[[:space:]]*=' "$POOL" || echo 0)
+    HAS_SPARES=$(grep -cE '^pm\.(start_servers|min_spare_servers|max_spare_servers)' "$POOL" || echo 0)
+    HAS_IDLE=$(grep -cE '^pm\.process_idle_timeout[[:space:]]*=' "$POOL" || echo 0)
 
     case "$TIER" in
       heavy)
@@ -2802,7 +2805,11 @@ if [ "$APPLY_DOMLOGS_ROTATE" = "1" ] && [ -d /usr/local/apache/domlogs ]; then
 DLROT
   chmod 644 "$DL_CONF"; chown root:root "$DL_CONF"
 
-  DL_BYTES=$(logrotate -d "$DL_CONF" 2>&1 | grep -c '\.bytes')
+  # ⚠️ `|| echo 0` is REQUIRED: grep -c exits 1 when it finds ZERO matches, and
+  # zero is the SUCCESS case here. Under `set -e` (line 39) the bare form kills
+  # the whole script silently right after the step header — it aborted every run
+  # at [7d/11] before this guard was added.
+  DL_BYTES=$(logrotate -d "$DL_CONF" 2>&1 | grep -c '\.bytes' || echo 0)
   if [ "${DL_BYTES:-1}" -ne 0 ]; then
     rm -f "$DL_CONF"
     echo "⚠ config would touch $DL_BYTES .bytes counter file(s) — removed, no change"
