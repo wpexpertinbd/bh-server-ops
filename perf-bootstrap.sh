@@ -1954,9 +1954,10 @@ fi
 # ────────────────────────────────────────────────
 # Why this exists: when Apache is the backend behind nginx (default CWP
 # layout), bot traffic still consumes Apache workers — bots ignore robots.txt
-# and hammer dynamic URLs. Cheaper to drop them at the nginx edge with
-# `return 444` (closes connection, costs almost nothing) than to let them
-# reach Apache+ModSecurity. Also rate-limits /robots.txt itself which is
+# and hammer dynamic URLs. Cheaper to reject them at the nginx edge with a
+# `return 403` than to let them reach Apache+ModSecurity. (403 rather than 444:
+# a dropped connection has no status line, so Varnish reports it as a 503 and
+# Cloudflare as a 520 — a deliberate block then looks like a broken site.) Also rate-limits /robots.txt itself which is
 # typically the most-hit URL on a hosting fleet (we saw 379 of 412 visible
 # requests on one server).
 #
@@ -2143,12 +2144,18 @@ map $http_user_agent $bh_bad_bot {
     "~*petalbot"            1;
     "~*bytespider"          1;
     "~*amazonbot"           1;
-    # AI training crawlers (NOT search engines — Googlebot is allowed)
+    # AI TRAINING crawlers (NOT search engines — Googlebot is allowed).
+    # These scrape in bulk to build training corpora: high cost, nothing back.
     "~*claudebot"           1;
     "~*gptbot"              1;
-    "~*chatgpt-user"        1;
     "~*ccbot"               1;
     "~*google-extended"     1;
+    # ⚠️ USER-TRIGGERED AI FETCHERS ARE DELIBERATELY *NOT* BLOCKED:
+    #   ChatGPT-User, Claude-User, OAI-SearchBot, PerplexityBot, Perplexity-User.
+    # They fetch because a real PERSON asked about that page. Blocking them makes
+    # a client site uncitable in ChatGPT/Claude/Perplexity answers — a real
+    # discovery channel — and stops the owner reviewing their own site with an AI.
+    # (chatgpt-user used to be in this list; removed 2026-08-28.)
     # Generic scraper toolkits
     "~*headlesschrome"      1;
     "~*scrapy"              1;
@@ -2230,7 +2237,12 @@ NGXCRAWL
 set $bh_block 0;
 if ($bh_bad_bot)    { set $bh_block 1; }
 if ($bh_trusted_ip) { set $bh_block 0; }
-if ($bh_block = 1)  { return 444; }
+# 403, NOT 444. A dropped connection (444) has no status line, so Varnish turns
+# it into "503 Backend fetch failed" and Cloudflare into "520" — a deliberate
+# block then looks identical to a broken site. That is how it was reported to us
+# ("your sites return 502/520 and can't be read"). 403 says "blocked" honestly,
+# costs a few bytes, and keeps uptime monitors from false-alarming.
+if ($bh_block = 1)  { return 403; }
 
 # Block paths with no legitimate use + constant attack targets
 location = /xmlrpc.php       { deny all; access_log off; log_not_found off; return 444; }
@@ -2967,8 +2979,10 @@ TraceEnable Off
 
     # SEO/scraper bots
     RewriteCond %{HTTP_USER_AGENT} (PetalBot|MJ12bot|DotBot|SemrushBot|AhrefsBot|Bytespider|YandexBot|seznambot|MegaIndex|BLEXBot|DataForSeoBot|GeedoShop|MauiBot|sogou|spbot|trendkite|garlik|webmeup|exabot|Lipperhey|psbot|360Spider) [NC,OR]
-    # AI training bots
-    RewriteCond %{HTTP_USER_AGENT} (GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot|PerplexityBot) [NC]
+    # AI TRAINING bots only. User-triggered fetchers (ChatGPT-User, Claude-User,
+    # OAI-SearchBot, PerplexityBot) are deliberately ALLOWED so client sites stay
+    # citable in AI answers — PerplexityBot was removed from this list 2026-08-28.
+    RewriteCond %{HTTP_USER_AGENT} (GPTBot|ClaudeBot|CCBot|Amazonbot|anthropic-ai|cohere-ai|magpie-crawler|Diffbot|ImagesiftBot|Omgili|SiteAnalyzerBot|TurnitinBot) [NC]
     # NOTE: do NOT block empty/dash-only User-Agent — that assumption is wrong.
     # Legitimate server-to-server APIs send no UA: Telegram webhooks, payment/gateway
     # callbacks, uptime monitors, etc. (matches the nginx bh.d/00-anti-bot.conf stance.)
