@@ -936,6 +936,30 @@ ensure_kv() {
   fi
 }
 
+# ── Atomic pool rewriting (mirrors the heal script — keep the two in sync) ───
+# Never edit a live pool in place: we delete `pm =` before re-adding it, and a
+# php-fpm reload (ours OR CWP's) landing in that window aborts the whole daemon
+# with "the process manager is missing", taking every pool on that PHP version
+# down with it. s3 lost 25 sites for 19h this way (2026-08-31).
+pool_begin() {
+  local POOL="$1" TMP
+  TMP="$(mktemp "${POOL}.bhtmp.XXXXXX" 2>/dev/null)" || return 1
+  cp -p "$POOL" "$TMP" 2>/dev/null || { rm -f "$TMP"; return 1; }
+  printf '%s' "$TMP"
+}
+pool_commit() {
+  local TMP="$1" POOL="$2"
+  [ -n "$TMP" ] && [ -f "$TMP" ] || return 1
+  if grep -qE '^pm[[:space:]]*=[[:space:]]*(static|dynamic|ondemand)[[:space:]]*$' "$TMP" \
+     && grep -qE '^pm\.max_children[[:space:]]*=' "$TMP"; then
+    mv -f "$TMP" "$POOL"          # same dir → atomic rename
+  else
+    rm -f "$TMP"
+    echo "⚠ refused invalid pool write: $POOL" >&2
+    return 1
+  fi
+}
+
 if [ ${#PHP_FPM_USER_DIRS[@]} -eq 0 ]; then
   echo "⊘ No FPM pool dirs detected — skipping"
 else
@@ -947,40 +971,43 @@ else
 
       [ -f "${CONF}.bak-pre-tune" ] || cp "$CONF" "${CONF}.bak-pre-tune"
 
+      # All edits go to a temp copy and are renamed in atomically (see pool_begin).
+      POOLTMP="$(pool_begin "$CONF")" || { echo "⚠ could not stage $CONF — skipped" >&2; continue; }
+
       if echo " $HEAVY_USERS " | grep -q " $USER "; then
         # HEAVY (Laravel/CodeIgniter/Symfony) — dynamic warm pool, full HEAVY_CHILDREN
         START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
         MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
         MAX_SPARE=$(( HEAVY_CHILDREN / 2 )); [ $MAX_SPARE -lt 4 ] && MAX_SPARE=4
         # process_idle_timeout is ondemand-only — strip any stale leftover
-        sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$CONF"
-        ensure_kv "$CONF" "pm" "dynamic"
-        ensure_kv "$CONF" "pm.max_children" "$HEAVY_CHILDREN"
-        ensure_kv "$CONF" "pm.max_requests" "500"
-        ensure_kv "$CONF" "pm.start_servers" "$START_SVR"
-        ensure_kv "$CONF" "pm.min_spare_servers" "$MIN_SPARE"
-        ensure_kv "$CONF" "pm.max_spare_servers" "$MAX_SPARE"
-        ensure_kv "$CONF" "request_terminate_timeout" "30s"
-        HEAVY_TOUCHED=$((HEAVY_TOUCHED+1))
+        sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$POOLTMP"
+        ensure_kv "$POOLTMP" "pm" "dynamic"
+        ensure_kv "$POOLTMP" "pm.max_children" "$HEAVY_CHILDREN"
+        ensure_kv "$POOLTMP" "pm.max_requests" "500"
+        ensure_kv "$POOLTMP" "pm.start_servers" "$START_SVR"
+        ensure_kv "$POOLTMP" "pm.min_spare_servers" "$MIN_SPARE"
+        ensure_kv "$POOLTMP" "pm.max_spare_servers" "$MAX_SPARE"
+        ensure_kv "$POOLTMP" "request_terminate_timeout" "30s"
+        pool_commit "$POOLTMP" "$CONF" && HEAVY_TOUCHED=$((HEAVY_TOUCHED+1))
       elif echo " $MEDIUM_USERS " | grep -q " $USER "; then
         # MEDIUM (WordPress/WooCommerce/OpenCart/Magento) — ondemand, 50% of heavy.
         # Strip heavy-only spare-server keys in case this user was heavy before.
-        sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$CONF"
-        ensure_kv "$CONF" "pm" "ondemand"
-        ensure_kv "$CONF" "pm.max_children" "$MEDIUM_CHILDREN"
-        ensure_kv "$CONF" "pm.max_requests" "500"
-        ensure_kv "$CONF" "pm.process_idle_timeout" "30s"
-        ensure_kv "$CONF" "request_terminate_timeout" "30s"
-        MEDIUM_TOUCHED=$((MEDIUM_TOUCHED+1))
+        sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$POOLTMP"
+        ensure_kv "$POOLTMP" "pm" "ondemand"
+        ensure_kv "$POOLTMP" "pm.max_children" "$MEDIUM_CHILDREN"
+        ensure_kv "$POOLTMP" "pm.max_requests" "500"
+        ensure_kv "$POOLTMP" "pm.process_idle_timeout" "30s"
+        ensure_kv "$POOLTMP" "request_terminate_timeout" "30s"
+        pool_commit "$POOLTMP" "$CONF" && MEDIUM_TOUCHED=$((MEDIUM_TOUCHED+1))
       else
         # LIGHT (static HTML / basic PHP) — ondemand, 25% of heavy.
-        sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$CONF"
-        ensure_kv "$CONF" "pm" "ondemand"
-        ensure_kv "$CONF" "pm.max_children" "$LIGHT_CHILDREN"
-        ensure_kv "$CONF" "pm.max_requests" "500"
-        ensure_kv "$CONF" "pm.process_idle_timeout" "30s"
-        ensure_kv "$CONF" "request_terminate_timeout" "30s"
-        TOUCHED=$((TOUCHED+1))
+        sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$POOLTMP"
+        ensure_kv "$POOLTMP" "pm" "ondemand"
+        ensure_kv "$POOLTMP" "pm.max_children" "$LIGHT_CHILDREN"
+        ensure_kv "$POOLTMP" "pm.max_requests" "500"
+        ensure_kv "$POOLTMP" "pm.process_idle_timeout" "30s"
+        ensure_kv "$POOLTMP" "request_terminate_timeout" "30s"
+        pool_commit "$POOLTMP" "$CONF" && TOUCHED=$((TOUCHED+1))
       fi
     done
   done
@@ -1073,30 +1100,65 @@ done
 echo "$DETECTED_HEAVY"  | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/heavy-users.list
 echo "$DETECTED_MEDIUM" | tr ' ' '\n' | grep -v '^$' | sort -u > /var/lib/bh-server-ops/medium-users.list
 
+# ── Atomic pool rewriting ───────────────────────────────────────────────────
+# ⚠️ NEVER edit a live pool file in place. These functions delete `pm =` before
+# re-adding it, so an in-place edit leaves the on-disk pool WITHOUT a process
+# manager for a few milliseconds. php-fpm reloads on CWP's schedule as well as
+# ours, and a reload landing in that window aborts the ENTIRE daemon:
+#     ALERT: [pool X] the process manager is missing (static, dynamic or ondemand)
+#     ERROR: failed to post process the configuration / FPM initialization failed
+# One malformed pool takes down every pool on that PHP version. s3 lost 25 sites
+# for 19h this way (2026-08-31 17:01 → 2026-09-01 12:35).
+# So: work on a temp copy, validate it, then rename(2) it into place.
+pool_begin() {
+  # echoes a temp path that is a copy of $1, or nothing on failure
+  local POOL="$1" TMP
+  TMP="$(mktemp "${POOL}.bhtmp.XXXXXX" 2>/dev/null)" || return 1
+  cp -p "$POOL" "$TMP" 2>/dev/null || { rm -f "$TMP"; return 1; }
+  printf '%s' "$TMP"
+}
+pool_commit() {
+  # install $1 over $2 only if it is a pool php-fpm will actually accept
+  local TMP="$1" POOL="$2"
+  [ -n "$TMP" ] && [ -f "$TMP" ] || return 1
+  if grep -qE '^pm[[:space:]]*=[[:space:]]*(static|dynamic|ondemand)[[:space:]]*$' "$TMP" \
+     && grep -qE '^pm\.max_children[[:space:]]*=' "$TMP"; then
+    mv -f "$TMP" "$POOL"          # same dir → atomic rename
+  else
+    rm -f "$TMP"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') REFUSED invalid pool write: $POOL" >> /var/log/bh-fpm-heal.log
+    return 1
+  fi
+}
+
 # Apply the HEAVY (dynamic) profile to a pool conf.
 apply_heavy() {
-  local POOL="$1"
-  sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
-  sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$POOL"
-  ensure_kv "$POOL" "pm" "dynamic"
-  ensure_kv "$POOL" "pm.max_children" "$HEAVY_CHILDREN"
-  ensure_kv "$POOL" "pm.max_requests" "500"
-  ensure_kv "$POOL" "pm.start_servers" "$START_SVR"
-  ensure_kv "$POOL" "pm.min_spare_servers" "$MIN_SPARE"
-  ensure_kv "$POOL" "pm.max_spare_servers" "$MAX_SPARE"
-  ensure_kv "$POOL" "request_terminate_timeout" "30s"
+  local POOL="$1" TMP
+  TMP="$(pool_begin "$POOL")" || return 1
+  sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$TMP"
+  sed -i '/^pm\.process_idle_timeout[[:space:]]*=/d' "$TMP"
+  ensure_kv "$TMP" "pm" "dynamic"
+  ensure_kv "$TMP" "pm.max_children" "$HEAVY_CHILDREN"
+  ensure_kv "$TMP" "pm.max_requests" "500"
+  ensure_kv "$TMP" "pm.start_servers" "$START_SVR"
+  ensure_kv "$TMP" "pm.min_spare_servers" "$MIN_SPARE"
+  ensure_kv "$TMP" "pm.max_spare_servers" "$MAX_SPARE"
+  ensure_kv "$TMP" "request_terminate_timeout" "30s"
+  pool_commit "$TMP" "$POOL"
 }
 
 # Apply an ondemand profile (medium or light) to a pool conf.
 apply_ondemand() {
-  local POOL="$1" CHILDREN="$2"
-  sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$POOL"
-  sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$POOL"
-  ensure_kv "$POOL" "pm" "ondemand"
-  ensure_kv "$POOL" "pm.max_children" "$CHILDREN"
-  ensure_kv "$POOL" "pm.max_requests" "500"
-  ensure_kv "$POOL" "pm.process_idle_timeout" "30s"
-  ensure_kv "$POOL" "request_terminate_timeout" "30s"
+  local POOL="$1" CHILDREN="$2" TMP
+  TMP="$(pool_begin "$POOL")" || return 1
+  sed -i -E '/^pm[[:space:]]*=[[:space:]]*(dynamic|ondemand)[[:space:]]*$/d' "$TMP"
+  sed -i -E '/^pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d' "$TMP"
+  ensure_kv "$TMP" "pm" "ondemand"
+  ensure_kv "$TMP" "pm.max_children" "$CHILDREN"
+  ensure_kv "$TMP" "pm.max_requests" "500"
+  ensure_kv "$TMP" "pm.process_idle_timeout" "30s"
+  ensure_kv "$TMP" "request_terminate_timeout" "30s"
+  pool_commit "$TMP" "$POOL"
 }
 
 # Single reconcile loop over every pool conf: figure the user's desired tier
@@ -1157,6 +1219,44 @@ if [ $CHANGED -gt 0 ]; then
   done
   echo "$(date '+%Y-%m-%d %H:%M:%S') changed=$CHANGED (heavy=$HEAVY_N medium=$MEDIUM_N light=$LIGHT_N)" >> /var/log/bh-fpm-heal.log
 fi
+
+# ── Recovery sweep — runs EVERY tick, even when CHANGED=0 ────────────────────
+# A php-fpm unit that has DIED is invisible to a `--state=active` loop, so the
+# old code could never bring it back; CWP meanwhile just logged "Unit cannot be
+# reloaded because it is inactive" forever. s3's php-fpm83 sat dead for 19h that
+# way (2026-08-31) with ~25 sites down, because recovery was also gated behind
+# CHANGED>0 — and a service can die for reasons that have nothing to do with our
+# pool edits. Enumerate INSTALLED units instead and start whatever is down.
+mkdir -p /var/lib/bh-server-ops 2>/dev/null
+for SVC in $(systemctl list-unit-files --no-legend 'php-fpm*.service' 2>/dev/null \
+             | awk '{print $1}' | grep -E '^php-fpm[0-9]+\.service$'); do
+  systemctl is-active  --quiet "$SVC" 2>/dev/null && continue   # healthy
+  systemctl is-enabled --quiet "$SVC" 2>/dev/null || continue   # deliberately off
+
+  # Back off so a service that dies on startup can't be restart-stormed.
+  STAMP="/var/lib/bh-server-ops/recover-${SVC}.stamp"
+  NOW=$(date +%s); LAST=$(cat "$STAMP" 2>/dev/null || echo 0)
+  [ $(( NOW - LAST )) -lt 900 ] && continue
+  echo "$NOW" > "$STAMP"
+
+  # Only start if the config is genuinely valid, else we'd loop on a real fault.
+  V="${SVC#php-fpm}"; V="${V%.service}"
+  BIN="/opt/alt/php-fpm${V}/usr/sbin/php-fpm"
+  CFG="/opt/alt/php-fpm${V}/usr/etc/php-fpm.conf"
+  if [ -x "$BIN" ] && [ -f "$CFG" ]; then
+    if ! "$BIN" -t -y "$CFG" >/dev/null 2>&1; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') $SVC is down but its config is INVALID — not starting" >> /var/log/bh-fpm-heal.log
+      continue
+    fi
+  fi
+
+  systemctl reset-failed "$SVC" >/dev/null 2>&1
+  if systemctl start "$SVC" >/dev/null 2>&1; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') RECOVERED $SVC (was down)" >> /var/log/bh-fpm-heal.log
+  else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') FAILED to recover $SVC" >> /var/log/bh-fpm-heal.log
+  fi
+done
 HEALSCRIPT
   chmod +x /usr/local/sbin/bh-fpm-pool-heal.sh
 
