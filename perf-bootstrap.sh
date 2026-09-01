@@ -1055,6 +1055,16 @@ CONF=/var/lib/bh-server-ops/fpm-config
 [ -n "$LIGHT_CHILDREN" ]  || { LIGHT_CHILDREN=$(( HEAVY_CHILDREN / 4 ));      [ "$LIGHT_CHILDREN"  -lt 2 ] && LIGHT_CHILDREN=2; }
 SKIP_USERS="${SKIP_USERS:-nobody}"
 
+# Only one heal run at a time. Two concurrent runs stage temp copies of the same
+# pool and the loser's rename is lost, orphaning a *.bhtmp.* file (seen on s3).
+# Exit quietly rather than queueing — the next tick is only 5 minutes away.
+exec 9>/run/bh-fpm-pool-heal.lock
+flock -n 9 || exit 0
+
+# Sweep any temp files orphaned by an interrupted earlier run.
+find /opt/alt/php-fpm*/usr/etc/php-fpm.d/users -maxdepth 1 -name '*.bhtmp.*' \
+     -mmin +10 -delete 2>/dev/null
+
 START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
 MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
 MAX_SPARE=$(( HEAVY_CHILDREN / 2 )); [ $MAX_SPARE -lt 4 ] && MAX_SPARE=4
@@ -1178,12 +1188,15 @@ for DIR in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users; do
     CUR_PM=$(grep -oE '^pm[[:space:]]*=[[:space:]]*[a-z]+' "$POOL" | head -1 | awk '{print $3}')
     CUR_CHILDREN=$(grep -oE '^pm\.max_children[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
     CUR_START=$(grep -oE '^pm\.start_servers[[:space:]]*=[[:space:]]*[0-9]+' "$POOL" | head -1 | awk '{print $3}')
-    # `|| echo 0` on every one: grep -c exits 1 on zero matches, which under
-    # `set -e` would abort the whole run — and zero is a legitimate result for a
-    # pool file that simply lacks the directive.
-    PM_LINE_COUNT=$(grep -cE '^pm[[:space:]]*=' "$POOL" || echo 0)
-    HAS_SPARES=$(grep -cE '^pm\.(start_servers|min_spare_servers|max_spare_servers)' "$POOL" || echo 0)
-    HAS_IDLE=$(grep -cE '^pm\.process_idle_timeout[[:space:]]*=' "$POOL" || echo 0)
+    # ⚠️ Guard the ASSIGNMENT, never `$(grep -c ... || echo 0)`. On zero matches
+    # grep -c PRINTS "0" *and* exits 1, so the `|| echo 0` fires as well and the
+    # variable becomes the two-line string "0\n0" — which never equals "0", so
+    # every skip test below failed and all 870 pools were rewritten every 5 min.
+    # That churn reloaded php-fpm ~288x/day per version, which is what SEGV'd
+    # php-fpm71/72 on s4 and opened the window that killed php-fpm83 on s3.
+    PM_LINE_COUNT=$(grep -cE '^pm[[:space:]]*=' "$POOL") || PM_LINE_COUNT=0
+    HAS_SPARES=$(grep -cE '^pm\.(start_servers|min_spare_servers|max_spare_servers)' "$POOL") || HAS_SPARES=0
+    HAS_IDLE=$(grep -cE '^pm\.process_idle_timeout[[:space:]]*=' "$POOL") || HAS_IDLE=0
 
     case "$TIER" in
       heavy)
