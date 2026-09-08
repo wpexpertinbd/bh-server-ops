@@ -2838,6 +2838,97 @@ else
 fi
 
 # ────────────────────────────────────────────────
+# 7a. WP_REDIS_PREFIX — one Redis keyspace per SITE
+# ────────────────────────────────────────────────
+# The Redis Object Cache drop-in falls back to the WordPress TABLE PREFIX when
+# WP_REDIS_PREFIX is unset. A table prefix is only unique inside its own MySQL
+# database, but Redis is ONE FLAT KEYSPACE for the whole server — so two sites
+# sharing a prefix read each other's options. Live case 2026-09-08: three s3
+# sites on our house standard `bb_` shared `bb_:options:alloptions`, and
+# painting-master.com.au served a WordPress 301 to lizaonlinebd.com because it
+# read liza's `home` value. Nothing was hacked; the DB was correct throughout.
+#
+# DB_NAME is the right key: unique per site even when ONE account hosts many
+# sites (deriving from the Unix user would re-create the bug one level up).
+# Applied to EVERY WP install, not just Redis-enabled ones — the constant is
+# inert without Redis, so a site that enables the plugin later is safe from its
+# first request instead of waiting for the next bootstrap run.
+if [ "${APPLY_WP_REDIS_PREFIX:-1}" = "1" ]; then
+  echo ""
+  echo "─── [7a/11] WP_REDIS_PREFIX (per-site Redis keyspace) ───"
+  wrp_done=0; wrp_have=0; wrp_fail=0
+  # ⚠️ Lint with `php -n`: this fleet loads ionCube + OPcache together, and in
+  # that combination `php -l` SEGFAULTS (exit 139, no output) on a perfectly
+  # valid file — which reads as "syntax error" and reverts good edits.
+  WRP_PHP=""
+  for _c in /opt/alt/php-fpm83/usr/bin/php /opt/alt/php-fpm82/usr/bin/php \
+            /opt/alt/php-fpm81/usr/bin/php /usr/bin/php; do
+    [ -x "$_c" ] && { WRP_PHP="$_c"; break; }
+  done
+  # ⚠️ Backups go to /root, NEVER beside the file: "wp-config.php.bak-…" does not
+  # end in .php, so Apache serves it as PLAIN TEXT and one leftover leaks the DB
+  # credentials to anyone who guesses the URL.
+  WRP_BAK_DIR=/root/bh-wpconfig-bak
+  mkdir -p "$WRP_BAK_DIR" && chmod 700 "$WRP_BAK_DIR"
+  while IFS= read -r _wpc; do
+    [ -f "$_wpc" ] || continue
+    if grep -q 'WP_REDIS_PREFIX' "$_wpc" 2>/dev/null; then
+      wrp_have=$((wrp_have+1)); continue
+    fi
+    grep -qE '^[[:space:]]*\$table_prefix[[:space:]]*=' "$_wpc" 2>/dev/null || continue
+    _bak="$WRP_BAK_DIR/$(echo "${_wpc#/}" | tr '/' '_').$(date +%Y%m%d-%H%M%S)"
+    cp -p "$_wpc" "$_bak" || continue
+    # Candidate must live in the SAME directory: /root and /home are separate
+    # filesystems, so only a same-dir temp can be renamed into place atomically.
+    _tmp="$(mktemp "$(dirname "$_wpc")/.bh-wpc.XXXXXX")" || { rm -f "$_bak"; continue; }
+    awk '
+      { print }
+      !ins && /^[[:space:]]*\$table_prefix[[:space:]]*=/ {
+        print ""
+        print "/* BH-REDIS-PREFIX: Redis is ONE flat keyspace per server, but a table prefix"
+        print "   is only unique inside its own database. DB_NAME is unique per site even"
+        print "   when one account hosts many sites. */"
+        print "define( '\''WP_REDIS_PREFIX'\'', DB_NAME . '\''_'\'' . $table_prefix );"
+        ins = 1
+      }
+    ' "$_bak" > "$_tmp" 2>/dev/null
+    # An empty/short awk output means something went wrong — never install it.
+    if [ ! -s "$_tmp" ] || [ "$(wc -c < "$_tmp")" -le "$(wc -c < "$_bak")" ]; then
+      rm -f "$_tmp" "$_bak"; wrp_fail=$((wrp_fail+1)); continue
+    fi
+    # ⚠️ Match owner/mode on the CANDIDATE, then rename over the original. Never
+    # redirect into the live wp-config.php: `> file` truncates first, so on an
+    # account that is AT its disk quota the write fails and leaves a 0-byte
+    # wp-config.php — i.e. the site down. (Happened live 2026-09-08 on s4
+    # /home/ekusheyb: "cat: write error: Disk quota exceeded", and an empty file
+    # lints clean so the old revert-on-lint-failure guard never fired.)
+    # Here the chown is what fails on an over-quota account, before anything is
+    # touched, and the rename is atomic — there is no window where the file is
+    # missing or half-written.
+    if ! chown --reference="$_wpc" "$_tmp" 2>/dev/null || \
+       ! chmod --reference="$_wpc" "$_tmp" 2>/dev/null; then
+      rm -f "$_tmp" "$_bak"
+      echo "  ⚠ skipped (cannot set owner/mode — account over quota?): $_wpc"
+      wrp_fail=$((wrp_fail+1)); continue
+    fi
+    if [ -n "$WRP_PHP" ] && ! "$WRP_PHP" -n -l "$_tmp" >/dev/null 2>&1; then
+      rm -f "$_tmp" "$_bak"
+      echo "  ⚠ skipped (lint failed): $_wpc"; wrp_fail=$((wrp_fail+1)); continue
+    fi
+    if mv -f "$_tmp" "$_wpc"; then
+      wrp_done=$((wrp_done+1))
+    else
+      rm -f "$_tmp"; echo "  ⚠ skipped (rename failed): $_wpc"; wrp_fail=$((wrp_fail+1))
+    fi
+  done <<EOF
+$(find /home -maxdepth 5 \( -path /home/tmp_bak -o -name node_modules -o -name .git \) -prune -o -name wp-config.php -type f -print 2>/dev/null)
+EOF
+
+  echo "✓ WP_REDIS_PREFIX: added $wrp_done, already set $wrp_have, skipped $wrp_fail"
+  echo "  backups: $WRP_BAK_DIR"
+fi
+
+# ────────────────────────────────────────────────
 # 7b. clamd resource cap (CPU/RAM/IO) — AV daemon is a known resource hog
 # ────────────────────────────────────────────────
 # clamd loads the full signature DB into RAM and spikes CPU + leaks RAM during
