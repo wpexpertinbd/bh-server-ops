@@ -1062,8 +1062,11 @@ exec 9>/run/bh-fpm-pool-heal.lock
 flock -n 9 || exit 0
 
 # Sweep any temp files orphaned by an interrupted earlier run.
-find /opt/alt/php-fpm*/usr/etc/php-fpm.d/users -maxdepth 1 -name '*.bhtmp.*' \
-     -mmin +10 -delete 2>/dev/null
+# Both prefixes: .bhtmp.* from pool_begin (reconcile) and .bhnew.* from
+# bh_write_base_pool (provisioning). Neither ends in .conf, so php-fpm's
+# users/*.conf include never loads one — but an orphan would sit there forever.
+find /opt/alt/php-fpm*/usr/etc/php-fpm.d/users -maxdepth 1 \
+     \( -name '*.bhtmp.*' -o -name '.bhnew.*' \) -mmin +10 -delete 2>/dev/null
 
 START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
 MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
@@ -1171,6 +1174,110 @@ apply_ondemand() {
   pool_commit "$TMP" "$POOL"
 }
 
+# ── Missing-pool provisioning ───────────────────────────────────────────────
+# The reconcile loop below can only fix a pool that EXISTS. A pool that was
+# never CREATED is invisible to it — a blind spot that costs a whole account.
+#
+# CWP sometimes half-finishes an account: it writes the vhost and records the
+# PHP version in the selector, but never writes the php-fpm pool. Apache then
+# hands .php to a socket nothing is listening on and every page is a 503:
+#   AH02454: FCGI: attempt to connect to Unix domain socket
+#            /opt/alt/php-fpm74/usr/var/sockets/<user>.sock (localhost:8000) failed
+# (The "localhost:8000" is only mod_proxy printing the default port for the
+# fcgi:// scheme — nothing connects to 8000, and it is NOT a database.)
+# Live case s3 2026-09-10: vault.rasbd.com, account created that morning, ZERO
+# pools on all 15 PHP versions while all 58 other FPM accounts had 15 each. The
+# panel cheerfully reported "php-fpm / 7.4 / Apache: Yes" the whole time —
+# panel state is not the artifact.
+#
+# So trust the VHOST, not the panel: a vhost that routes PHP to an FPM socket
+# is a promise that the pool exists. Make it true.
+bh_write_base_pool() {
+  # $1=version $2=user — writes a minimal VALID pool. The reconcile loop below
+  # runs afterwards on the same tick and sets the correct tier.
+  local V="$1" U="$2" D P T
+  D="/opt/alt/php-fpm${V}/usr/etc/php-fpm.d/users"
+  P="$D/${U}.conf"
+  [ -d "$D" ] || return 1
+  [ -e "$P" ] && return 1
+  T="$(mktemp "$D/.bhnew.XXXXXX")" || return 1
+  cat > "$T" <<POOLEOF
+[$U]
+listen = /opt/alt/php-fpm${V}/usr/var/sockets/${U}.sock
+listen.allowed_clients = 127.0.0.1
+listen.group = "nobody"
+listen.mode = 0660
+user = "$U"
+group = "$U"
+rlimit_files = 131072
+rlimit_core = unlimited
+catch_workers_output = yes
+env[HOSTNAME] = \$HOSTNAME
+env[TMP] = /home/${U}/tmp
+env[TMPDIR] = /home/${U}/tmp
+env[TEMP] = /home/${U}/tmp
+env[PATH] = /usr/local/bin:/usr/bin:/bin
+request_terminate_timeout = 30s
+pm = ondemand
+pm.max_children = ${LIGHT_CHILDREN}
+pm.max_requests = 500
+pm.process_idle_timeout = 30s
+POOLEOF
+  chown root:root "$T" 2>/dev/null
+  chmod 644 "$T" 2>/dev/null
+  mv -f "$T" "$P"
+}
+
+CREATED=0
+VHOST_SOCKS="$(
+  for VD in /usr/local/apache/conf.d/vhosts /etc/httpd/conf.d/vhosts \
+            /usr/local/apache/conf.d /etc/httpd/conf.d; do
+    [ -d "$VD" ] || continue
+    grep -rhoE 'proxy:unix:/opt/alt/php-fpm[0-9]+/usr/var/sockets/[A-Za-z0-9._-]+\.sock' \
+         "$VD" 2>/dev/null
+  done | sort -u
+)"
+# ⚠️ here-string, NOT a pipe: `... | while read` runs the loop in a SUBSHELL and
+# every CREATED increment is discarded, so the reload below would never fire.
+while read -r REF; do
+  [ -n "$REF" ] || continue
+  SOCK="${REF#proxy:unix:}"
+  [ -S "$SOCK" ] && continue                       # healthy — the common case
+  SV="${SOCK#/opt/alt/php-fpm}"; SV="${SV%%/*}"    # version from the socket path
+  SU="${SOCK##*/}"; SU="${SU%.sock}"               # user from the socket path
+  case "$SV" in ''|*[!0-9]*) continue ;; esac      # version must be numeric
+  case "$SU" in ''|*/*|.*) continue ;; esac        # never a path or dotfile
+  case " $SKIP_USERS " in *" $SU "*) continue ;; esac
+  # Must be a real, non-system, unsuspended account with a home dir.
+  UID_N="$(id -u "$SU" 2>/dev/null)" || continue
+  case "$UID_N" in ''|*[!0-9]*) continue ;; esac
+  [ "$UID_N" -ge 1000 ] || continue
+  [ -d "/home/$SU" ] || continue
+  [ -e "/usr/local/cwp/users/suspended/$SU" ] && continue
+  # A pool that EXISTS but has no socket is a dead/never-reloaded service, not a
+  # missing pool — the recovery sweep at the end of this script owns that case.
+  [ -e "/opt/alt/php-fpm${SV}/usr/etc/php-fpm.d/users/${SU}.conf" ] && continue
+
+  # Provision the referenced version FIRST (that is the live 503), then every
+  # other installed version so switching PHP in the panel can't reproduce this.
+  for V in "$SV" $(ls -d /opt/alt/php-fpm* 2>/dev/null | sed 's|.*/php-fpm||'); do
+    case "$V" in ''|*[!0-9]*) continue ;; esac
+    [ -d "/opt/alt/php-fpm${V}/usr/etc/php-fpm.d/users" ] || continue
+    bh_write_base_pool "$V" "$SU" || continue
+    # One malformed pool aborts EVERY pool on that PHP version — never leave a
+    # freshly written pool in place unless the whole config still parses.
+    BIN="/opt/alt/php-fpm${V}/usr/sbin/php-fpm"
+    CFG="/opt/alt/php-fpm${V}/usr/etc/php-fpm.conf"
+    if [ -x "$BIN" ] && [ -f "$CFG" ] && ! "$BIN" -t -y "$CFG" >/dev/null 2>&1; then
+      rm -f "/opt/alt/php-fpm${V}/usr/etc/php-fpm.d/users/${SU}.conf"
+      echo "$(date '+%Y-%m-%d %H:%M:%S') REFUSED new pool $SU on php-fpm$V (config test failed)" >> /var/log/bh-fpm-heal.log
+      continue
+    fi
+    CREATED=$((CREATED+1))
+    echo "$(date '+%Y-%m-%d %H:%M:%S') CREATED missing pool $SU on php-fpm$V" >> /var/log/bh-fpm-heal.log
+  done
+done <<< "$VHOST_SOCKS"
+
 # Single reconcile loop over every pool conf: figure the user's desired tier
 # (default LIGHT), skip if already in the correct clean state, else re-apply.
 HEAVY_N=0; MEDIUM_N=0; LIGHT_N=0; CHANGED=0
@@ -1226,11 +1333,15 @@ for DIR in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users; do
   done
 done
 
-if [ $CHANGED -gt 0 ]; then
+# ⚠️ CREATED must be in this condition, not just CHANGED. A newly written pool
+# whose tier already matches makes the reconcile loop `continue` (CHANGED=0), so
+# gating on CHANGED alone would write the pool and never reload — the socket
+# would never appear and the site would stay 503 with the fix already on disk.
+if [ $CHANGED -gt 0 ] || [ $CREATED -gt 0 ]; then
   for SVC in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php-fpm[0-9]+\.service$'); do
     systemctl reload "$SVC" >/dev/null 2>&1
   done
-  echo "$(date '+%Y-%m-%d %H:%M:%S') changed=$CHANGED (heavy=$HEAVY_N medium=$MEDIUM_N light=$LIGHT_N)" >> /var/log/bh-fpm-heal.log
+  echo "$(date '+%Y-%m-%d %H:%M:%S') changed=$CHANGED created=$CREATED (heavy=$HEAVY_N medium=$MEDIUM_N light=$LIGHT_N)" >> /var/log/bh-fpm-heal.log
 fi
 
 # ── Recovery sweep — runs EVERY tick, even when CHANGED=0 ────────────────────
@@ -1279,6 +1390,18 @@ HEALSCRIPT
 HEALCRON
   touch /var/log/bh-fpm-heal.log
   echo "✓ heal cron installed: /usr/local/sbin/bh-fpm-pool-heal.sh (every 5 min)"
+
+  # Run it once now. The heal script owns missing-pool provisioning, so without
+  # this a bootstrap run would leave a 503'ing account broken for up to 5 more
+  # minutes even though the fix is already installed.
+  # ⚠️ Count BEFORE and AFTER — grepping the whole log would report pools that a
+  # previous run provisioned days ago as if this run had just created them.
+  POOLS_BEFORE=$(grep -c "CREATED missing pool" /var/log/bh-fpm-heal.log 2>/dev/null) || POOLS_BEFORE=0
+  /usr/local/sbin/bh-fpm-pool-heal.sh >/dev/null 2>&1
+  POOLS_AFTER=$(grep -c "CREATED missing pool" /var/log/bh-fpm-heal.log 2>/dev/null) || POOLS_AFTER=0
+  if [ "$POOLS_AFTER" -gt "$POOLS_BEFORE" ] 2>/dev/null; then
+    echo "  ✓ provisioned $((POOLS_AFTER - POOLS_BEFORE)) missing FPM pool(s) — see /var/log/bh-fpm-heal.log"
+  fi
 fi
 
 # ────────────────────────────────────────────────
