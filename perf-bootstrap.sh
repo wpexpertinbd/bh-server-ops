@@ -98,6 +98,10 @@ TMPBAK_JANITOR_MINAGE="${TMPBAK_JANITOR_MINAGE:-10}"    # only delete dirs untou
 APPLY_DOMLOGS_ROTATE="${APPLY_DOMLOGS_ROTATE:-1}"        # 1 = rotate CWP per-domain Apache logs (they are NOT rotated by anything)
 DOMLOGS_ROTATE_KEEP="${DOMLOGS_ROTATE_KEEP:-7}"          # days of per-domain logs to keep
 DOMLOGS_ROTATE_MAXSIZE="${DOMLOGS_ROTATE_MAXSIZE:-100M}" # rotate early if one domain floods
+APPLY_SYSLOG_ROTATE="${APPLY_SYSLOG_ROTATE:-1}"          # 1 = rotate system/panel/php-fpm logs nothing else owns
+SYSLOG_ROTATE_KEEP="${SYSLOG_ROTATE_KEEP:-14}"           # days of system/panel/php-fpm logs to keep
+BHLOG_ROTATE_KEEP="${BHLOG_ROTATE_KEEP:-30}"             # days of our own /var/log/bh-*.log to keep
+RETIRE_CLEARLOG="${RETIRE_CLEARLOG:-1}"                  # 1 = disable hand-written clearlog.sh blanket truncation
 # WordPress edge guard (nginx 6c): hard-block wp-cron.php over HTTP globally +
 # rate-limit wp-login.php per real-client-IP — kills bot floods on these
 # endpoints at the edge before they spawn PHP workers, country-independent
@@ -3164,6 +3168,174 @@ DLROT
   fi
 else
   echo "⊘ domlogs rotation skipped (set APPLY_DOMLOGS_ROTATE=1 / no domlogs dir)"
+fi
+
+echo ""
+echo "─── [7f/11] System + panel log rotation (retires clearlog.sh) ───"
+# Everything logrotate does NOT already own was being handled by a hand-written
+# clearlog.sh (/root/ or /usr/local/bin/) on a 00:00 cron that blanket
+# `truncate -s 0`'d the lot — /var/log/secure, /var/log/maillog,
+# /var/log/cwp/activity.log, the domlogs, and even the <domain>.bytes BANDWIDTH
+# COUNTERS. Those are exactly the files incident response reads; on 2026-09-13 a
+# run wiped the php-fpm heal history mid-investigation. Real rotation gives the
+# same disk ceiling AND keeps the history.
+#
+# ⚠️⚠️ NEVER declare a log another logrotate config already owns: logrotate
+#      errors "duplicate log entry" and SKIPS it, so one duplicate here silently
+#      stops fail2ban/lfd/syslog rotating. Measured on s3: 584 files are already
+#      managed, incl. fail2ban.log/lfd.log/monit.log/dnf.* — a naive
+#      /var/log/*.log glob collides with all of them. The misc list is therefore
+#      COMPUTED by subtracting what logrotate already considers, and the whole
+#      config is gated on a duplicate-free dry run.
+# ⚠️ `logrotate -d` writes to STDERR. Parsing it with 2>/dev/null returns ZERO
+#      managed files and every collision check silently passes.
+# ⚠️ copytruncate throughout, no postrotate reloads: apache/php-fpm/cwpsrv hold
+#      these open, and reloading 15 php-fpm versions daily is the reload storm
+#      that killed php-fpm83 for 19h (2026-09-01).
+if [ "$APPLY_SYSLOG_ROTATE" = "1" ]; then
+  SL_CONF=/etc/logrotate.d/bh-logs
+  SL_MANAGED=$(mktemp); SL_MISC=$(mktemp)
+
+  # ⚠️ IDEMPOTENCY: move our own config aside before measuring. On a re-run it is
+  # itself in /etc/logrotate.d, so logrotate would report the paths WE added as
+  # "already managed", the computed misc list would come back empty, and the
+  # second run would silently drop those paths back out of coverage.
+  # ⚠️⚠️ It must move OUT of /etc/logrotate.d entirely. `include /etc/logrotate.d`
+  #      reads EVERY file in that directory whatever its name, so a "bh-logs.prev"
+  #      left beside it is still fully in effect — measured: the path count then
+  #      oscillates 26 → 5 → 26 on successive runs. (Same reason a stray .bak or
+  #      .rpmnew in /etc/logrotate.d silently double-rotates a log.)
+  SL_PREV=""
+  if [ -f "$SL_CONF" ]; then SL_PREV=$(mktemp); mv "$SL_CONF" "$SL_PREV"; fi
+
+  logrotate -d /etc/logrotate.conf 2>&1 | sed -n 's/^considering log //p' | sort -u > "$SL_MANAGED"
+
+  # Misc /var/log/*.log nothing owns (bh-*.log has its own stanza below).
+  ls /var/log/*.log 2>/dev/null | sort -u > "${SL_MISC}.all" || true
+  if [ -s "${SL_MISC}.all" ]; then
+    comm -23 "${SL_MISC}.all" "$SL_MANAGED" | grep -v '^/var/log/bh-' > "$SL_MISC" || true
+  fi
+
+  cat > "$SL_CONF" <<'SLROT'
+# bh-logs-rotate v1 — logs that no other logrotate config owns.
+# Replaces the blanket-truncating clearlog.sh cron (perf-bootstrap [7f]).
+# copytruncate throughout: apache/php-fpm/cwpsrv hold these open and must NOT be
+# reloaded merely to rotate a log.
+/usr/local/apache/logs/*_log
+/usr/local/apache/logs/*.log
+/usr/local/cwpsrv/logs/*_log
+/opt/alt/*/usr/var/log/php-fpm.log
+{
+    daily
+    rotate __KEEP__
+    maxsize 200M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+
+/var/log/bh-*.log {
+    daily
+    rotate __BHKEEP__
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+SLROT
+
+  if [ -s "$SL_MISC" ]; then
+    {
+      echo ""
+      cat "$SL_MISC"
+      cat <<'SLMISC'
+{
+    daily
+    rotate __KEEP__
+    maxsize 100M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+SLMISC
+    } >> "$SL_CONF"
+  fi
+  sed -i "s/__KEEP__/$SYSLOG_ROTATE_KEEP/g; s/__BHKEEP__/$BHLOG_ROTATE_KEEP/g" "$SL_CONF"
+
+  # Gate: refuse to install anything that collides with an existing config.
+  SL_DUP=$(logrotate -d /etc/logrotate.conf 2>&1 | grep -ci 'duplicate log entry') || SL_DUP=0
+  if [ "${SL_DUP:-1}" -ne 0 ]; then
+    rm -f "$SL_CONF"
+    if [ -n "$SL_PREV" ]; then mv "$SL_PREV" "$SL_CONF"; fi
+    echo "⚠ config would create $SL_DUP duplicate log entr(ies) — reverted, no change"
+  else
+    if [ -n "$SL_PREV" ]; then rm -f "$SL_PREV"; fi
+    chmod 644 "$SL_CONF"; chown root:root "$SL_CONF"
+    SL_N=$(grep -c '^/' "$SL_CONF") || SL_N=0
+    echo "✓ rotation installed for $SL_N log path(s) (keep=${SYSLOG_ROTATE_KEEP}d, bh-*=${BHLOG_ROTATE_KEEP}d)"
+
+    # rsyslog's own config carries no directives, so it inherits the global
+    # weekly/rotate 4/UNCOMPRESSED. With clearlog.sh gone maillog is no longer
+    # truncated daily, and one weekly file on a busy mail server reaches GBs.
+    # /etc/logrotate.d/syslog is %config(noreplace) → our edit survives updates.
+    # Rebuilt from its OWN path list so an added path is never dropped.
+    if [ -f /etc/logrotate.d/syslog ] && ! grep -qE '^[[:space:]]*compress' /etc/logrotate.d/syslog; then
+      SL_SYSPATHS=$(sed -n '1,/^{/p' /etc/logrotate.d/syslog | grep '^/') || SL_SYSPATHS=""
+      if [ -n "$SL_SYSPATHS" ]; then
+        cp -a /etc/logrotate.d/syslog "/root/logrotate-syslog.bak-$(date +%Y%m%d-%H%M%S)"
+        {
+          echo "$SL_SYSPATHS"
+          cat <<SLSYS
+{
+    daily
+    rotate $SYSLOG_ROTATE_KEEP
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/bin/systemctl -s HUP kill rsyslog.service >/dev/null 2>&1 || true
+    endscript
+}
+SLSYS
+        } > /etc/logrotate.d/syslog
+        echo "  ✓ syslog (messages/maillog/secure/cron) → daily, keep ${SYSLOG_ROTATE_KEEP}d, compressed"
+      fi
+    fi
+
+    # Retire the blanket-truncation cron. Reversible: the crontab line is
+    # commented (not deleted) and the script renamed, never removed.
+    if [ "$RETIRE_CLEARLOG" = "1" ]; then
+      SL_CT=$(mktemp)
+      if crontab -l > "$SL_CT" 2>/dev/null && grep -q 'clearlog' "$SL_CT"; then
+        cp "$SL_CT" "/root/crontab.bak-clearlog-$(date +%Y%m%d-%H%M%S)"
+        sed -i 's|^\([^#].*clearlog.*\)$|# retired by perf-bootstrap [7f] — replaced by /etc/logrotate.d/bh-logs: \1|' "$SL_CT"
+        if crontab "$SL_CT"; then
+          echo "  ✓ clearlog cron commented out in root crontab"
+        fi
+      fi
+      rm -f "$SL_CT"
+      for SL_P in /root/clearlog.sh /usr/local/bin/clearlog.sh; do
+        if [ -f "$SL_P" ]; then
+          mv "$SL_P" "${SL_P}.retired-$(date +%Y%m%d)"
+          echo "  ✓ $SL_P → ${SL_P}.retired-$(date +%Y%m%d)"
+        fi
+      done
+    fi
+  fi
+  rm -f "$SL_MANAGED" "$SL_MISC" "${SL_MISC}.all"
+else
+  echo "⊘ system log rotation skipped (set APPLY_SYSLOG_ROTATE=1)"
 fi
 
 echo "─── [7c/11] tmp_bak backup-staging janitor ───"
