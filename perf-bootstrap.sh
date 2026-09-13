@@ -102,6 +102,7 @@ APPLY_SYSLOG_ROTATE="${APPLY_SYSLOG_ROTATE:-1}"          # 1 = rotate system/pan
 SYSLOG_ROTATE_KEEP="${SYSLOG_ROTATE_KEEP:-14}"           # days of system/panel/php-fpm logs to keep
 BHLOG_ROTATE_KEEP="${BHLOG_ROTATE_KEEP:-30}"             # days of our own /var/log/bh-*.log to keep
 RETIRE_CLEARLOG="${RETIRE_CLEARLOG:-1}"                  # 1 = disable hand-written clearlog.sh blanket truncation
+APPLY_WP_IMPLANT_SCAN="${APPLY_WP_IMPLANT_SCAN:-1}"      # 1 = scan for DB-anchored WP implants (detection only + daily cron)
 # WordPress edge guard (nginx 6c): hard-block wp-cron.php over HTTP globally +
 # rate-limit wp-login.php per real-client-IP — kills bot floods on these
 # endpoints at the edge before they spawn PHP workers, country-independent
@@ -3947,6 +3948,91 @@ if [ "$APPLY_CWP_ADMIN_IPLOCK" = "1" ]; then
   fi
 else
   echo "⊘ CWP admin IP lock skipped (set APPLY_CWP_ADMIN_IPLOCK=1 to enable)"
+fi
+
+
+echo ""
+echo "─── [10d/11] WP DB-anchored implant scan ───"
+# Detects the malware family found on maishacare.com 2026-09-13 (implanted 2026-06-23,
+# undetected for 11 weeks). It stores its payload bodies ENCRYPTED IN THE DATABASE as
+# fake `theme_mods_<12-hex>` option rows, and injects a resurrection anchor into
+# wp-config.php: a register_shutdown_function that, after any PHP fatal, reads a row,
+# base64+XOR-decodes it, rewrites the file and chmod 0444's it.
+#
+# ⚠️⚠️ THIS IS WHY FILE SCANNERS LOSE. cpGuard quarantined the dropped children
+#      1,096 times in a month (~35/day) and never once flagged the parent — the file
+#      it deletes is rebuilt from the DB on the next fatal error. maldet cannot see it
+#      either: the body is not on disk between drops. Scanning files alone is a
+#      treadmill; you must look at wp-config AND the options table.
+# ⚠️ DETECTION ONLY — never auto-remove. Cleanup means editing wp-config.php (which
+#      holds the DB credentials) and deleting DB rows; a false positive there takes a
+#      customer offline. Report and let a human read it.
+# ⚠️ `theme_mods_<slug>` is a LEGITIMATE WordPress option — every site has them, named
+#      after the theme (theme_mods_twentytwentyfour). Only a 12-hex name that ALSO
+#      carries a serialized path/content/hash payload is malicious.
+if [ "$APPLY_WP_IMPLANT_SCAN" = "1" ]; then
+  WIS=/usr/local/sbin/bh-wp-implant-scan.sh
+  cat > "$WIS" <<'WISEOF'
+#!/bin/bash
+# bh-wp-implant-scan v1 — detect DB-anchored WordPress implants. DETECTION ONLY.
+# See perf-bootstrap [10d/11]. Logs only when it finds something.
+LOG=/var/log/bh-wp-implant-scan.log
+FOUND=0; REPORT=""
+note() { REPORT="${REPORT}$1"$'\n'; FOUND=$((FOUND+1)); }
+
+while IFS= read -r CFG; do
+  [ -f "$CFG" ] || continue
+  DOC=$(dirname "$CFG")
+
+  # (1) resurrection anchor in wp-config.php — highly specific, near-zero false positives
+  A=$(grep -cE '_wph_xor|_wph_targets|_wph_anchor_armed' "$CFG" 2>/dev/null) || A=0
+  [ "${A:-0}" -gt 0 ] && note "ANCHOR    $CFG ($A refs to _wph_* + register_shutdown_function)"
+
+  # (2) any function body in wp-config at all is abnormal
+  F=$(grep -cE '^\s*function\s+[A-Za-z_]' "$CFG" 2>/dev/null) || F=0
+  [ "${F:-0}" -gt 0 ] && note "WPCONFIG  $CFG declares $F function(s) — wp-config should declare none"
+
+  # (3) encrypted payload rows in the options table
+  DB=$(grep -oE "define\(\s*'DB_NAME'\s*,\s*'[^']+" "$CFG" 2>/dev/null | sed "s/.*'//")
+  PX=$(grep -oE "^\s*\\\$table_prefix\s*=\s*['\"][^'\"]+" "$CFG" 2>/dev/null | sed "s/.*['\"]//")
+  if [ -n "$DB" ] && [ -n "$PX" ]; then
+    R=$(mysql -N -B "$DB" -e "SELECT COUNT(*) FROM ${PX}options WHERE option_name REGEXP '^theme_mods_[0-9a-f]{12}\$' AND option_value REGEXP 's:7:\"content\"' AND option_value REGEXP 's:4:\"hash\"';" 2>/dev/null) || R=0
+    [ "${R:-0}" -gt 0 ] && note "DBPAYLOAD $DB (${PX}options): $R fake theme_mods_<hex> row(s) carrying path+content+hash"
+  fi
+
+  # (4) the generator's signature: many one-line funcs returning a defined constant
+  G=$(grep -rlE --include='*.php' 'function (wp|wpa|wpc|wpd|wpm|wpse|_wp)[a-z_]*[0-9]{1,2}\(\)[[:space:]]*\{[[:space:]]*return' \
+        "$DOC/wp-content/themes" "$DOC/wp-content/plugins" "$DOC/wp-content/mu-plugins" 2>/dev/null | head -5)
+  [ -n "$G" ] && while IFS= read -r g; do note "GENERATOR $g"; done <<< "$G"
+
+  # (5) known dropped payload names carrying dangerous calls
+  for p in "$DOC/wp-content/object-cache.php" "$DOC/wp-content/db.php" \
+           "$DOC/wp-content/mu-plugins/wp-site-diagnostics.php" "$DOC/wp-content/query-optimizer.php"; do
+    [ -f "$p" ] || continue
+    D=$(grep -coiE 'xor_decode|hex2bin|shell_exec|passthru|\$_(GET|POST|COOKIE)\[[a-z_]+\(' "$p" 2>/dev/null) || D=0
+    [ "${D:-0}" -gt 0 ] && note "PAYLOAD   $p ($D dangerous call(s) — legit dropins have none)"
+  done
+done <<< "$(find /home -maxdepth 3 -name wp-config.php -type f 2>/dev/null)"
+
+if [ "$FOUND" -gt 0 ]; then
+  { echo "=== $(date '+%F %T') $FOUND finding(s) on $(hostname) ==="; echo "$REPORT"; } >> "$LOG"
+  echo "$REPORT"
+fi
+exit 0
+WISEOF
+  chmod 700 "$WIS"; chown root:root "$WIS"
+  printf '%s\n' 'MAILTO=""' '17 4 * * * root /usr/local/sbin/bh-wp-implant-scan.sh >/dev/null 2>&1' \
+    > /etc/cron.d/bh-wp-implant-scan
+  chmod 644 /etc/cron.d/bh-wp-implant-scan
+  WIS_OUT=$("$WIS" 2>/dev/null)
+  if [ -n "$WIS_OUT" ]; then
+    echo "🚨 DB-ANCHORED IMPLANT INDICATORS FOUND — investigate, do NOT auto-clean:"
+    echo "$WIS_OUT" | sed 's/^/    /'
+  else
+    echo "✓ no implant indicators ($(find /home -maxdepth 3 -name wp-config.php 2>/dev/null | wc -l) WP installs checked; daily cron installed)"
+  fi
+else
+  echo "⊘ WP implant scan skipped (set APPLY_WP_IMPLANT_SCAN=1)"
 fi
 
 
