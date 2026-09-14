@@ -103,11 +103,19 @@ SYSLOG_ROTATE_KEEP="${SYSLOG_ROTATE_KEEP:-14}"           # days of system/panel/
 BHLOG_ROTATE_KEEP="${BHLOG_ROTATE_KEEP:-30}"             # days of our own /var/log/bh-*.log to keep
 RETIRE_CLEARLOG="${RETIRE_CLEARLOG:-1}"                  # 1 = disable hand-written clearlog.sh blanket truncation
 APPLY_WP_IMPLANT_SCAN="${APPLY_WP_IMPLANT_SCAN:-1}"      # 1 = scan for DB-anchored WP implants (detection only + daily cron)
+APPLY_WP_CRON_PROVISION="${APPLY_WP_CRON_PROVISION:-1}"  # 1 = provision the system wp-cron the [6c] HTTP block requires
+WP_CRON_INTERVAL_MIN="${WP_CRON_INTERVAL_MIN:-60}"       # minutes between wp-cron runs (60 = matches cpGuard's setting)
+PHP_LINT_BIN="${PHP_LINT_BIN:-$(command -v php 2>/dev/null || echo /usr/bin/php)}"  # used to lint wp-config before replacing it
 # WordPress edge guard (nginx 6c): hard-block wp-cron.php over HTTP globally +
 # rate-limit wp-login.php per real-client-IP — kills bot floods on these
 # endpoints at the edge before they spawn PHP workers, country-independent
-# (complements CC_IGNORE without un-whitelisting BD customers). SAFE: wp-cron
-# runs via php-CLI cron (not HTTP) so blocking HTTP wp-cron doesn't touch it;
+# (complements CC_IGNORE without un-whitelisting BD customers).
+# ⚠️⚠️ THIS COMMENT USED TO SAY "SAFE: wp-cron runs via php-CLI cron (not HTTP)
+# so blocking HTTP wp-cron doesn't touch it". THAT WAS WRONG and it cost a
+# managed client every scheduled task on 19 sites for 4 months. WordPress's cron
+# IS the HTTP spawn by default; a CLI cron exists only if something creates one.
+# Blocking the HTTP path is still right (bot floods), but it MUST be paired with
+# step [6l], which provisions the replacement cron / reports where cpGuard owns it.
 # CF real_ip is already set on CWP so the rate-limit keys on the true visitor.
 # xmlrpc.php is already hard-blocked (return 444) in the anti-bot snippet.
 APPLY_WP_EDGE_GUARD="${APPLY_WP_EDGE_GUARD:-1}"
@@ -2173,6 +2181,150 @@ if [ -f /usr/local/cwpsrv/bin/cwpsrv ]; then
   fi
 else
   echo "⊘ cwpsrv not present — skipping"
+fi
+
+echo ""
+echo "─── [6l/11] WordPress cron provisioning (pairs with the [6c] wp-cron block) ───"
+# ⚠️⚠️ THIS FIXES A BUG OF OURS. [6c]/[10] block wp-cron.php over HTTP in THREE
+# places (nginx 444, the hardening LocationMatch, and a httpd.conf FilesMatch),
+# and the comment there claimed "SAFE: wp-cron runs via php-CLI cron (not HTTP)".
+# That premise is FALSE by default: WordPress's cron IS the HTTP spawn unless
+# somebody creates a system cron. Where nobody did, EVERY scheduled task died —
+# Action Scheduler (Woo order emails, stock sync), plugin crons, auto-updates,
+# scheduled posts. Reported by a managed client 2026-09-14 on fran01: 19 of 19
+# WP installs dead since 2026-05-14 and 83,750 denied wp-cron requests, because
+# WordPress retries the spawn on EVERY page view — so it is a load problem too.
+#
+# 🔴 OWNERSHIP: on boxes running cpGuard (s1-s4) cpGuard CREATES AND REWRITES the
+#    per-site wp-cron crontabs from its own dashboard setting (hourly). Writing
+#    our own entries there would be clobbered or duplicated — the same boundary
+#    as cpGuard owning the firewall. So: PROVISION only where cpGuard is absent,
+#    REPORT the gaps where it is present (fix those in the cpGuard dashboard).
+#    Measured on s3 2026-09-14: cpGuard covers ~70% — it missed 24 of 94 primary
+#    docroots AND 21 of 58 addon domains, so "it handles it" is not a given.
+# ⚠️ NEVER set DISABLE_WP_CRON unless a cron actually exists for that site, or
+#    you remove the HTTP spawn AND leave no replacement = fully dead cron.
+# ⚠️ Add crontab entries via `( crontab -l; echo LINE ) | crontab -` — writing
+#    /var/spool/cron/<user> directly is the CWP trap that silently drops jobs.
+if [ "$APPLY_WP_CRON_PROVISION" = "1" ]; then
+  WPC_CPG=0
+  { [ -d /etc/cpguard ] || pgrep -x cpguard >/dev/null 2>&1; } && WPC_CPG=1
+  WPC_LIST=$(mktemp)
+  find /home -maxdepth 3 -name wp-config.php -type f 2>/dev/null > "$WPC_LIST"
+  WPC_TOT=0; WPC_ADD=0; WPC_FIX=0; WPC_DIS=0; WPC_GAP=0; WPC_GAPLIST=""
+
+  while IFS= read -r WPC_CFG; do
+    [ -f "$WPC_CFG" ] || continue
+    WPC_TOT=$((WPC_TOT+1))
+    WPC_DOC=$(dirname "$WPC_CFG")
+    WPC_USR=$(stat -c%U "$WPC_CFG" 2>/dev/null) || continue
+    [ -n "$WPC_USR" ] && [ "$WPC_USR" != root ] || continue
+
+    WPC_HAS=$(crontab -u "$WPC_USR" -l 2>/dev/null | grep -cF "$WPC_DOC" ) || WPC_HAS=0
+    # a line we wrote previously (carries our marker) — distinguishable from
+    # cpGuard's and from anything the customer added themselves
+    WPC_OURS=$(crontab -u "$WPC_USR" -l 2>/dev/null | awk -v d="$WPC_DOC" 'index($0,d) && index($0,"# bh-wp-cron")' | head -1) || WPC_OURS=""
+
+    if [ "${WPC_HAS:-0}" -eq 0 ] || [ -n "$WPC_OURS" ]; then
+      if [ "$WPC_CPG" = "1" ]; then
+        # cpGuard owns crontabs here — report, don't fight it
+        if [ "${WPC_HAS:-0}" -eq 0 ]; then
+          WPC_GAP=$((WPC_GAP+1)); WPC_GAPLIST="${WPC_GAPLIST}    $WPC_DOC"$'\n'
+        fi
+        continue
+      fi
+      # pick the site's OWN php binary (system php may be a different major and
+      # fatal on that site's plugins — the CLI-vs-web version trap)
+      # ⚠️ Find the vhost BY ITS DocumentRoot, not by basename($docroot) — a primary
+      # site's vhost is named after the DOMAIN, so basename() yields "public_html.conf"
+      # which never exists. And guard every grep: an unguarded command substitution
+      # whose grep finds nothing returns 1 and `set -e` kills the whole run silently.
+      # ⚠️⚠️ RUNNING wp-cron UNDER THE WRONG PHP MAJOR IS WORSE THAN NOT RUNNING IT:
+      # it fatals and the job silently never completes. Measured on fran01
+      # 2026-09-14: /usr/bin/php is 8.2 while the sites declare php74 via suPHP —
+      # php82 → "Unparenthesized a?b:c?d:e is not supported" fatal in revslider;
+      # php74 → 0 fatals. So resolve the version the SITE actually runs, two ways:
+      #   1. php-fpm<NN> named in its vhost  (our fleet)
+      #   2. AddHandler x-httpd-php<NN> in its .htaccess  (suPHP boxes like fran01)
+      # …and only then fall back to the system php.
+      WPC_V=""; WPC_PHP=/usr/bin/php
+      WPC_VH=$(grep -rl "DocumentRoot $WPC_DOC" /usr/local/apache/conf.d/vhosts/ 2>/dev/null | head -1) || WPC_VH=""
+      if [ -n "$WPC_VH" ]; then
+        WPC_V=$(grep -hoE 'php-fpm[0-9]+' "$WPC_VH" 2>/dev/null | head -1) || WPC_V=""
+      fi
+      if [ -z "$WPC_V" ] && [ -f "$WPC_DOC/.htaccess" ]; then
+        WPC_H=$(grep -hoE 'x-httpd-(alt-)?php[0-9]+' "$WPC_DOC/.htaccess" 2>/dev/null | head -1) || WPC_H=""
+        [ -n "$WPC_H" ] && WPC_V="php$(printf '%s' "$WPC_H" | grep -oE '[0-9]+$')"
+      fi
+      if [ -n "$WPC_V" ] && [ -x "/opt/alt/${WPC_V}/usr/bin/php" ]; then
+        WPC_PHP="/opt/alt/${WPC_V}/usr/bin/php"
+      fi
+      # stagger the minute per account so 100 sites don't all fire on the hour
+      WPC_MIN=$(( $(printf '%s' "$WPC_USR" | cksum | cut -d' ' -f1) % 60 ))
+      WPC_EVERY=$(( WP_CRON_INTERVAL_MIN / 60 )); [ "$WPC_EVERY" -lt 1 ] && WPC_EVERY=1
+      WPC_LINE="$WPC_MIN */$WPC_EVERY * * * cd $WPC_DOC; /bin/nice -n15 $WPC_PHP -q wp-cron.php >/dev/null 2>&1 # bh-wp-cron"
+      WPC_WRITE=0
+      if [ -n "$WPC_OURS" ]; then
+        # ours already — rewrite ONLY if the resolved php binary changed
+        case "$WPC_OURS" in *" $WPC_PHP "*) WPC_WRITE=0 ;; *) WPC_WRITE=2 ;; esac
+      elif [ "${WPC_HAS:-0}" -eq 0 ]; then
+        WPC_WRITE=1
+      fi
+      if [ "$WPC_WRITE" -ne 0 ]; then
+        # drop only OUR previous line for this docroot, never the customer's or cpGuard's
+        if { crontab -u "$WPC_USR" -l 2>/dev/null | awk -v d="$WPC_DOC" '!(index($0,d) && index($0,"# bh-wp-cron"))'; printf '%s\n' "$WPC_LINE"; } | crontab -u "$WPC_USR" - 2>/dev/null; then
+          WPC_NOW=$(crontab -u "$WPC_USR" -l 2>/dev/null | grep -cF "$WPC_PHP -q wp-cron.php") || WPC_NOW=0
+          if [ "${WPC_NOW:-0}" -gt 0 ]; then
+            if [ "$WPC_WRITE" = "1" ]; then WPC_ADD=$((WPC_ADD+1)); else WPC_FIX=$((WPC_FIX+1)); fi
+          fi
+        fi
+      fi
+      WPC_HAS=1
+    fi
+
+    # only now that a cron exists is it safe to stop the (blocked) HTTP spawn
+    if [ "${WPC_HAS:-0}" -gt 0 ]; then
+      # ⚠️ Guard on the constant existing AT ALL, not on it being `true`. PHP keeps
+      # the FIRST define() and warns on the second, so appending `true` to a file
+      # that already says `false` is a no-op plus a notice. Leave those alone.
+      WPC_D=$(grep -c "DISABLE_WP_CRON" "$WPC_CFG" 2>/dev/null) || WPC_D=0
+      if [ "${WPC_D:-0}" -eq 0 ]; then
+        WPC_TMP="$WPC_DOC/.wp-config.wpcron.$$"
+        awk 'BEGIN{done=0}
+             !done && (/That.s all, stop editing/ || /require_once ABSPATH/) {
+               print "define( '"'"'DISABLE_WP_CRON'"'"', true ); // BH: HTTP wp-cron is blocked; a system cron runs it"
+               done=1 }
+             { print }' "$WPC_CFG" > "$WPC_TMP" 2>/dev/null
+        if [ -s "$WPC_TMP" ] && grep -q 'DISABLE_WP_CRON' "$WPC_TMP" \
+           && grep -q 'DB_PASSWORD' "$WPC_TMP" \
+           && "${PHP_LINT_BIN:-php}" -n -l "$WPC_TMP" >/dev/null 2>&1; then
+          chown --reference="$WPC_CFG" "$WPC_TMP" 2>/dev/null
+          chmod --reference="$WPC_CFG" "$WPC_TMP" 2>/dev/null
+          mv "$WPC_TMP" "$WPC_CFG" && WPC_DIS=$((WPC_DIS+1))
+        else
+          rm -f "$WPC_TMP"
+        fi
+      fi
+    fi
+  done < "$WPC_LIST"
+  rm -f "$WPC_LIST"
+
+  if [ "$WPC_CPG" = "1" ]; then
+    echo "✓ cpGuard detected — it owns per-site wp-cron here, so nothing was written"
+    echo "  WP installs: $WPC_TOT   DISABLE_WP_CRON asserted: $WPC_DIS"
+    if [ "$WPC_GAP" -gt 0 ]; then
+      echo "  🔴 $WPC_GAP site(s) have NO wp-cron job — cpGuard has not picked them up."
+      echo "     Their scheduled tasks are DEAD. Fix in the cpGuard dashboard (rescan/enable):"
+      printf '%s' "$WPC_GAPLIST" | head -15
+    else
+      echo "  ✓ every WP install has a wp-cron job"
+    fi
+  else
+    echo "✓ no cpGuard — provisioned directly"
+    echo "  WP installs: $WPC_TOT   crons added: $WPC_ADD   wrong-php crons corrected: $WPC_FIX   DISABLE_WP_CRON asserted: $WPC_DIS"
+  fi
+else
+  echo "⊘ WP cron provisioning skipped (set APPLY_WP_CRON_PROVISION=1)"
 fi
 
 # ────────────────────────────────────────────────
