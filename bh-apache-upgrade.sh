@@ -2,8 +2,11 @@
 # bh-apache-upgrade.sh — upgrade CWP's Apache (/usr/local/apache) to a newer 2.4.x
 # from apache.org source, WITHOUT touching any configuration.
 #
-#   bash bh-apache-upgrade.sh 2.4.69               # build, verify, install, restart, health-check
-#   bash bh-apache-upgrade.sh 2.4.69 --build-only  # build + verify only, install nothing
+#   bash bh-apache-upgrade.sh                      # upgrade to the LATEST 2.4.x on apache.org
+#   bash bh-apache-upgrade.sh --check              # only show current vs latest, change nothing
+#   bash bh-apache-upgrade.sh --build-only         # build + verify the latest, install nothing
+#   bash bh-apache-upgrade.sh 2.4.69               # a specific version instead of the latest
+#   bash bh-apache-upgrade.sh 2.4.69 --build-only
 #
 # Why not CWP's apache-rebuild.sh (also the alphagnu "latest Apache" guide):
 #   - it DELETES conf/httpd.conf and installs a stock one (our BH hardening block,
@@ -22,10 +25,27 @@
 #
 # ⚠ Afterwards `rpm -V cwp-httpd` flags bin/ + modules/ (expected). Use the
 # sha256 manifest this writes to /root/bh-apache-manifests/ for tamper checks.
-# A later `yum update cwp-httpd` would overwrite this build.
+# On success it adds cwp-httpd* to exclude= in /etc/yum.conf so yum can't revert it.
+# Usage guide: README.md → "Apache upgrade".
 set -euo pipefail
 
-VER="${1:-}"; MODE="${2:-}"
+VER=""; MODE=""
+for arg in "$@"; do
+  case "$arg" in
+    --build-only|--check) [ -z "$MODE" ] || { echo "✗ use only one of --build-only / --check" >&2; exit 1; }; MODE="$arg" ;;
+    -h|--help) cat <<'USAGE'
+bh-apache-upgrade.sh — upgrade CWP's Apache to a newer 2.4.x, configuration untouched
+  bash bh-apache-upgrade.sh                 upgrade to the LATEST 2.4.x on apache.org
+  bash bh-apache-upgrade.sh --check         show installed vs latest, change nothing
+  bash bh-apache-upgrade.sh --build-only    build + verify the latest, install nothing
+  bash bh-apache-upgrade.sh 2.4.69 [--check|--build-only]   a specific version
+Guide: README.md -> "Apache upgrade"
+USAGE
+      exit 0 ;;
+    2.4.*) [ -z "$VER" ] || { echo "✗ give only one version" >&2; exit 1; }; VER="$arg" ;;
+    *) echo "✗ unknown argument: $arg  (try --help)" >&2; exit 1 ;;
+  esac
+done
 A=/usr/local/apache
 LOG=/var/log/bh-apache-upgrade.log
 TS=$(date +%Y%m%d-%H%M%S)
@@ -37,16 +57,37 @@ SIGNERS="${BH_APACHE_SIGNERS:-65B2D44FE74BD5E3DE3AC3F082781DE46D5954FA}"
 
 die(){ echo "✗ $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
-[[ "$VER" =~ ^2\.4\.[0-9]{1,3}$ ]] || die "usage: $0 <2.4.x> [--build-only]"
-[ -z "$MODE" ] || [ "$MODE" = --build-only ] || die "unknown option: $MODE"
 [ -x "$A/bin/httpd" ] || die "$A/bin/httpd not found — not a CWP Apache"
+
+# Latest 2.4.x = highest httpd-2.4.N.tar.gz in apache.org's release directory
+# (it only keeps current releases). Authenticity is still enforced below by
+# SHA-256 + the pinned PGP signer, so a wrong listing can't install anything unsigned.
+latest_24(){
+  curl -fsSL --max-time 30 https://downloads.apache.org/httpd/ 2>/dev/null \
+    | grep -oE 'httpd-2\.4\.[0-9]{1,3}\.tar\.gz' | sed -E 's/^httpd-|\.tar\.gz$//g' | sort -uV | tail -1 || true
+}
+CUR=$("$A/bin/httpd" -v | grep -oE 'Apache/[0-9.]+' | cut -d/ -f2) || die "could not read the installed Apache version ($A/bin/httpd -v)"
+if [ -z "$VER" ]; then
+  VER=$(latest_24)
+  [ -n "$VER" ] || die "could not determine the latest 2.4.x from downloads.apache.org — pass a version, e.g. $0 2.4.69"
+  _src="latest on apache.org"
+else
+  _src="requested"
+fi
+[[ "$VER" =~ ^2\.4\.[0-9]{1,3}$ ]] || die "bad version '$VER' — expected 2.4.N"
+
+if [ "$MODE" = --check ]; then
+  echo "installed: $CUR   $_src: $VER"
+  if [ "$CUR" = "$VER" ]; then echo "✓ up to date"
+  elif [ "$(printf '%s\n%s\n' "$CUR" "$VER" | sort -V | tail -1)" = "$VER" ]; then echo "↑ upgrade available: run  bash $0 $VER"
+  else echo "installed is newer than $VER"; fi
+  exit 0
+fi
 
 exec > >(tee -a "$LOG") 2>&1
 exec 9>/run/bh-apache-upgrade.lock
 flock -n 9 || die "another bh-apache-upgrade is running"
-echo "=== bh-apache-upgrade $VER ${MODE} on $(hostname -s) at $TS ==="
-
-CUR=$("$A/bin/httpd" -v | grep -oE 'Apache/[0-9.]+' | cut -d/ -f2)
+echo "=== bh-apache-upgrade $VER ($_src) ${MODE} on $(hostname -s) at $TS ==="
 echo "current: $CUR"
 if [ "$CUR" = "$VER" ] && [ -z "$MODE" ]; then echo "✓ already $VER — nothing to do"; exit 0; fi
 [ "$(printf '%s\n%s\n' "$CUR" "$VER" | sort -V | tail -1)" = "$VER" ] || die "$VER is OLDER than the running $CUR — refusing to downgrade"
@@ -213,5 +254,29 @@ mkdir -p "$MANIFEST_DIR"
 if ! (cd "$A" && find bin modules -type f -print0 | sort -z | xargs -0 sha256sum) > "$MANIFEST_DIR/apache-$VER-$TS.sha256"; then
   echo "⚠ could not write the sha256 manifest — upgrade itself is fine"
 fi
+# Stop yum from "updating" this build back to CWP's older cwp-httpd package.
+# EL8: /etc/yum.conf is a SYMLINK to /etc/dnf/dnf.conf — edit the real file (sed -i
+# would replace the link with a detached copy dnf never reads). Accept `exclude=`,
+# `exclude = …` and `excludepkgs=`; append to the existing key inside [main] (a second
+# key would silently override the first), else add one right after [main].
+yum_exclude_cwp_httpd(){
+  local yc tmp
+  yc=$(readlink -f /etc/yum.conf 2>/dev/null); [ -f "$yc" ] || yc=/etc/dnf/dnf.conf
+  [ -f "$yc" ] || return 1
+  grep -qE '^[[:space:]]*(exclude|excludepkgs)[[:space:]]*=.*cwp-httpd' "$yc" && return 0
+  cp -p "$yc" "$yc.bak-$TS" || return 1
+  tmp=$(mktemp) || return 1
+  awk '
+    /^\[/ { if (inmain && !done) { print "exclude=cwp-httpd*"; done=1 } inmain = ($0 ~ /^\[main\]/) }
+    inmain && !done && /^[[:space:]]*(exclude|excludepkgs)[[:space:]]*=/ { sub(/[[:space:]]*$/, " cwp-httpd*"); done=1 }
+    { print }
+    END { if (!done) print "exclude=cwp-httpd*" }
+  ' "$yc" > "$tmp" && cat "$tmp" > "$yc"     # cat > keeps the file's inode, owner and mode
+  rm -f "$tmp"
+}
+if ! yum_exclude_cwp_httpd; then echo "⚠ could not edit the yum config — add cwp-httpd* to exclude= in /etc/dnf/dnf.conf by hand"
+elif dnf -q --setopt=skip_if_unavailable=True repoquery cwp-httpd 2>/dev/null | grep -q cwp-httpd; then
+  echo "⚠ yum can still see cwp-httpd — check exclude= in /etc/dnf/dnf.conf"
+else echo "✓ yum: cwp-httpd* excluded (verified: dnf no longer lists it)"; fi
 echo "✓ Apache $CUR → $VER on $(hostname -s); backup $BACKUP"
 echo "  tamper check from now on: cd $A && sha256sum -c --quiet $MANIFEST_DIR/apache-$VER-$TS.sha256"

@@ -281,6 +281,73 @@ sed -i 's/\r$//' /root/perf-bootstrap.sh
 
 **Tip:** Always use `curl` instead of SCP — fetched files always have correct LF line endings.
 
+## Apache upgrade (`bh-apache-upgrade.sh`)
+
+Upgrades CWP's Apache (`/usr/local/apache`) to the newest 2.4.x from apache.org — CWP's own
+repo lags behind (its rebuild default is still 2.4.65). **Configuration is never touched.**
+
+```bash
+# SSH to the server as root, then:
+curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/bh-apache-upgrade.sh -o /root/bh-apache-upgrade.sh
+
+bash /root/bh-apache-upgrade.sh --check        # 1. installed vs latest — changes nothing
+bash /root/bh-apache-upgrade.sh --build-only   # 2. download, verify, build — installs nothing
+bash /root/bh-apache-upgrade.sh                # 3. upgrade to the latest 2.4.x
+```
+
+- **No version given = latest 2.4.x** found on downloads.apache.org. Name one to pin it:
+  `bash /root/bh-apache-upgrade.sh 2.4.69` (also works with `--build-only` / `--check`).
+- Already on that version → "nothing to do". An **older** version is refused (no accidental downgrades).
+- Do **one server at a time**, at a quiet hour. Apache is down a few seconds (2–10 s measured) during
+  the restart; nginx answers 502 for that moment.
+
+What it does, in order — and stops before touching anything if a check fails:
+
+1. Refuses if the current config fails `httpd -t`, if `build/config.nice` doesn't match the CWP build
+   options, or if there is less than 2 GB free.
+2. Downloads `httpd-<ver>.tar.gz`, checks its **SHA-256** and that it is **PGP-signed by the pinned
+   Apache release-manager key** (`65B2D44F…5954FA`; override with `BH_APACHE_SIGNERS="<fpr> …"` only after
+   checking https://downloads.apache.org/httpd/KEYS).
+3. Builds with the **same `./configure` options as CWP's cwp-httpd** package. CWP's `suexec.patch` is
+   *not* applied — no server of ours runs it, and it has an infinite-loop bug.
+4. Records a health baseline (each vhost's own `IP:8181`), backs up `/usr/local/apache` to
+   `/root/bh-apache-backup-<time>.tgz`.
+5. `make install` → proves every live config file is **byte-identical** → `httpd -t` → fast restart
+   (suPHP `php-cgi` is killed after 10 s instead of systemd's 90 s wait) → health check.
+6. **Any failure after the install rolls back automatically** to the backup and restarts the old Apache.
+7. Writes a fingerprint list to `/root/bh-apache-manifests/apache-<ver>-<time>.sha256`.
+8. Adds `cwp-httpd*` to `exclude=` in `/etc/dnf/dnf.conf` (that's the real file — `/etc/yum.conf`
+   is a symlink to it; appends to an existing `exclude`/`excludepkgs` line, backup `dnf.conf.bak-<time>`),
+   so `yum update` can't put CWP's older package back. Check: `dnf repoquery cwp-httpd` prints nothing.
+
+Log of every run: `/var/log/bh-apache-upgrade.log`.
+
+⚠️ **Trojan checks change:** `rpm -V cwp-httpd` now reports every Apache binary/module as modified
+(expected — they're no longer the RPM's). Check for tampering with the fingerprint list instead:
+
+```bash
+cd /usr/local/apache && sha256sum -c --quiet "$(ls -t /root/bh-apache-manifests/*.sha256 | head -1)"   # no output = clean
+```
+
+(Use only the newest manifest — builds aren't byte-reproducible, so an older one for the same version
+gives a false alarm.)
+
+⛔ **Don't use CWP's "Apache Re-Build" / `apache-rebuild.sh` (or guides based on it) on our servers.**
+It deletes `conf/httpd.conf` (our hardening block, MPM include, DirectoryIndex, upload limits),
+overwrites `sharedip.conf` + `system-redirects.conf`, fetches its patch over plain http, verifies
+nothing and has no rollback.
+
+**Manual rollback** (rarely needed — the script rolls back by itself):
+
+```bash
+systemctl kill --signal=SIGKILL httpd    # plain "stop" can hang 90 s on suPHP php-cgi
+tar xzf /root/bh-apache-backup-<time>.tgz -C / --exclude=usr/local/apache/conf --exclude=usr/local/apache/conf.d
+systemctl reset-failed httpd; systemctl start httpd && /usr/local/apache/bin/httpd -v
+```
+
+If you roll back to CWP's own package for good, remove ` cwp-httpd*` from the `exclude=` line in
+`/etc/dnf/dnf.conf`, otherwise yum will never update cwp-httpd again.
+
 ## Helper commands
 
 After bootstrap, three commands are available system-wide.
