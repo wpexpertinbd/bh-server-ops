@@ -80,18 +80,29 @@ yum -y -q install gcc make gnupg2 openssl-devel apr-devel apr-util-devel pcre2-d
 
 W=$(mktemp -d /usr/local/src/bh-apache-XXXXXX)
 INSTALLING=0; DONE=0
+# Stop the WHOLE httpd unit fast. suPHP sites run php-cgi inside the httpd cgroup and
+# ignore SIGTERM: httpd itself exits at once, but systemd stays in 'stop-sigterm' until
+# TimeoutStopSec (90 s) and only then lets `systemctl start` run — s1 was down 94 s
+# on 2026-10-05 that way. So: TERM everything, give it 10 s, then KILL the rest.
+unit_stopped(){ systemctl show -p ActiveState --value httpd 2>/dev/null | grep -qE '^(inactive|failed)$'; }
+hard_stop(){
+  systemctl kill --signal=SIGTERM httpd 2>/dev/null || true
+  for _i in $(seq 1 10); do unit_stopped && break; sleep 1; done
+  unit_stopped || systemctl kill --signal=SIGKILL httpd 2>/dev/null || true
+  for _i in $(seq 1 15); do unit_stopped && break; sleep 1; done
+  systemctl reset-failed httpd 2>/dev/null || true
+}
 rollback(){
   set +e
   trap - EXIT ERR
   echo "!!! ROLLING BACK to $CUR from $BACKUP"
-  systemctl kill --signal=SIGTERM httpd 2>/dev/null   # hard stop: TERM = immediate
-  for _i in $(seq 1 30); do pgrep -x httpd >/dev/null || break; sleep 1; done
+  hard_stop
   # Restore program files only — config was proven unchanged, and restoring it
   # could revert a vhost CWP wrote in the meantime.
   if ! tar xzf "$BACKUP" -C / --exclude=usr/local/apache/conf --exclude=usr/local/apache/conf.d; then
     echo "✗✗ RESTORE FAILED — Apache files may be mixed; backup is $BACKUP"
   fi
-  systemctl reset-failed httpd 2>/dev/null; systemctl start httpd
+  systemctl start httpd
   sleep 2
   echo "after rollback: $("$A/bin/httpd" -v 2>&1 | head -1) | httpd is $(systemctl is-active httpd)"
   [ "$(systemctl is-active httpd)" = active ] || echo "✗✗ APACHE IS DOWN — start it by hand: systemctl start httpd"
@@ -181,11 +192,11 @@ echo "  modules replaced by the build: $(echo "$modchg" | wc -w)  (third-party m
 "$A/bin/httpd" -t || { echo "✗ httpd -t fails with the new binary"; rollback; }
 
 echo "─── restart (hard stop: in-flight requests are cut, outage is seconds not minutes)"
-systemctl kill --signal=SIGTERM httpd || true
-for _i in $(seq 1 30); do pgrep -x httpd >/dev/null || break; sleep 1; done
-pgrep -x httpd >/dev/null && { echo "✗ old httpd did not exit"; rollback; }
-systemctl reset-failed httpd 2>/dev/null || true
+T0=$(date +%s)
+hard_stop
+unit_stopped || { echo "✗ httpd unit did not stop"; rollback; }
 systemctl start httpd || { echo "✗ start failed"; rollback; }
+echo "  Apache was down $(( $(date +%s) - T0 )) s"
 for _i in $(seq 1 20); do [ "$(systemctl is-active httpd)" = active ] && break; sleep 1; done
 [ "$(systemctl is-active httpd)" = active ] || { echo "✗ httpd not active"; rollback; }
 RUNV=$("$A/bin/httpd" -v | grep -oE 'Apache/[0-9.]+' | cut -d/ -f2)
