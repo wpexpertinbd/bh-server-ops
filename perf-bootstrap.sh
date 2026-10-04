@@ -748,10 +748,15 @@ else
     else
       _slots=$(( ((_files * 13 / 10) / 10000 + 1) * 10000 )); [ "$_slots" -lt 20000 ] && _slots=20000
       _mb=$(( _files * 15 / 1024 )); _mb=$(( (_mb / 128 + 1) * 128 )); [ "$_mb" -lt 256 ] && _mb=256
-      if   [ "$_sites" -ge 20 ]; then _int=64
-      elif [ "$_sites" -ge 10 ]; then _int=48
-      elif [ "$_sites" -ge 5 ];  then _int=32
-      else _int=16; fi
+      # Interned strings scale with the CODE, not the site count. Measured on s4
+      # 2026-10-04: EVERY active version was 0% free (php83 64M with 77k scripts,
+      # php81/82/85 32M), and php84 used 48.8M of a fresh 64M at ~18k scripts
+      # (~2.7 KB/cached script). A full buffer silently pushes strings into
+      # per-worker memory. Like memory_consumption it is a virtual reservation.
+      # The buffer is carved OUT of memory_consumption, so add it on top — otherwise
+      # a bigger buffer quietly shrinks the opcode space.
+      _int=$(( (_mb / 10 + 7) / 8 * 8 )); [ "$_int" -lt 32 ] && _int=32; [ "$_int" -gt 512 ] && _int=512
+      _mb=$(( ((_mb + _int) / 128 + 1) * 128 ))
     fi
     _oc_total=$(( _oc_total + _mb ))
     _oc_plan="${_oc_plan}${INI_DIR}|${_v}|${_sites}|${_files}|${_mb}|${_slots}|${_int}
@@ -767,11 +772,16 @@ else
       if [ "$_s" -gt 0 ]; then
         _mb=$(( _mb * _oc_budget / _oc_total )); _mb=$(( (_mb / 128 + 1) * 128 ))
         [ "$_mb" -lt 256 ] && _mb=256
+        [ "$_mb" -lt $(( _in + 256 )) ] && _mb=$(( _in + 256 ))   # interned is inside _mb
       fi
       _tot2=$(( _tot2 + _mb )); _new="${_new}${_dir}|${_v}|${_s}|${_fl}|${_mb}|${_sl}|${_in}
 "
     done <<< "$_oc_plan"
     _oc_plan="$_new"; _oc_total=$_tot2
+    # Floors (256M opcode + interned) can keep the total above budget on small boxes.
+    if [ "$_oc_total" -gt "$_oc_budget" ]; then
+      echo "⚠ still ${_oc_total}M after scale-back (floors) — over the ${_oc_budget}M budget; virtual, but check RAM"
+    fi
   fi
 
   while IFS='|' read -r _dir _v _s _fl _mb _sl _in; do
@@ -791,7 +801,7 @@ opcache.revalidate_freq=60
 opcache.validate_timestamps=1
 opcache.max_wasted_percentage=10
 EOF
-    printf "✓ php%-3s sites=%-3s files=%-7s → %sM / %s slots\n" "${_v:-?}" "$_s" "$_fl" "$_mb" "$_sl"
+    printf "✓ php%-3s sites=%-3s files=%-7s → %sM (%sM interned) / %s slots\n" "${_v:-?}" "$_s" "$_fl" "$_mb" "$_in" "$_sl"
   done <<< "$_oc_plan"
   echo "  total ${_oc_total}M of ${_oc_budget}M budget (${OPCACHE_RAM_PCT}% of ${_oc_ram}M RAM)"
   echo "  ⚠ new sizes need a php-fpm restart to take effect (opcache shm is allocated at startup)"
@@ -820,30 +830,47 @@ for V in $(ls -d /opt/alt/php-fpm* 2>/dev/null | grep -oE '[0-9]+$' | sort -n); 
   [ -n "$vh" ] || continue
   D=$(grep -hoE 'DocumentRoot [^ ]+' "$vh" | head -1 | awk '{print $2}')
   DOM=$(grep -hoE 'ServerName [^ ]+' "$vh" | head -1 | awk '{print $2}')
-  U=$(grep -hoE 'suPHP_UserGroup [a-z0-9_]+' "$vh" | head -1 | awk '{print $2}')
+  D="${D%/}"   # CWP writes some DocumentRoots with a trailing slash
   [ -d "$D" ] && [ -n "$DOM" ] || continue
-  PROBE="$D/bh-ocp-$$-${RANDOM}.php"
-  cat > "$PROBE" <<'PHPPROBE'
+  # ⚠ SECURITY: the docroot belongs to a CUSTOMER. Root must never write or chown a
+  # path there — `cat >` and `chown` follow a pre-planted symlink (e.g. the old
+  # guessable "bh-ocp-$$-$RANDOM.php" -> /etc/passwd = customer owns /etc/passwd).
+  # So the probe is created BY the docroot owner, via mktemp (O_EXCL, unguessable).
+  U=$(stat -c %U "$D" 2>/dev/null)
+  if [ -z "$U" ] || [ "$U" = root ]; then emit "  php$V  (skipped: $D not owned by a site user)"; continue; fi
+  # setpriv, not runuser: runuser applies the user's PAM nproc limit, and a busy
+  # site already at its cap fails with "Resource temporarily unavailable".
+  PROBE=$(env -i PATH=/usr/bin:/bin setpriv --reuid="$U" --regid="$U" --init-groups -- /bin/bash -c 'umask 022; f=$(mktemp -p "$1" --suffix=.php bh-ocp-XXXXXXXXXX) && cat > "$f" && chmod 644 "$f" && echo "$f"' _ "$D" <<'PHPPROBE'
 <?php $s=@opcache_get_status(false); if(!$s){echo '{"err":1}';exit;}
 $m=$s['memory_usage'];$t=$s['opcache_statistics'];$tot=$m['used_memory']+$m['free_memory']+$m['wasted_memory'];
 echo json_encode(['full'=>$s['cache_full']?1:0,'oom'=>$t['oom_restarts'],
 'used'=>round($m['used_memory']/1048576),'free'=>round($m['free_memory']/1048576),
 'freepct'=>round(100*$m['free_memory']/max(1,$tot),1),'wasted'=>round($m['current_wasted_percentage'],1),
 'scripts'=>$t['num_cached_scripts'],
-'hit'=>round(100*$t['hits']/max(1,$t['hits']+$t['misses']),1)]);
+'hit'=>round(100*$t['hits']/max(1,$t['hits']+$t['misses']),1),
+'ibuf'=>isset($s['interned_strings_usage'])?round($s['interned_strings_usage']['buffer_size']/1048576):0,
+'ifreepct'=>isset($s['interned_strings_usage'])?round(100*$s['interned_strings_usage']['free_memory']/max(1,$s['interned_strings_usage']['buffer_size']),1):100]);
 PHPPROBE
-  [ -n "$U" ] && chown "$U":"$U" "$PROBE" 2>/dev/null
+)
+  case "$PROBE" in
+    "$D"/bh-ocp-??????????.php) ;;
+    *) # never leave a status page behind in a customer docroot (rm does not follow symlinks)
+       case "$PROBE" in */bh-ocp-??????????.php) rm -f -- "$PROBE" ;; esac
+       emit "  php$V  (could not create probe as $U)"; PROBE=""; continue ;;
+  esac
   out=$(curl -sk --max-time 20 --resolve "$DOM:443:${SRVIP:-127.0.0.1}" "https://$DOM/$(basename "$PROBE")?x=$RANDOM" 2>/dev/null)
   rm -f "$PROBE"; PROBE=""
   g(){ echo "$out" | grep -oE "\"$1\":[0-9.]+" | grep -oE '[0-9.]+$'; }
-  full=$(g full); oom=$(g oom); used=$(g used); free=$(g free); fpct=$(g freepct); wst=$(g wasted); scr=$(g scripts); hit=$(g hit)
+  full=$(g full); oom=$(g oom); used=$(g used); free=$(g free); fpct=$(g freepct); wst=$(g wasted); scr=$(g scripts); hit=$(g hit); ibuf=$(g ibuf); ifp=$(g ifreepct)
   [ -z "$full" ] && { emit "  php$V  (no reading from $DOM)"; continue; }
   state="ok"
   [ "${full:-0}" = "1" ] && state="FULL"
   [ "${oom:-0}" -gt 0 ] 2>/dev/null && state="OOM($oom)"
   awk "BEGIN{exit !(${fpct:-100}<10)}" && [ "$state" = "ok" ] && state="LOW(${fpct}%)"
+  # A full interned-strings buffer is invisible to cache_full/oom and still costs every request.
+  awk "BEGIN{exit !(${ifp:-100}<5)}" && [ "$state" = "ok" ] && state="INTERNED-FULL(${ibuf}M)"
   [ "$QUIET" = 0 ] && printf "  php%-2s %-6s %-9s %-9s %-7s %-8s %-6s %s\n" "$V" "${full:-?}" "${used}M" "${free}M" "$wst" "$scr" "$hit" "$state"
-  [ "$state" != "ok" ] && alert "php$V $state used=${used}M free=${free}M(${fpct}%) scripts=$scr hit=${hit}% oom=$oom"
+  [ "$state" != "ok" ] && alert "php$V $state used=${used}M free=${free}M(${fpct}%) interned=${ibuf}M ifree=${ifp:-?}% scripts=$scr hit=${hit}% oom=$oom"
 done
 BHOCMON
 chmod +x /usr/local/sbin/bh-opcache-monitor.sh
@@ -853,7 +880,7 @@ cat > /etc/cron.d/bh-opcache-monitor <<'EOF'
 17 6 * * * root /bin/bash /usr/local/sbin/bh-opcache-monitor.sh --quiet
 EOF
 chmod 644 /etc/cron.d/bh-opcache-monitor
-echo "✓ /usr/local/sbin/bh-opcache-monitor.sh + daily cron 06:17 (alerts on FULL / OOM / <10% free)"
+echo "✓ /usr/local/sbin/bh-opcache-monitor.sh + daily cron 06:17 (alerts on FULL / OOM / <10% free / interned <5% free)"
 
 # ────────────────────────────────────────────────
 # 2c. CSF: exclude php-fpm from process-tracking (VSZ false alarms)
