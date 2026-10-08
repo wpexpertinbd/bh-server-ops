@@ -348,6 +348,24 @@ systemctl reset-failed httpd; systemctl start httpd && /usr/local/apache/bin/htt
 If you roll back to CWP's own package for good, remove ` cwp-httpd*` from the `exclude=` line in
 `/etc/dnf/dnf.conf`, otherwise yum will never update cwp-httpd again.
 
+## Reboot-safe start order (`bh-boot-order.sh`)
+
+Two systemd drop-ins found necessary during the 2026-10-08 fleet reboots. Idempotent, restarts nothing:
+
+```bash
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/bh-boot-order.sh -o "$f" \
+  && bash "$f"; rm -f "$f"
+bash bh-boot-order.sh --check     # verify on any server
+```
+
+| Drop-in | Problem it prevents |
+|---|---|
+| `httpd.service.d/bh-network-online.conf` | ModSecurity (cpGuard MEWAF) downloads rules over HTTPS at start; Apache started before the network was up, hung, was killed at 90 s → sites down ~2.5 min (s3). Now waits for `network-online.target`, 180 s timeout. |
+| `amavisd.service.d/bh-listen-check.conf` | amavis came up "active" but not listening on `127.0.0.1:10024` (s3: nothing, biswashost: only `[::1]`) → Postfix deferred all mail. Now the start fails unless `127.0.0.1:10024` answers within 120 s, so `Restart=on-failure` retries. |
+
+**After any reboot also check by hand:** `bash -c '</dev/tcp/127.0.0.1/10024' && echo amavis OK` and `postqueue -p | tail -1`.
+Undo: delete the two files and `systemctl daemon-reload`.
+
 ## MariaDB account watcher (`bh-mysql-user-audit.sh`)
 
 **Alert-only** — it never changes anything. Every 5 minutes it looks for:
