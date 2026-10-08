@@ -64,25 +64,31 @@ notify(){ # $1 level, $2 subject, $3 message — returns 0 only if the CWP notif
 # On a NEW critical finding, snapshot everything that could show HOW it was created (CWP panel/API
 # request, a cron/CWP update, a package update, a running process), while it is still fresh — CWP
 # rotates its panel logs daily and MariaDB has no record of when a user was created.
-capture_evidence(){ # $1 = the new critical findings
-  local d="$EVID_DIR/mysql-$(date +%Y%m%d-%H%M%S)" f
+capture_evidence(){ # $1 = the new critical findings. Runs AFTER the alert; every step is time- and size-capped.
+  local d="$EVID_DIR/mysql-$(date +%Y%m%d-%H%M%S)" f cap=5M
   mkdir -p "$d" && chmod 700 "$EVID_DIR" "$d" || return 1
   printf '%s\n' "$1" > "$d/findings.txt"
   { date; uptime; } > "$d/when.txt"
-  # CWP admin/user panel + API access logs: last 3000 lines of each (≈ the minutes before)
+  # CWP admin/user panel + API logs: last 3000 lines of each (≈ the minutes before), max 5 MB per file
   for f in /usr/local/cwpsrv/logs/*access_log /usr/local/cwpsrv/logs/*error_log; do
-    [ -f "$f" ] && tail -n 3000 "$f" > "$d/cwpsrv-$(basename "$f").tail" 2>/dev/null
+    [ -f "$f" ] && timeout 20 tail -n 3000 "$f" 2>/dev/null | tail -c $cap > "$d/cwpsrv-$(basename "$f").tail"
   done
-  grep -hiE "mysql|database|dbuser|phpmyadmin|pma" "$d"/cwpsrv-*access_log.tail > "$d/cwpsrv-mysql-requests.txt" 2>/dev/null
-  tail -n 400 /var/log/cron > "$d/cron.tail" 2>/dev/null
-  { tail -n 80 /var/log/dnf.rpm.log 2>/dev/null; echo "--- rpm -qa --last"; rpm -qa --last 2>/dev/null | head -40; } > "$d/packages.txt"
-  find /usr/local/cwpsrv /usr/local/cwp /scripts -xdev -type f -mmin -1440 2>/dev/null | head -300 > "$d/cwp-files-changed-24h.txt"
-  ps -eo pid,ppid,user,lstart,etime,args --sort=start_time 2>/dev/null | tail -n 150 > "$d/processes.txt"
-  timeout 30 "$MYSQL" -e "SHOW FULL PROCESSLIST" > "$d/mariadb-processlist.txt" 2>&1
+  grep -hiE "mysql|database|dbuser|phpmyadmin|pma" "$d"/cwpsrv-*access_log.tail 2>/dev/null | tail -c $cap > "$d/cwpsrv-mysql-requests.txt"
+  timeout 20 tail -n 400 /var/log/cron 2>/dev/null | tail -c $cap > "$d/cron.tail"
+  # rpm -qa waits on the rpmdb lock during a yum/dnf run (e.g. a CWP update) — hence the timeouts
+  { timeout 20 tail -n 80 /var/log/dnf.rpm.log 2>/dev/null; echo "--- rpm -qa --last"; timeout 30 rpm -qa --last 2>/dev/null | head -40; } > "$d/packages.txt"
+  timeout 60 find /usr/local/cwpsrv /usr/local/cwp /scripts -xdev -path /usr/local/cwpsrv/logs -prune -o \
+    -type f -mmin -1440 -printf '%TF %TT %p\n' 2>/dev/null | sort -r | head -300 > "$d/cwp-files-changed-24h.txt"
+  timeout 20 ps -eo pid,ppid,user,lstart,etime,args --sort=start_time 2>/dev/null | tail -n 150 | cut -c1-1000 > "$d/processes.txt"
+  timeout 30 "$MYSQL" -e "SHOW FULL PROCESSLIST" 2>&1 | head -c $cap > "$d/mariadb-processlist.txt"
   timeout 30 "$MYSQL" -Nse "SELECT User,Host,JSON_REMOVE(Priv,'\$.authentication_string') FROM mysql.global_priv WHERE User IN ('','PUBLIC') OR Host LIKE '%\\%%'" > "$d/mariadb-suspect-accounts.txt" 2>&1
   timeout 30 "$MYSQL" -Nse "SELECT * FROM mysql.db WHERE User IN ('','PUBLIC') OR LEFT(Db,1) IN ('_','%')" > "$d/mariadb-suspect-db-grants.txt" 2>&1
-  journalctl --since "-30 min" --no-pager -u mariadb -u cwpsrv -u crond 2>/dev/null | tail -n 300 > "$d/journal.tail"
+  timeout 30 journalctl --since "-30 min" --no-pager -u mariadb -u cwpsrv -u crond 2>/dev/null | tail -n 300 > "$d/journal.tail"
   chmod -R go-rwx "$d"
+  # Retention: keep the newest 10 snapshots (only our own mysql-* folders are ever removed)
+  ls -1dt "$EVID_DIR"/mysql-[0-9]*-[0-9]* 2>/dev/null | tail -n +11 | while IFS= read -r old; do
+    case "$old" in "$EVID_DIR"/mysql-[0-9]*) rm -rf -- "$old" ;; esac
+  done
   echo "$d"
 }
 
@@ -140,18 +146,19 @@ last=$(cat "$CRIT_STAMP" 2>/dev/null || echo 0); now=$(date +%s)
 realert=""; [ -n "$crit" ] && [ $((now - last)) -ge "$REALERT_CRITICAL_SECS" ] && realert="$crit"
 alert=$(printf '%s\n%s\n' "$new" "$realert" | grep . | sort -u || true)
 
+# Evidence bookkeeping: one snapshot per critical finding, tracked apart from alert delivery (a failed
+# notification keeps a finding "new" for retry — that must not re-snapshot every 5 min). Entries whose
+# finding has cleared are dropped EVERY run, so a recurrence always gets a fresh snapshot.
+EVID_SEEN="$STATE.evidence-taken"
+if [ -f "$EVID_SEEN" ]; then
+  comm -12 <(sort -u "$EVID_SEEN") <(printf '%s\n' "$crit" | grep . | sort -u) > "$EVID_SEEN.tmp" || true
+  mv -f "$EVID_SEEN.tmp" "$EVID_SEEN"
+fi
+newcrit=$(comm -13 <(sort -u "$EVID_SEEN" 2>/dev/null) <(printf '%s\n' "$crit" | grep . | sort -u) || true)
+
 if [ -n "$alert" ]; then
   while IFS= read -r line; do log "ALERT $line"; done <<< "$alert"
-  # One snapshot per critical finding — tracked on its own, so a failed notification (which keeps the
-  # finding "new" for a retry) never makes a fresh snapshot every 5 minutes.
-  EVID_SEEN="$STATE.evidence-taken"
-  newcrit=$(comm -13 <(sort -u "$EVID_SEEN" 2>/dev/null) <(printf '%s\n' "$crit" | grep . | sort -u) || true)
-  if [ -n "$newcrit" ]; then
-    if ev=$(capture_evidence "$newcrit" 2>/dev/null); then
-      log "EVIDENCE saved: $ev"; alert="$alert"$'\n'"evidence: $ev"
-      printf '%s\n' "$newcrit" >> "$EVID_SEEN"
-    fi
-  fi
+  # ALERT FIRST — evidence capture comes after, so a slow/stuck capture can never delay or block it.
   if notify danger "MariaDB: dangerous account/grant on $HOST_S" "$(printf '%s\n' "$alert" | head -6 | paste -sd ';' -) — check: bash /usr/local/sbin/bh-mysql-user-audit.sh"; then
     printf '%s\n' "$findings" > "$STATE"
     [ -n "$crit" ] && echo "$now" > "$CRIT_STAMP"
@@ -160,6 +167,12 @@ if [ -n "$alert" ]; then
   fi
 else
   printf '%s\n' "$findings" > "$STATE"                          # also forgets resolved findings
-  [ -z "$crit" ] && rm -f "$CRIT_STAMP" "$STATE.evidence-taken"  # resolved → a recurrence gets a new snapshot
+  [ -z "$crit" ] && rm -f "$CRIT_STAMP"
+fi
+
+if [ -n "$newcrit" ] && ev=$(capture_evidence "$newcrit" 2>/dev/null); then
+  printf '%s\n' "$newcrit" >> "$EVID_SEEN"
+  log "EVIDENCE saved: $ev"
+  notify info "MariaDB evidence saved on $HOST_S" "Snapshot for the new critical finding: $ev" || true
 fi
 exit 0
