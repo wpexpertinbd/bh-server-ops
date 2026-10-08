@@ -24,6 +24,7 @@ MYSQL="${BH_MYSQL:-mariadb}"                                   # overridable for
 LOG="${BH_AUDIT_LOG:-/var/log/bh-mysql-user-audit.log}"
 STATE="${BH_AUDIT_STATE:-/var/lib/bh-server-ops/mysql-user-audit.state}"
 CRIT_STAMP="$STATE.critical-alerted"
+EVID_DIR="${BH_AUDIT_EVIDENCE:-/var/lib/bh-server-ops/evidence}"   # snapshots taken on NEW critical findings
 REALERT_CRITICAL_SECS=21600                                    # re-alert CRITICAL every 6 h
 QUIET=0
 HOST_S=$(hostname -s 2>/dev/null || hostname)
@@ -58,6 +59,31 @@ notify(){ # $1 level, $2 subject, $3 message — returns 0 only if the CWP notif
   [ -x "$php" ] && [ -f "$cli" ] || return 1
   timeout 30 "$php" "$cli" --level="$1" --subject="$(printf '%s' "$2" | clean)" \
     --message="$(printf '%s' "$3" | clean | head -c 900)" >/dev/null 2>&1
+}
+
+# On a NEW critical finding, snapshot everything that could show HOW it was created (CWP panel/API
+# request, a cron/CWP update, a package update, a running process), while it is still fresh — CWP
+# rotates its panel logs daily and MariaDB has no record of when a user was created.
+capture_evidence(){ # $1 = the new critical findings
+  local d="$EVID_DIR/mysql-$(date +%Y%m%d-%H%M%S)" f
+  mkdir -p "$d" && chmod 700 "$EVID_DIR" "$d" || return 1
+  printf '%s\n' "$1" > "$d/findings.txt"
+  { date; uptime; } > "$d/when.txt"
+  # CWP admin/user panel + API access logs: last 3000 lines of each (≈ the minutes before)
+  for f in /usr/local/cwpsrv/logs/*access_log /usr/local/cwpsrv/logs/*error_log; do
+    [ -f "$f" ] && tail -n 3000 "$f" > "$d/cwpsrv-$(basename "$f").tail" 2>/dev/null
+  done
+  grep -hiE "mysql|database|dbuser|phpmyadmin|pma" "$d"/cwpsrv-*access_log.tail > "$d/cwpsrv-mysql-requests.txt" 2>/dev/null
+  tail -n 400 /var/log/cron > "$d/cron.tail" 2>/dev/null
+  { tail -n 80 /var/log/dnf.rpm.log 2>/dev/null; echo "--- rpm -qa --last"; rpm -qa --last 2>/dev/null | head -40; } > "$d/packages.txt"
+  find /usr/local/cwpsrv /usr/local/cwp /scripts -xdev -type f -mmin -1440 2>/dev/null | head -300 > "$d/cwp-files-changed-24h.txt"
+  ps -eo pid,ppid,user,lstart,etime,args --sort=start_time 2>/dev/null | tail -n 150 > "$d/processes.txt"
+  timeout 30 "$MYSQL" -e "SHOW FULL PROCESSLIST" > "$d/mariadb-processlist.txt" 2>&1
+  timeout 30 "$MYSQL" -Nse "SELECT User,Host,JSON_REMOVE(Priv,'\$.authentication_string') FROM mysql.global_priv WHERE User IN ('','PUBLIC') OR Host LIKE '%\\%%'" > "$d/mariadb-suspect-accounts.txt" 2>&1
+  timeout 30 "$MYSQL" -Nse "SELECT * FROM mysql.db WHERE User IN ('','PUBLIC') OR LEFT(Db,1) IN ('_','%')" > "$d/mariadb-suspect-db-grants.txt" 2>&1
+  journalctl --since "-30 min" --no-pager -u mariadb -u cwpsrv -u crond 2>/dev/null | tail -n 300 > "$d/journal.tail"
+  chmod -R go-rwx "$d"
+  echo "$d"
 }
 
 timeout 30 "$MYSQL" -Nse "SELECT 1" 2>/dev/null | grep -qx 1 || {
@@ -116,6 +142,16 @@ alert=$(printf '%s\n%s\n' "$new" "$realert" | grep . | sort -u || true)
 
 if [ -n "$alert" ]; then
   while IFS= read -r line; do log "ALERT $line"; done <<< "$alert"
+  # One snapshot per critical finding — tracked on its own, so a failed notification (which keeps the
+  # finding "new" for a retry) never makes a fresh snapshot every 5 minutes.
+  EVID_SEEN="$STATE.evidence-taken"
+  newcrit=$(comm -13 <(sort -u "$EVID_SEEN" 2>/dev/null) <(printf '%s\n' "$crit" | grep . | sort -u) || true)
+  if [ -n "$newcrit" ]; then
+    if ev=$(capture_evidence "$newcrit" 2>/dev/null); then
+      log "EVIDENCE saved: $ev"; alert="$alert"$'\n'"evidence: $ev"
+      printf '%s\n' "$newcrit" >> "$EVID_SEEN"
+    fi
+  fi
   if notify danger "MariaDB: dangerous account/grant on $HOST_S" "$(printf '%s\n' "$alert" | head -6 | paste -sd ';' -) — check: bash /usr/local/sbin/bh-mysql-user-audit.sh"; then
     printf '%s\n' "$findings" > "$STATE"
     [ -n "$crit" ] && echo "$now" > "$CRIT_STAMP"
@@ -124,6 +160,6 @@ if [ -n "$alert" ]; then
   fi
 else
   printf '%s\n' "$findings" > "$STATE"                          # also forgets resolved findings
-  [ -z "$crit" ] && rm -f "$CRIT_STAMP"
+  [ -z "$crit" ] && rm -f "$CRIT_STAMP" "$STATE.evidence-taken"  # resolved → a recurrence gets a new snapshot
 fi
 exit 0
