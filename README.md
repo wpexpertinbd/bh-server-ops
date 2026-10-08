@@ -348,6 +348,36 @@ systemctl reset-failed httpd; systemctl start httpd && /usr/local/apache/bin/htt
 If you roll back to CWP's own package for good, remove ` cwp-httpd*` from the `exclude=` line in
 `/etc/dnf/dnf.conf`, otherwise yum will never update cwp-httpd again.
 
+## MariaDB account watcher (`bh-mysql-user-audit.sh`)
+
+**Alert-only** — it never changes anything. Every 5 minutes it looks for:
+
+| Level | Finding |
+|---|---|
+| CRITICAL | anonymous user (`''@host`) · a grant with a **blank user** (MariaDB applies it to *every* user) |
+| HIGH | a database grant whose pattern starts with `_` or `%` (matches other customers' databases) · a non-root user with global `*.*` privileges |
+| MEDIUM | an account allowed from any host (`user@%`) |
+
+Why it exists: CWP's user panel sometimes loses the account username. On s1 (2026-10-08) that
+created `''@'localhost'` with `GRANT ALL PRIVILEGES ON `_%`.*` — every database user could read,
+change and drop every database on the server (it showed in phpMyAdmin for any customer login).
+
+```bash
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/bh-mysql-user-audit.sh -o "$f" \
+  && bash "$f" --install; rm -f "$f"          # → /usr/local/sbin + /etc/cron.d, runs once
+bash /usr/local/sbin/bh-mysql-user-audit.sh    # check now, any time
+```
+
+(Never download to a fixed name in `/tmp` — on our servers `fs.protected_regular=0`, so a customer
+process could pre-create that file and swap its content before root runs it.)
+
+- NEW findings are logged to `/var/log/bh-mysql-user-audit.log` (mode 600), sent to syslog `auth.crit`,
+  and posted as a CWP admin notification (danger). CRITICAL findings re-alert every 6 hours.
+- A failing check query is reported as **"watcher broken"** (exit 3) — never as "clean".
+- Allowed by design: `root@localhost/127.0.0.1/::1/<hostname>`, `mariadb.sys@localhost` while locked,
+  and `mysql@localhost` only while its password is the stock `invalid` (socket-only login).
+- A human removes what it reports, e.g. `mariadb -e "DROP USER ''@'localhost';"`.
+
 ## Helper commands
 
 After bootstrap, three commands are available system-wide.
