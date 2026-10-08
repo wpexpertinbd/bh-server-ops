@@ -355,7 +355,7 @@ Two systemd drop-ins found necessary during the 2026-10-08 fleet reboots. Idempo
 ```bash
 f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/bh-boot-order.sh -o "$f" \
   && bash "$f"; rm -f "$f"
-bash bh-boot-order.sh --check     # verify on any server
+bash /usr/local/sbin/bh-boot-order.sh --check     # verify (the install copies itself there)
 ```
 
 | Drop-in | Problem it prevents |
@@ -364,6 +364,8 @@ bash bh-boot-order.sh --check     # verify on any server
 | `amavisd.service.d/bh-listen-check.conf` | amavis came up "active" but not listening on `127.0.0.1:10024` (s3: nothing, biswashost: only `[::1]`) → Postfix deferred all mail. Now the start fails unless `127.0.0.1:10024` answers within 120 s, so `Restart=on-failure` retries. |
 
 **After any reboot also check by hand:** `bash -c '</dev/tcp/127.0.0.1/10024' && echo amavis OK` and `postqueue -p | tail -1`.
+amavis retries every 15 s with no give-up limit. If it was stopped by hand repeatedly and systemd refuses
+("start request repeated too quickly"): `systemctl reset-failed amavisd && systemctl start amavisd`.
 Undo: delete the two files and `systemctl daemon-reload`.
 
 ## MariaDB account watcher (`bh-mysql-user-audit.sh`)
