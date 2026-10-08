@@ -84,6 +84,9 @@ capture_evidence(){ # $1 = the new critical findings. Runs AFTER the alert; ever
   timeout 30 "$MYSQL" -Nse "SELECT User,Host,JSON_REMOVE(Priv,'\$.authentication_string') FROM mysql.global_priv WHERE User IN ('','PUBLIC') OR Host LIKE '%\\%%'" > "$d/mariadb-suspect-accounts.txt" 2>&1
   timeout 30 "$MYSQL" -Nse "SELECT * FROM mysql.db WHERE User IN ('','PUBLIC') OR LEFT(Db,1) IN ('_','%')" > "$d/mariadb-suspect-db-grants.txt" 2>&1
   timeout 30 journalctl --since "-30 min" --no-pager -u mariadb -u cwpsrv -u crond 2>/dev/null | tail -n 300 > "$d/journal.tail"
+  # MariaDB audit log of GRANT/CREATE/DROP USER (server_audit, QUERY_DCL) — shows the exact statement,
+  # connecting account and connection id that created the finding. See README "MariaDB audit log".
+  [ -f /var/lib/mysql/bh_audit_dcl.log ] && timeout 20 tail -n 500 /var/lib/mysql/bh_audit_dcl.log 2>/dev/null | tail -c $cap > "$d/mariadb-audit-dcl.tail"
   chmod -R go-rwx "$d"
   # Retention: keep the newest 10 snapshots (only our own mysql-* folders are ever removed)
   ls -1dt "$EVID_DIR"/mysql-[0-9]*-[0-9]* 2>/dev/null | tail -n +11 | while IFS= read -r old; do

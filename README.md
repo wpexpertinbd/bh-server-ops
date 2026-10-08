@@ -397,6 +397,26 @@ process could pre-create that file and swap its content before root runs it.)
 - Allowed by design: `root@localhost/127.0.0.1/::1/<hostname>`, `mariadb.sys@localhost` while locked,
   and `mysql@localhost` only while its password is the stock `invalid` (socket-only login).
 - A human removes what it reports, e.g. `mariadb -e "DROP USER ''@'localhost';"`.
+- On a NEW critical finding it also saves a root-only evidence snapshot (after the alert) to
+  `/var/lib/bh-server-ops/evidence/mysql-<time>/`: CWP panel/API logs, cron, package history, CWP files changed
+  in 24 h, processes, MariaDB processlist and the audit log below. Newest 10 kept.
+
+### MariaDB audit log (who creates the dangerous account)
+
+Logs only account/permission changes (`GRANT`, `REVOKE`, `CREATE USER`, `DROP USER`) with time, account,
+connection id and the statement. Passwords in `GRANT`/`CREATE USER` are masked (`*****`); `SET PASSWORD` /
+`ALTER USER` are not part of `QUERY_DCL`, so customer passwords never appear (tested 2026-10-09). No restart:
+
+```bash
+mariadb -e "INSTALL SONAME 'server_audit'"            # once; persists in mysql.plugin
+mariadb -e "SET GLOBAL server_audit_events='QUERY_DCL'; SET GLOBAL server_audit_file_path='/var/lib/mysql/bh_audit_dcl.log';
+            SET GLOBAL server_audit_file_rotate_size=10485760; SET GLOBAL server_audit_file_rotations=9; SET GLOBAL server_audit_logging=ON;"
+# persist the settings for the next MariaDB start (loose_ = still starts if the plugin is missing):
+printf '[mariadb]\nloose_server_audit_events=QUERY_DCL\nloose_server_audit_file_path=/var/lib/mysql/bh_audit_dcl.log\nloose_server_audit_file_rotate_size=10485760\nloose_server_audit_file_rotations=9\nloose_server_audit_logging=ON\n' > /etc/my.cnf.d/bh-server-audit.cnf
+tail /var/lib/mysql/bh_audit_dcl.log                   # read it
+```
+
+⚠️ On MariaDB 12.x `GRANT … IDENTIFIED BY` **creates** a missing user — never "test" with it on a live server.
 
 ## Helper commands
 
