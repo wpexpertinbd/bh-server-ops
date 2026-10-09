@@ -350,7 +350,7 @@ If you roll back to CWP's own package for good, remove ` cwp-httpd*` from the `e
 
 ## Reboot-safe start order (`bh-boot-order.sh`)
 
-Two systemd drop-ins found necessary during the 2026-10-08 fleet reboots. Idempotent, restarts nothing:
+Three systemd drop-ins found necessary after the 2026-10-08 fleet reboots. Idempotent, restarts nothing:
 
 ```bash
 f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/bh-boot-order.sh -o "$f" \
@@ -362,11 +362,15 @@ bash /usr/local/sbin/bh-boot-order.sh --check     # verify (the install copies i
 |---|---|
 | `httpd.service.d/bh-network-online.conf` | ModSecurity (cpGuard MEWAF) downloads rules over HTTPS at start; Apache started before the network was up, hung, was killed at 90 s → sites down ~2.5 min (s3). Now waits for `network-online.target`, 180 s timeout. |
 | `amavisd.service.d/bh-listen-check.conf` | amavis came up "active" but not listening on `127.0.0.1:10024` (s3: nothing, biswashost: only `[::1]`) → Postfix deferred all mail. Now the start fails unless `127.0.0.1:10024` answers within 120 s, so `Restart=on-failure` retries. |
+| `named.service.d/bh-listen-check.conf` | named listened on the public IP for UDP but TCP only on `127.0.0.1` (s3) → PowerDNS could not pull zones (AXFR is TCP), a newly added domain stayed SERVFAIL. `rndc scan` did not help, a restart did. Now waits for `network-online.target` and the start fails unless every public IPv4 has TCP `:53` within 60 s (only when `listen-on` is `any`); `Restart=on-failure` retries. The check runs `/usr/local/sbin/bh-boot-order.sh --named-post`, so keep that copy. |
 
-**After any reboot also check by hand:** `bash -c '</dev/tcp/127.0.0.1/10024' && echo amavis OK` and `postqueue -p | tail -1`.
+**After any reboot also check by hand:** `bash -c '</dev/tcp/127.0.0.1/10024' && echo amavis OK`, `postqueue -p | tail -1`
+and `ss -lnt 'sport = :53'` (must show the public IP, not only `127.0.0.1`).
+**New domain not resolving?** On the PowerDNS box: `pdnsutil show-zone <domain>` ("No SOA serial" = never transferred) and
+`journalctl -u pdns | grep <domain>`; after fixing the source, `pdns_control retrieve <domain>`.
 amavis retries every 15 s with no give-up limit. If it was stopped by hand repeatedly and systemd refuses
 ("start request repeated too quickly"): `systemctl reset-failed amavisd && systemctl start amavisd`.
-Undo: delete the two files and `systemctl daemon-reload`.
+Undo: delete the three files and `systemctl daemon-reload`.
 
 ## MariaDB account watcher (`bh-mysql-user-audit.sh`)
 

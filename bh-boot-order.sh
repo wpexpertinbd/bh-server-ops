@@ -14,11 +14,55 @@
 #     while Postfix's content_filter sends to 127.0.0.1:10024 → all mail deferred.
 #     → wait for network-online.target and FAIL the start unless 127.0.0.1:10024 accepts a
 #       connection within 120 s, so the unit's own Restart=on-failure retries it.
-# Undo: delete the two files below and run `systemctl daemon-reload`.
+#  3. named (2026-10-09, s3): after the reboot it listened on the public IP for UDP but TCP only on
+#     127.0.0.1, so PowerDNS could not pull zones (AXFR = TCP) — "Connection refused", a new domain
+#     stayed SERVFAIL. `rndc scan` did not fix it, a restart did.
+#     → wait for network-online.target and FAIL the start unless every public IPv4 that has UDP :53
+#       also has TCP :53 (only when listen-on is "any"); Restart=on-failure retries it.
+# Undo: delete the three files below and run `systemctl daemon-reload`.
 set -euo pipefail
 
 HTTPD_DROPIN=/etc/systemd/system/httpd.service.d/bh-network-online.conf
 AMAVIS_DROPIN=/etc/systemd/system/amavisd.service.d/bh-listen-check.conf
+NAMED_DROPIN=/etc/systemd/system/named.service.d/bh-listen-check.conf
+SELF=/usr/local/sbin/bh-boot-order.sh
+
+# Called by named's ExecStartPost. Succeeds once every global IPv4 with UDP :53 also has TCP :53.
+# Skipped (success) when listen-on is not "any" — then the admin chose the addresses on purpose.
+# (Outputs are captured into variables first: under pipefail, `cmd | grep -q` can fail on SIGPIPE.)
+public_ips(){ ip -4 -o addr show scope global | awk '{split($4,a,"/"); print a[1]}'; }
+listening(){ ss -ln"$1" "sport = :53" | awk 'NR>1{print $4}'; }   # $1 = t or u
+
+named_post(){
+  local conf
+  conf=$(/usr/sbin/named-checkconf -p 2>/dev/null || true)
+  if ! awk '/^[[:space:]]*listen-on port 53 \{/{getline; if ($0 ~ /^[[:space:]]*"?any"?;/) f=1} END{exit !f}' <<<"$conf"; then
+    exit 0
+  fi
+  # Only IPs named actually bound for UDP count: an address on a down interface or one another daemon
+  # holds would otherwise fail every start forever. But at least one public IP must be bound, so a
+  # pass before named has bound anything does not succeed by accident.
+  local i ip ips tcp udp bound missing
+  ips=$(public_ips)
+  [ -n "$ips" ] || exit 0
+  for i in $(seq 1 60); do
+    bound=0; missing=""
+    tcp=$(listening t); udp=$(listening u)
+    for ip in $ips; do
+      grep -qxF "$ip:53" <<<"$udp" || continue
+      bound=1
+      grep -qxF "$ip:53" <<<"$tcp" || missing="$missing $ip"
+    done
+    [ "$bound" = 1 ] && [ -z "$missing" ] && exit 0
+    sleep 1
+  done
+  if [ "$bound" = 1 ]; then
+    echo "named has UDP but not TCP :53 on:$missing after 60 s (zone transfers to PowerDNS would fail)" >&2
+  else
+    echo "named not listening on any public IPv4 :53 after 60 s" >&2
+  fi
+  exit 1
+}
 
 check(){
   local ok=1
@@ -31,6 +75,18 @@ check(){
     if systemctl show -p ExecStartPost --value amavisd | grep -q 127.0.0.1/10024; then echo "✓ amavisd start is verified against 127.0.0.1:10024"
     else echo "✗ amavisd drop-in missing or not loaded"; ok=0; fi
   else echo "- amavisd.service not present"; fi
+  if systemctl cat named >/dev/null 2>&1; then
+    if systemctl show -p ExecStartPost --value named | grep -q -- --named-post \
+       && systemctl show -p After --value named | grep -q network-online.target; then echo "✓ named waits for network-online, start verified against TCP :53 on public IPs"
+    else echo "✗ named drop-in missing or not loaded"; ok=0; fi
+    local ip tcp udp
+    tcp=$(listening t); udp=$(listening u)
+    for ip in $(public_ips); do
+      grep -qxF "$ip:53" <<<"$udp" || continue
+      grep -qxF "$ip:53" <<<"$tcp" \
+        || { echo "✗ named has UDP but NOT TCP on $ip:53 right now — PowerDNS cannot transfer zones; systemctl restart named"; ok=0; }
+    done
+  else echo "- named.service not present"; fi
   local w=""
   for u in NetworkManager-wait-online systemd-networkd-wait-online; do
     [ "$(systemctl is-enabled $u 2>/dev/null)" = enabled ] && { w=$u; break; }
@@ -42,12 +98,13 @@ check(){
 }
 
 if [ "${1:-}" = --check ]; then check; exit $?; fi
-[ -z "${1:-}" ] || { echo "usage: $0 [--check]" >&2; exit 1; }
+if [ "${1:-}" = --named-post ]; then named_post; fi
+[ -z "${1:-}" ] || { echo "usage: $0 [--check]   (--named-post is for named.service only)" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "✗ run as root" >&2; exit 1; }
 
-# Keep a copy so `bh-boot-order.sh --check` works later on this server.
-if [ -f "$0" ] && [ "$(readlink -f "$0")" != /usr/local/sbin/bh-boot-order.sh ]; then
-  install -m 0755 "$0" /usr/local/sbin/bh-boot-order.sh || echo "⚠ could not copy to /usr/local/sbin" >&2
+# Keep a copy so `bh-boot-order.sh --check` works later — and named's drop-in calls it.
+if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$SELF" ]; then
+  install -m 0755 "$0" "$SELF.new" && mv -f "$SELF.new" "$SELF" || echo "⚠ could not copy to /usr/local/sbin" >&2
 fi
 
 if systemctl cat httpd >/dev/null 2>&1; then
@@ -72,6 +129,24 @@ if systemctl cat amavisd >/dev/null 2>&1; then
     "ExecStartPost=/bin/bash -c 'for i in \$(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/10024) 2>/dev/null && exit 0; sleep 1; done; echo \"amavisd not listening on 127.0.0.1:10024 after 120 s\" >&2; exit 1'" \
     > "$AMAVIS_DROPIN"
   chmod 644 "$AMAVIS_DROPIN"
+fi
+
+if systemctl cat named >/dev/null 2>&1; then
+  # The drop-in runs $SELF, so only install it when that copy exists and has the --named-post mode;
+  # otherwise every named start would fail.
+  if [ -x "$SELF" ] && grep -q -- '--named-post' "$SELF"; then
+    install -d -m 755 "$(dirname "$NAMED_DROPIN")"
+    printf '%s\n' \
+      '# bh-server-ops bh-boot-order.sh: named must LISTEN on TCP :53 on the public IP (PowerDNS pulls zones' \
+      '# by AXFR over TCP) before it counts as started; otherwise the start fails and Restart retries it.' \
+      '[Unit]' 'Wants=network-online.target' 'After=network-online.target' '' \
+      '[Service]' 'TimeoutStartSec=180' 'Restart=on-failure' 'RestartSec=10' \
+      "ExecStartPost=$SELF --named-post" \
+      > "$NAMED_DROPIN"
+    chmod 644 "$NAMED_DROPIN"
+  else
+    echo "⚠ $SELF missing or too old (no --named-post) — named drop-in NOT installed" >&2
+  fi
 fi
 
 systemctl daemon-reload
