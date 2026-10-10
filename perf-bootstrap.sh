@@ -2191,14 +2191,72 @@ echo "✓ heal cron installed: /usr/local/sbin/bh-cron-shell-heal.sh (every 30 m
 # 2026-07-28. Recreate the .crt from .cert and restart cwpsrv.
 # ⚠ NEVER openssl-generate a fresh cert/key here — that overwrites the real
 # hostname.key and yields "key values mismatch". Copy only.
+# ⚠⚠ 2026-10-09: the .crt we recreated on 07-28 was a one-time COPY. CWP's
+# Let's Encrypt renewal updates only hostname.cert/.bundle, so the .crt aged
+# out and :2087 served an EXPIRED cert (biswashost + s1; s3/s4 were next).
+# perf-bootstrap only runs after CWP updates, so the sync is now its own
+# script + daily cron: refresh .crt whenever the renewed cert is newer and
+# matches the key. Source = hostname.bundle (leaf + intermediates) when it is
+# valid, because hostname.cert is the LEAF ONLY — serving it alone breaks strict
+# TLS clients (curl/PHP on Linux, e.g. Blesta → CWP API). Falls back to .cert.
 echo ""
-echo "─── [6k/11] CWP panel hostname-cert heal ───"
+echo "─── [6k/11] CWP panel hostname-cert heal + daily .crt sync ───"
 if [ -f /usr/local/cwpsrv/bin/cwpsrv ]; then
+  cat > /usr/local/sbin/bh-hostname-crt-sync <<'SYNC'
+#!/bin/bash
+# bh-server-ops: keep /etc/pki/tls/certs/hostname.crt (used by cwpsrv: :2083/:2087/API)
+# in step with the cert CWP's Let's Encrypt renewal writes (hostname.bundle / .cert).
+# Copy only — never generate a cert/key. Daily via /etc/cron.d/bh-hostname-crt-sync.
+set -u
+D=/etc/pki/tls/certs; CRT=$D/hostname.crt; KEY=/etc/pki/tls/private/hostname.key
+log(){ logger -t bh-hostname-crt-sync "$*"; echo "$*"; }
+[ -f "$KEY" ] || exit 0
+pub(){ local p; p=$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null) && [ -n "$p" ] && sha256sum <<<"$p" | cut -c1-64; }
+end(){ local e; e=$(openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2); [ -n "$e" ] && date -d "$e" +%s 2>/dev/null || echo 0; }
+kpem=$(openssl pkey -in "$KEY" -pubout 2>/dev/null) && [ -n "$kpem" ] || { log "cannot read hostname.key — not touching hostname.crt"; exit 1; }
+kp=$(sha256sum <<<"$kpem" | cut -c1-64)
+# Pick the source: the bundle if its first cert is ours and the chain verifies, else the bare .cert.
+SRC=""
+for f in "$D/hostname.bundle" "$D/hostname.cert"; do
+  [ -f "$f" ] && [ "$(pub "$f")" = "$kp" ] || continue
+  if [ "$f" = "$D/hostname.bundle" ]; then
+    [ "$(grep -c 'BEGIN CERTIFICATE' "$f")" -gt 1 ] || continue
+    openssl verify -untrusted "$f" "$f" >/dev/null 2>&1 || continue
+  fi
+  [ "$(openssl x509 -in "$f" -noout -issuer | cut -d= -f2-)" != "$(openssl x509 -in "$f" -noout -subject | cut -d= -f2-)" ] || continue   # skip self-signed
+  SRC=$f; break
+done
+[ -n "$SRC" ] || { log "no usable renewed cert (bundle/.cert missing, self-signed or not matching the key) — not touching hostname.crt"; exit 0; }
+if [ -f "$CRT" ] && cmp -s "$SRC" "$CRT"; then exit 0; fi
+# Same expiry but .crt lacks the chain → still replace (that is the leaf-only case).
+if [ -f "$CRT" ] && [ "$(end "$SRC")" -lt "$(end "$CRT")" ]; then exit 0; fi
+if [ -f "$CRT" ] && [ "$(end "$SRC")" -eq "$(end "$CRT")" ] && [ "$(grep -c 'BEGIN CERTIFICATE' "$CRT")" -ge "$(grep -c 'BEGIN CERTIFICATE' "$SRC")" ]; then exit 0; fi
+BK=""
+if [ -f "$CRT" ]; then BK="$CRT.bh-prev"; cp -p "$CRT" "$BK" || { log "backup of hostname.crt failed — not touching it"; exit 1; }; fi
+cp -f "$SRC" "$CRT.new" && chmod 644 "$CRT.new" && mv -f "$CRT.new" "$CRT" || { rm -f "$CRT.new"; log "copy to hostname.crt failed"; exit 1; }
+if /usr/local/cwpsrv/bin/cwpsrv -t >/dev/null 2>&1; then
+  if systemctl reload cwpsrv 2>/dev/null || systemctl restart cwpsrv; then
+    log "hostname.crt refreshed from $(basename "$SRC") (valid to $(openssl x509 -in "$CRT" -noout -enddate | cut -d= -f2)), cwpsrv reloaded"
+  else
+    log "hostname.crt refreshed but cwpsrv reload/restart FAILED"; exit 1
+  fi
+else
+  if [ -n "$BK" ]; then mv -f "$BK" "$CRT"; fi
+  log "cwpsrv -t FAILED with the new hostname.crt — previous file restored"; exit 1
+fi
+SYNC
+  chmod 755 /usr/local/sbin/bh-hostname-crt-sync
+  printf '%s\n' '# bh-server-ops: refresh cwpsrv hostname.crt after CWP renews the hostname cert' \
+    'SHELL=/bin/bash' '17 4 * * * root /usr/local/sbin/bh-hostname-crt-sync >/dev/null 2>&1' \
+    > /etc/cron.d/bh-hostname-crt-sync
+  chmod 644 /etc/cron.d/bh-hostname-crt-sync
   if [ ! -f /etc/pki/tls/certs/hostname.crt ] && [ -f /etc/pki/tls/certs/hostname.cert ]; then
     cp -f /etc/pki/tls/certs/hostname.cert /etc/pki/tls/certs/hostname.crt
     chmod 644 /etc/pki/tls/certs/hostname.crt
     echo "✓ recreated missing /etc/pki/tls/certs/hostname.crt from hostname.cert"
   fi
+  /usr/local/sbin/bh-hostname-crt-sync | sed 's/^/  /'
+  echo "  hostname.crt valid to: $(openssl x509 -in /etc/pki/tls/certs/hostname.crt -noout -enddate 2>/dev/null | cut -d= -f2)"
   if /usr/local/cwpsrv/bin/cwpsrv -t >/dev/null 2>&1; then
     systemctl is-active --quiet cwpsrv || { systemctl restart cwpsrv 2>/dev/null; sleep 2; }
     echo "✓ cwpsrv config OK (service: $(systemctl is-active cwpsrv 2>/dev/null))"
