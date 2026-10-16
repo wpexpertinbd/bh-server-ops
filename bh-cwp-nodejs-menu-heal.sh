@@ -77,7 +77,9 @@ for F in "$THEMES"/*/menu_left.html; do
   # The whole path (services/users/cwp_theme/<theme>) is owned by cwpsvc, so it is READ and WRITTEN
   # only as cwpsvc (runuser): a path swapped for a symlink then gives cwpsvc nothing it lacks already.
   C="$WORK/$th.menu_left.html.prev"
-  rm -f "$C" && runuser -u "$OWNER" -- cat -- "$F" > "$C" && [ -s "$C" ] || { rm -f "$C"; log "ERR $th: snapshot failed"; rc=1; continue; }
+  # setsid -w: the cwpsvc child gets its own session with no controlling tty, so on a manual run it
+  # cannot push keystrokes into root's terminal (TIOCSTI).
+  rm -f "$C" && setsid -w runuser -u "$OWNER" -- cat -- "$F" < /dev/null > "$C" 2>/dev/null && [ -s "$C" ] || { rm -f "$C"; log "ERR $th: snapshot failed"; rc=1; continue; }
   T=$(mktemp "$WORK/$th.XXXXXX") || { log "ERR $th: mktemp failed"; rc=1; continue; }
   awk -v cond="$COND" -v mark="$MARK" '
     # widen the Domains menu condition once (the "if" line that tests sslwizard and domains)
@@ -100,7 +102,7 @@ for F in "$THEMES"/*/menu_left.html; do
     rm -f "$T"; log "WARN $th: patch did not apply cleanly (layout changed?) — left untouched"; rc=1; continue
   fi
   # Write as cwpsvc: temp file next to the target, then one atomic rename in the same dir.
-  if runuser -u "$OWNER" -- sh -c 'umask 022; n="$1.bh-new.$$"; cat > "$n" && chmod 644 "$n" && mv -fT "$n" "$1" || { rm -f "$n"; exit 1; }' _ "$F" < "$T"; then
+  if setsid -w runuser -u "$OWNER" -- sh -c 'umask 022; n="$1.bh-new.$$"; cat > "$n" && chmod 644 "$n" && mv -fT "$n" "$1" || { rm -f "$n"; exit 1; }' _ "$F" < "$T" > /dev/null 2>&1; then
     rm -f "$T"; log "healed $th: Node.JS Apps re-added to $F (backup $C)"
   else
     rm -f "$T"; log "ERR $th: could not replace $F (as $OWNER)"; rc=1
