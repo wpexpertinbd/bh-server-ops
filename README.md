@@ -372,6 +372,25 @@ amavis retries every 15 s with no give-up limit. If it was stopped by hand repea
 ("start request repeated too quickly"): `systemctl reset-failed amavisd && systemctl start amavisd`.
 Undo: delete the three files and `systemctl daemon-reload`.
 
+## Node.JS Apps link in the CWP user panel (`bh-cwp-nodejs-menu-heal.sh`)
+
+The CWP update of 2026-10-14 shipped a user theme `original` without the **Node.JS Apps** sidebar
+entry (the module `?module=nodejs_manager` itself still works). This puts the entry back under
+**Domains** and keeps it there after every CWP update (cron every 15 min):
+
+```bash
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/wpexpertinbd/bh-server-ops/main/bh-cwp-nodejs-menu-heal.sh -o "$f" \
+  && bash "$f"; rm -f "$f"
+bash /usr/local/sbin/bh-cwp-nodejs-menu-heal.sh --check     # report only
+```
+
+- Shown when `"nodejs" in extra_rmenu`, `"nodejs_manager" in rmenu` (package feature list) or `swmenu==1`.
+- Themes that already have the link are not touched; the patch is tagged `BH-NODEJS-MENU`.
+- Root-only work dir `/root/.bh-cwp-nodejs-menu-heal/` (backup `<theme>.menu_left.html.prev`), symlinks
+  refused, one atomic rename. Log: `/var/log/bh-cwp-nodejs-menu-heal.log`.
+- Undo: copy the `.prev` back over `cwp_theme/<theme>/menu_left.html`, delete
+  `/etc/cron.d/bh-cwp-nodejs-menu-heal` and the script.
+
 ## MariaDB account watcher (`bh-mysql-user-audit.sh`)
 
 **Alert-only** — it never changes anything. Every 5 minutes it looks for:
