@@ -14,10 +14,11 @@
 #   - lets the Domains menu itself open for users who only have Node.js
 # Shown when ("nodejs" in extra_rmenu) or ("nodejs_manager" in rmenu) or (swmenu==1) — the stock
 # condition plus the package feature list. Themes that already have the link are left untouched.
-# Safety: parts of cwp_theme are writable by the panel user cwpsvc, so root never writes a temp or
-# backup file there and never follows a symlink: the new file is built in a root-only dir and put in
-# place with one rename() on the same filesystem; a symlinked menu_left.html is refused.
-# Keeps owner/mode, one backup per theme in $WORK/<theme>.menu_left.html.prev, logs to
+# Safety: everything from /usr/local/cwpsrv/var/services down is owned by the panel user cwpsvc, so
+# root never reads or writes there itself: the template is read and replaced AS cwpsvc (runuser),
+# the new content is built in a root-only dir, the swap is one rename() in the theme dir. A path
+# redirected via symlink therefore gains nothing beyond what cwpsvc can already do. Result: the
+# healed file is cwpsvc-owned, mode 644. One backup per theme in $WORK/<theme>.menu_left.html.prev, logs to
 # /var/log/bh-cwp-nodejs-menu-heal.log. Undo: copy the .prev back, remove the cron + script.
 set -u
 
@@ -26,6 +27,7 @@ LOG=/var/log/bh-cwp-nodejs-menu-heal.log
 SELF=/usr/local/sbin/bh-cwp-nodejs-menu-heal.sh
 CRON=/etc/cron.d/bh-cwp-nodejs-menu-heal
 WORK=/root/.bh-cwp-nodejs-menu-heal
+OWNER=cwpsvc   # owns /usr/local/cwpsrv/var/services/users/cwp_theme and below
 MARK='BH-NODEJS-MENU'
 COND='("nodejs" in extra_rmenu )or("nodejs_manager" in rmenu )or(swmenu==1)'
 MODE=heal
@@ -33,6 +35,7 @@ MODE=heal
 [ -z "${1:-}" ] || [ "$MODE" = check ] || { echo "usage: $0 [--check]" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "✗ run as root" >&2; exit 1; }
 [ -d "$THEMES" ] || { echo "- no CWP user themes here ($THEMES) — nothing to do"; exit 0; }
+id -u "$OWNER" >/dev/null 2>&1 || { echo "✗ user $OWNER missing — refusing" >&2; exit 1; }
 
 log(){ echo "$(date '+%F %T') $*" >> "$LOG"; echo "$*"; }
 
@@ -71,9 +74,10 @@ for F in "$THEMES"/*/menu_left.html; do
 
   # Work on a snapshot in the root-only dir: copied without following links, then checked, so a
   # file swapped for a symlink after the check above can never feed another file into the theme.
+  # The whole path (services/users/cwp_theme/<theme>) is owned by cwpsvc, so it is READ and WRITTEN
+  # only as cwpsvc (runuser): a path swapped for a symlink then gives cwpsvc nothing it lacks already.
   C="$WORK/$th.menu_left.html.prev"
-  rm -f "$C" && cp -p --no-dereference "$F" "$C" || { log "ERR $th: snapshot failed"; rc=1; continue; }
-  if [ -L "$C" ] || [ ! -f "$C" ]; then rm -f "$C"; log "WARN $th: $F is not a regular file — refused"; rc=1; continue; fi
+  rm -f "$C" && runuser -u "$OWNER" -- cat -- "$F" > "$C" && [ -s "$C" ] || { rm -f "$C"; log "ERR $th: snapshot failed"; rc=1; continue; }
   T=$(mktemp "$WORK/$th.XXXXXX") || { log "ERR $th: mktemp failed"; rc=1; continue; }
   awk -v cond="$COND" -v mark="$MARK" '
     # widen the Domains menu condition once (the "if" line that tests sslwizard and domains)
@@ -95,12 +99,11 @@ for F in "$THEMES"/*/menu_left.html; do
      || ! grep -E '\{% if .*"domains" in rmenu' "$T" | grep -q '"nodejs_manager" in rmenu'; then
     rm -f "$T"; log "WARN $th: patch did not apply cleanly (layout changed?) — left untouched"; rc=1; continue
   fi
-  # rename() is only atomic on the same filesystem; never fall back to a copy into the theme dir.
-  if [ "$(stat -c %d "$WORK")" != "$(stat -c %d "$(dirname "$F")")" ]; then
-    rm -f "$T"; log "WARN $th: $WORK is on another filesystem than $F — left untouched"; rc=1; continue
+  # Write as cwpsvc: temp file next to the target, then one atomic rename in the same dir.
+  if runuser -u "$OWNER" -- sh -c 'umask 022; n="$1.bh-new.$$"; cat > "$n" && chmod 644 "$n" && mv -fT "$n" "$1" || { rm -f "$n"; exit 1; }' _ "$F" < "$T"; then
+    rm -f "$T"; log "healed $th: Node.JS Apps re-added to $F (backup $C)"
+  else
+    rm -f "$T"; log "ERR $th: could not replace $F (as $OWNER)"; rc=1
   fi
-  chown "$(stat -c %u:%g "$C")" "$T" && chmod "$(stat -c %a "$C")" "$T" \
-    && mv -fT "$T" "$F" || { rm -f "$T"; log "ERR $th: could not replace $F"; rc=1; continue; }
-  log "healed $th: Node.JS Apps re-added to $F (backup $C)"
 done
 exit $rc
