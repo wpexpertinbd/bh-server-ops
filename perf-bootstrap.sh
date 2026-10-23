@@ -1107,6 +1107,9 @@ flock -n 9 || exit 0
 # users/*.conf include never loads one — but an orphan would sit there forever.
 find /opt/alt/php-fpm*/usr/etc/php-fpm.d/users -maxdepth 1 \
      \( -name '*.bhtmp.*' -o -name '.bhnew.*' \) -mmin +10 -delete 2>/dev/null
+# ...and the upload-progress lock's temp copies of service pools and CWP templates.
+find /opt/alt/php-fpm*/usr/etc/php-fpm.d /usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/php-fpm \
+     -maxdepth 1 -name '*.bhtmp.*' -mmin +10 -delete 2>/dev/null
 
 START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
 MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
@@ -1263,6 +1266,8 @@ pm.max_children = ${LIGHT_CHILDREN}
 pm.max_requests = 500
 pm.process_idle_timeout = 30s
 POOLEOF
+  # BH-CVE-2026-115560 lock (5.3 has no upload progress, so no such setting)
+  [ "$V" = "53" ] || echo 'php_admin_flag[session.upload_progress.enabled] = off' >> "$T"
   chown root:root "$T" 2>/dev/null
   chmod 644 "$T" 2>/dev/null
   mv -f "$T" "$P"
@@ -1317,6 +1322,72 @@ while read -r REF; do
     echo "$(date '+%Y-%m-%d %H:%M:%S') CREATED missing pool $SU on php-fpm$V" >> /var/log/bh-fpm-heal.log
   done
 done <<< "$VHOST_SOCKS"
+
+# ── BH-CVE-2026-115560: lock session upload progress OFF in every pool ───────
+# php.ini / php.d already say session.upload_progress.enabled = 0, but the key is
+# PHP_INI_PERDIR, so any site can switch it back on from its own .user.ini.
+# php_admin_flag in the pool cannot be overridden by .user.ini or ini_set().
+# CWP regenerates pools from its templates, so this re-asserts every tick, on
+# user pools AND service pools (roundcube, cwpsvc), and patches the templates.
+# Fixed-string matching on purpose: the key's [ ] and . are regex syntax, and
+# ensure_kv would never match it and append a duplicate every 5 minutes.
+UP_LOCK='php_admin_flag[session.upload_progress.enabled] = off'
+UP_KEY_RE='^[[:space:]]*php_(admin_)?(flag|value)\[session\.upload_progress\.enabled\]'
+upload_lock_ok() {
+  grep -qxF "$UP_LOCK" "$1" && [ "$(grep -cE "$UP_KEY_RE" "$1")" = "1" ]
+}
+upload_lock_apply() {
+  sed -i -E "/${UP_KEY_RE}/d" "$1"
+  [ -n "$(tail -c1 "$1")" ] && echo >> "$1"
+  printf '%s\n' "$UP_LOCK" >> "$1"
+}
+# CWP rewrites pools and templates on its own schedule, so a copy taken mid-write
+# can be partial, and a rename can land over a file CWP has just replaced. Only
+# install the edited copy when the original is still byte-for-byte what was
+# copied; otherwise drop it and let the next tick retry.
+upload_lock_stage() {   # $1=file → UP_TMP = locked copy, UP_SUM = checksum of what was copied
+  # Sets globals; never call it in $( ), a subshell would lose UP_SUM.
+  local F="$1" T
+  UP_TMP=""; UP_SUM=""
+  T="$(mktemp "${F}.bhtmp.XXXXXX" 2>/dev/null)" || return 1
+  cp -p "$F" "$T" 2>/dev/null || { rm -f "$T"; return 1; }
+  UP_SUM="$(md5sum < "$T")"
+  upload_lock_apply "$T"
+  UP_TMP="$T"
+}
+upload_lock_unchanged() {   # $1=original — still identical to what was staged?
+  [ "$(md5sum < "$1" 2>/dev/null)" = "$UP_SUM" ]
+}
+LOCKED=0
+for POOL in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf /opt/alt/php-fpm*/usr/etc/php-fpm.d/*.conf; do
+  [ -f "$POOL" ] || continue
+  case "$POOL" in /opt/alt/php-fpm53/*) continue ;; esac   # 5.3 has no upload progress
+  # exactly one [pool] section: users.conf is an include list, and an appended
+  # line only reaches the LAST section of a multi-pool file
+  [ "$(grep -cE '^\[[^]]+\][[:space:]]*$' "$POOL")" = "1" ] || continue
+  upload_lock_ok "$POOL" && continue
+  upload_lock_stage "$POOL" || continue
+  TMP="$UP_TMP"
+  # pool_commit refuses a copy without pm / pm.max_children (a partial read):
+  # one invalid pool would stop every pool on that PHP version at the reload.
+  if upload_lock_unchanged "$POOL"; then
+    pool_commit "$TMP" "$POOL" && LOCKED=$((LOCKED+1))
+  else
+    rm -f "$TMP"
+  fi
+done
+[ "$LOCKED" -gt 0 ] && echo "$(date '+%Y-%m-%d %H:%M:%S') locked session.upload_progress off in $LOCKED pool(s)" >> /var/log/bh-fpm-heal.log
+for TPL in /usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/php-fpm/*.tpl; do
+  [ -f "$TPL" ] || continue
+  upload_lock_ok "$TPL" && continue
+  upload_lock_stage "$TPL" || continue
+  TMP="$UP_TMP"
+  if upload_lock_unchanged "$TPL" && grep -q '^pm[[:space:]]*=' "$TMP"; then
+    mv -f "$TMP" "$TPL"
+  else
+    rm -f "$TMP"
+  fi
+done
 
 # Single reconcile loop over every pool conf: figure the user's desired tier
 # (default LIGHT), skip if already in the correct clean state, else re-apply.
@@ -1377,11 +1448,11 @@ done
 # whose tier already matches makes the reconcile loop `continue` (CHANGED=0), so
 # gating on CHANGED alone would write the pool and never reload — the socket
 # would never appear and the site would stay 503 with the fix already on disk.
-if [ $CHANGED -gt 0 ] || [ $CREATED -gt 0 ]; then
+if [ $CHANGED -gt 0 ] || [ $CREATED -gt 0 ] || [ $LOCKED -gt 0 ]; then
   for SVC in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php-fpm[0-9]+\.service$'); do
     systemctl reload "$SVC" >/dev/null 2>&1
   done
-  echo "$(date '+%Y-%m-%d %H:%M:%S') changed=$CHANGED created=$CREATED (heavy=$HEAVY_N medium=$MEDIUM_N light=$LIGHT_N)" >> /var/log/bh-fpm-heal.log
+  echo "$(date '+%Y-%m-%d %H:%M:%S') changed=$CHANGED created=$CREATED locked=$LOCKED (heavy=$HEAVY_N medium=$MEDIUM_N light=$LIGHT_N)" >> /var/log/bh-fpm-heal.log
 fi
 
 # ── Recovery sweep — runs EVERY tick, even when CHANGED=0 ────────────────────
