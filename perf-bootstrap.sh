@@ -1110,6 +1110,8 @@ find /opt/alt/php-fpm*/usr/etc/php-fpm.d/users -maxdepth 1 \
 # ...and the upload-progress lock's temp copies of service pools and CWP templates.
 find /opt/alt/php-fpm*/usr/etc/php-fpm.d /usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/php-fpm \
      -maxdepth 1 -name '*.bhtmp.*' -mmin +10 -delete 2>/dev/null
+find /usr/local/php /usr/local/bin /opt/alt/php[0-9][0-9]/usr/php \
+     -maxdepth 1 -name 'php.ini.bhtmp.*' -mmin +10 -delete 2>/dev/null
 
 START_SVR=$(( HEAVY_CHILDREN / 5 )); [ $START_SVR -lt 2 ] && START_SVR=2
 MIN_SPARE=$(( HEAVY_CHILDREN / 10 )); [ $MIN_SPARE -lt 1 ] && MIN_SPARE=1
@@ -1355,6 +1357,15 @@ upload_lock_stage() {   # $1=file → UP_TMP = locked copy, UP_SUM = checksum of
   upload_lock_apply "$T"
   UP_TMP="$T"
 }
+upload_lock_stage_ini() {   # like upload_lock_stage, for a php.ini and its [PATH=/home] block
+  local F="$1" T
+  UP_TMP=""; UP_SUM=""
+  T="$(mktemp "${F}.bhtmp.XXXXXX" 2>/dev/null)" || return 1
+  cp -p "$F" "$T" 2>/dev/null || { rm -f "$T"; return 1; }
+  UP_SUM="$(md5sum < "$T")"
+  upload_path_apply "$T"
+  UP_TMP="$T"
+}
 upload_lock_unchanged() {   # $1=original — still identical to what was staged?
   [ "$(md5sum < "$1" 2>/dev/null)" = "$UP_SUM" ]
 }
@@ -1388,6 +1399,67 @@ for TPL in /usr/local/cwpsrv/htdocs/resources/conf/web_servers/vhosts/php-fpm/*.
     rm -f "$TMP"
   fi
 done
+
+# ── The same lock for suPHP (CGI) sites: main PHP + CWP PHP Selector builds ──
+# php_admin_flag only exists for FPM. A CGI build honours a site's .user.ini,
+# except for settings inside a [PATH=...] section of php.ini, which "can not be
+# overridden by user-defined INI files or at runtime". Every site lives under
+# /home, so a [PATH=/home] section closes it.
+# ⚠️ A [PATH=] header scopes EVERY line after it, so the block must stay LAST:
+# anything appended later (a panel edit) would silently become /home-only. The
+# block is moved back to the end whenever something follows it.
+# The file is the one PHP actually LOADS (php_ini_loaded_file), not an assumed
+# path: PHP reads a php.ini next to its own binary first, and s2 had a stray one.
+UP_PATH_BLOCK="$(printf '%s\n' '; BH-CVE-2026-115560 (bh-server-ops: keep this block LAST)' \
+  '[PATH=/home]' 'session.upload_progress.enabled = 0' '; END BH-CVE-2026-115560')"
+upload_path_ok() {
+  [ "$(tail -n 4 "$1")" = "$UP_PATH_BLOCK" ] \
+    && [ "$(grep -c '^; BH-CVE-2026-115560 ' "$1")" = "1" ] \
+    && [ "$(grep -cE '^\[(PATH|HOST)=' "$1")" = "1" ]
+}
+upload_path_apply() {
+  sed -i '/^; BH-CVE-2026-115560 /,/^; END BH-CVE-2026-115560$/d' "$1"
+  [ -n "$(tail -c1 "$1")" ] && echo >> "$1"
+  printf '%s\n' "$UP_PATH_BLOCK" >> "$1"
+}
+PATHLOCKED=0
+for BIN in /usr/local/bin/php /opt/alt/php[0-9][0-9]/usr/bin/php; do
+  [ -x "$BIN" ] || continue
+  case "$BIN" in /opt/alt/php53/*) continue ;; esac   # 5.3 has no upload progress
+  INI="$("$BIN" -r 'echo php_ini_loaded_file();' 2>/dev/null | tail -n 1)"
+  case "$INI" in /*php.ini) [ -f "$INI" ] || continue ;; *) continue ;; esac
+  upload_path_ok "$INI" && continue
+  # A symlinked php.ini is managed elsewhere: renaming over it would cut the link.
+  if [ -L "$INI" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') SKIPPED php.ini lock: $INI is a symlink" >> /var/log/bh-fpm-heal.log
+    continue
+  fi
+  # The block is removed by a sed RANGE: with its END marker missing (or ending
+  # in a CR) the range would run to EOF and delete every later setting. Only
+  # touch a file whose markers pair up exactly.
+  if [ "$(grep -c '^; BH-CVE-2026-115560 ' "$INI")" != "$(grep -cx '; END BH-CVE-2026-115560' "$INI")" ] \
+     || [ "$(grep -c '^; BH-CVE-2026-115560 ' "$INI")" -gt 1 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') SKIPPED php.ini lock: $INI has a damaged BH-CVE-2026-115560 block" >> /var/log/bh-fpm-heal.log
+    continue
+  fi
+  # Another [PATH=]/[HOST=] section that is not ours: lines after OUR block would
+  # still be fine, but ours must not land inside someone else's scope rules —
+  # leave that file to a human and say so.
+  if [ "$(grep -cE '^\[(PATH|HOST)=' "$INI")" != "$(grep -c '^; BH-CVE-2026-115560 ' "$INI")" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') SKIPPED php.ini lock: $INI has its own [PATH=]/[HOST=] section" >> /var/log/bh-fpm-heal.log
+    continue
+  fi
+  upload_lock_stage_ini "$INI" || continue
+  TMP="$UP_TMP"
+  # Residual race: a panel edit landing between this check and the rename is
+  # lost. The window is microseconds and php.ini changes only on panel actions.
+  if upload_lock_unchanged "$INI" && grep -q '^\[PATH=/home\]$' "$TMP"; then
+    mv -f "$TMP" "$INI" && PATHLOCKED=$((PATHLOCKED+1))
+  else
+    rm -f "$TMP"
+  fi
+done
+[ "$PATHLOCKED" -gt 0 ] && echo "$(date '+%Y-%m-%d %H:%M:%S') locked session.upload_progress off for suPHP in $PATHLOCKED php.ini file(s)" >> /var/log/bh-fpm-heal.log
 
 # Single reconcile loop over every pool conf: figure the user's desired tier
 # (default LIGHT), skip if already in the correct clean state, else re-apply.
